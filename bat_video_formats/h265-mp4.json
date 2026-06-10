@@ -1,0 +1,25 @@
+{
+    "label": "video/h265-mp4",
+    "extension": "mp4",
+    "browser_playable": false,
+    "video_args": [
+        "-c:v", "libx265",
+        "-vtag", "hvc1",
+        "-pix_fmt", "{pix_fmt}",
+        "-crf", "{crf}",
+        "-preset", "{preset}",
+        "-g", "1", "-keyint_min", "1",
+        "-x265-params", "log-level=quiet:keyint=1:min-keyint=1:scenecut=0:bframes=0",
+        "-vf", "scale=out_color_matrix=bt709",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709",
+        "-movflags", "+faststart"
+    ],
+    "audio_args": ["-c:a", "aac"],
+    "widgets": {
+        "crf":     {"type": "INT",   "default": 22, "min": 0, "max": 51},
+        "pix_fmt": {"type": "COMBO", "default": "yuv420p10le", "options": ["yuv420p10le", "yuv420p"]},
+        "preset":  {"type": "COMBO", "default": "medium",
+                    "options": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]}
+    }
+}

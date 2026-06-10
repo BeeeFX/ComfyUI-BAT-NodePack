@@ -1,0 +1,14 @@
+{
+    "label": "image/gif",
+    "extension": "gif",
+    "browser_playable": true,
+    "video_args": [
+        "-vf", "split [a][b];[a] palettegen=stats_mode=diff [p];[b][p] paletteuse=dither={dither}",
+        "-loop", "0"
+    ],
+    "audio_args": null,
+    "widgets": {
+        "dither": {"type": "COMBO", "default": "sierra2_4a",
+                   "options": ["none", "bayer", "heckbert", "floyd_steinberg", "sierra2", "sierra2_4a"]}
+    }
+}

@@ -1,0 +1,22 @@
+{
+    "label": "video/prores-mov",
+    "extension": "mov",
+    "browser_playable": false,
+    "video_args": [
+        "-c:v", "prores_ks",
+        "-profile:v", "{profile}",
+        "-pix_fmt", "{pix_fmt}",
+        "-vendor", "apl0",
+        "-vf", "scale=out_color_matrix=bt709",
+        "-colorspace", "bt709",
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709"
+    ],
+    "audio_args": ["-c:a", "pcm_s16le"],
+    "widgets": {
+        "profile": {"type": "COMBO", "default": "hq",
+                    "options": ["proxy", "lt", "standard", "hq", "4444", "4444xq"]},
+        "pix_fmt": {"type": "COMBO", "default": "yuv422p10le",
+                    "options": ["yuv422p10le", "yuv444p10le", "yuva444p10le"]}
+    }
+}

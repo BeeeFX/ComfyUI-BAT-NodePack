@@ -1,0 +1,13 @@
+{
+    "label": "image/png-sequence",
+    "extension": "%05d.png",
+    "browser_playable": false,
+    "video_args": [
+        "-pix_fmt", "{pix_fmt}"
+    ],
+    "audio_args": null,
+    "widgets": {
+        "pix_fmt": {"type": "COMBO", "default": "rgb24",
+                    "options": ["rgb24", "rgba", "rgb48be", "rgba64be"]}
+    }
+}
