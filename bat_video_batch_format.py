@@ -1,6 +1,6 @@
 import torch
 
-from .etc_wan_batch_format import _normalize_mask, _pad_image_like, _pad_mask_like
+from .bat_wan_batch_format import _normalize_mask, _pad_image_like, _pad_mask_like
 
 
 # Each entry: pixel-frame stride. Valid pixel frame counts are F such that
