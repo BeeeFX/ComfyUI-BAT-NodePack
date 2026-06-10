@@ -1,0 +1,15 @@
+{
+    "label": "image/webp",
+    "extension": "webp",
+    "browser_playable": true,
+    "video_args": [
+        "-c:v", "libwebp_anim",
+        "-pix_fmt", "yuv420p",
+        "-quality", "{quality}",
+        "-loop", "0"
+    ],
+    "audio_args": null,
+    "widgets": {
+        "quality": {"type": "INT", "default": 80, "min": 0, "max": 100}
+    }
+}

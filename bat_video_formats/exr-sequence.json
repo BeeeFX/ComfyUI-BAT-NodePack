@@ -1,0 +1,17 @@
+{
+    "label": "image/exr-sequence",
+    "extension": "%05d.exr",
+    "browser_playable": false,
+    "video_args": [
+        "-c:v", "exr",
+        "-pix_fmt", "{pix_fmt}",
+        "-compression", "{compression}"
+    ],
+    "audio_args": null,
+    "widgets": {
+        "pix_fmt": {"type": "COMBO", "default": "gbrpf32le",
+                    "options": ["gbrpf32le", "gbrapf32le"]},
+        "compression": {"type": "COMBO", "default": "zip",
+                    "options": ["none", "rle", "zip1", "zip", "piz", "pxr24"]}
+    }
+}

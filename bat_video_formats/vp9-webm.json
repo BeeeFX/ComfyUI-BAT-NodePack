@@ -1,0 +1,21 @@
+{
+    "label": "video/vp9-webm",
+    "extension": "webm",
+    "browser_playable": true,
+    "video_args": [
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "{pix_fmt}",
+        "-crf", "{crf}",
+        "-b:v", "0",
+        "-g", "1", "-keyint_min", "1",
+        "-row-mt", "1",
+        "-vf", "scale=out_color_matrix=bt709",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709"
+    ],
+    "audio_args": ["-c:a", "libopus"],
+    "widgets": {
+        "crf":     {"type": "INT",   "default": 30, "min": 0, "max": 63},
+        "pix_fmt": {"type": "COMBO", "default": "yuv420p", "options": ["yuv420p", "yuva420p"]}
+    }
+}
