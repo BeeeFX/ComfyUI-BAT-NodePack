@@ -15,6 +15,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { addBatDOMWidget, clampNodeSize, vueNodesEnabled } from "./bat_node_layout.js";
 
 const NODE_TYPE = "Bat_VideoLoader";
 const PATH_ROUTE   = "/bat/getpath";
@@ -159,7 +160,10 @@ function makePathWidget(name, defaultValue, options) {
 
 // ─── Trim-range widget (NLE-style scrubber) ─────────────────────────────────
 
-const PREVIEW_H    = 110;
+const PREVIEW_H    = 110;   // trim-widget thumbnail height
+// Height of the <video> preview pane below the trim widget. Distinct from
+// PREVIEW_H above, which is the trim strip's thumbnail height.
+const VIDEO_PANE_H = 260;
 const TIMELINE_H   = 28;
 const CONTROLS_H   = 26;   // single row: step buttons (left) + status (right)
 const PAD          = 6;
@@ -746,9 +750,27 @@ async function fetchVideoInfo(node) {
     const pathW = node.widgets.find(w => w.name === "path");
     const trimW = node.widgets.find(w => w.name === "trim");
     if (!pathW || !trimW || !pathW.value) return;
+
+    // Sequence guard. This function WRITES trimW._start/_end, which are setters
+    // onto the real start_frame/end_frame widgets — so a slow response for a
+    // previously-selected file could land after the artist picked a new file (or
+    // typed new trim values) and silently overwrite them with the old clip's
+    // clamp. Stamp each call and let only the newest one apply; also re-check the
+    // path hasn't changed under us before touching anything.
+    const seq = (node._batInfoSeq = (node._batInfoSeq || 0) + 1);
+    const pathAtRequest = pathW.value;
+    if (node._batInfoAbort) { try { node._batInfoAbort.abort(); } catch (_) {} }
+    const ac = (typeof AbortController === "function") ? new AbortController() : null;
+    node._batInfoAbort = ac;
+
     try {
-        const r = await fetch(api.apiURL(`${INFO_ROUTE}?path=${encodeURIComponent(pathW.value)}`));
+        const r = await fetch(
+            api.apiURL(`${INFO_ROUTE}?path=${encodeURIComponent(pathAtRequest)}`),
+            ac ? { signal: ac.signal } : undefined,
+        );
         const info = await r.json();
+        // Superseded by a newer lookup, or the artist changed the path — drop it.
+        if (seq !== node._batInfoSeq || pathW.value !== pathAtRequest) return;
         if (!info.ok) { console.warn("[Bat] video-info:", info.error); return; }
         const st = trimW._state;
         st.frameCount = info.frame_count | 0;
@@ -774,7 +796,10 @@ async function fetchVideoInfo(node) {
         fetchFrame(node, "start");
         fetchFrame(node, "end");
     } catch (e) {
+        if (e && e.name === "AbortError") return;   // expected on supersede
         console.warn("[Bat] video-info fetch failed:", e);
+    } finally {
+        if (node._batInfoAbort === ac) node._batInfoAbort = null;
     }
 }
 
@@ -1182,29 +1207,32 @@ app.registerExtension({
             // it isn't persisted in the workflow JSON.
             const preview = makePreviewWidget();
             this._batPreview = preview;
-            try {
-                this.addDOMWidget("video_preview", "video_preview", preview.element, {
-                    serialize: false,
-                    hideOnZoom: false,
-                });
-            } catch (e) {
-                console.warn("[Bat] addDOMWidget failed, falling back:", e);
-            }
+            // Dual-mode sizing. The preview pane's own height is declared here
+            // (PREVIEW_H) so Nodes 2.0 can size the node from the widget rather
+            // than from the `computeSize() + previewH` arithmetic below, which
+            // is Nodes-1.0-only semantics.
+            addBatDOMWidget(this, "video_preview", "video_preview", preview.element, {
+                minWidth: 420, height: VIDEO_PANE_H, growable: true,
+            });
 
             // For freshly-added nodes only; on workflow restore, the
             // saved widget values aren't applied until after onConfigure,
             // so the info-fetch there gets the right start/end.
             queueMicrotask(() => fetchVideoInfo(this));
 
-            // Resize node to fit. Bump min width so the IN/OUT step button
-            // clusters + status line don't crowd each other, and add room
-            // for the preview pane below the trim widget.
-            const computed = this.computeSize();
-            const previewH = 260;
-            this.size = [
-                Math.max(420, this.size[0] || 0, computed[0]),
-                computed[1] + previewH,
-            ];
+            // Resize node to fit (Nodes 1.0 only — clampNodeSize no-ops under
+            // 2.0, where the height comes from each widget's computeLayoutSize).
+            // Bump min width so the IN/OUT step button clusters + status line
+            // don't crowd each other, and add room for the preview pane below
+            // the trim widget.
+            if (!vueNodesEnabled()) {
+                const computed = this.computeSize();
+                this.size = [
+                    Math.max(420, this.size[0] || 0, computed[0]),
+                    computed[1] + VIDEO_PANE_H,
+                ];
+                this.setDirtyCanvas?.(true, true);
+            }
             return r;
         };
 

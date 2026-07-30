@@ -25,11 +25,33 @@ from PIL import Image
 
 import server
 
-# Bounded LRU of decoded frame batches, keyed by
-# (abs_path, mtime, start, end). 4 entries is enough for typical
-# workflows that re-run with the same trim window, and bounds memory.
+# Bounded LRU of decoded frame batches, keyed by (abs_path, mtime, start, end).
+#
+# Bounded by BYTES, not entry count. The old `_FRAME_CACHE_MAX = 4` counted
+# entries, which says nothing about memory: four cached 500-frame 1080p float32
+# batches is 4 x 500 x 1920 x 1080 x 3 x 4 B ≈ 50 GB. A byte budget keeps the
+# cache useful for the common "re-run with the same trim window" case while
+# making the worst case bounded and predictable.
 _FRAME_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
-_FRAME_CACHE_MAX = 4
+# Entry-count cap is kept as a secondary guard against pathological tiny entries.
+_FRAME_CACHE_MAX = 8
+_FRAME_CACHE_MAX_BYTES = 4 * 1024 ** 3   # 4 GiB
+
+
+def _tensor_nbytes(t) -> int:
+    try:
+        return int(t.numel()) * int(t.element_size())
+    except Exception:
+        return 0
+
+
+def _trim_frame_cache():
+    """Evict oldest entries until both the byte budget and the entry cap hold."""
+    total = sum(_tensor_nbytes(v) for v in _FRAME_CACHE.values())
+    while _FRAME_CACHE and (total > _FRAME_CACHE_MAX_BYTES
+                            or len(_FRAME_CACHE) > _FRAME_CACHE_MAX):
+        _key, victim = _FRAME_CACHE.popitem(last=False)
+        total -= _tensor_nbytes(victim)
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +128,7 @@ def probe_video(path: str) -> Optional[dict]:
 # ─── Frame extraction ───────────────────────────────────────────────────────
 
 
-def _frames_decord(path: str, start: int, end: int) -> Optional[np.ndarray]:
+def _frames_decord(path: str, start: int, end: int, stride: int = 1) -> Optional[np.ndarray]:
     try:
         import decord  # type: ignore
         decord.bridge.set_bridge("native")
@@ -114,7 +136,9 @@ def _frames_decord(path: str, start: int, end: int) -> Optional[np.ndarray]:
         n = len(vr)
         s = max(0, min(start, n - 1))
         e = max(s, min(end, n - 1))
-        indices = list(range(s, e + 1))
+        # get_batch accepts an arbitrary index list, so a stride costs nothing:
+        # we decode only the frames we keep instead of the whole span.
+        indices = list(range(s, e + 1, max(1, int(stride))))
         batch = vr.get_batch(indices).asnumpy()  # (N, H, W, 3) uint8
         return batch
     except Exception as e:
@@ -122,7 +146,7 @@ def _frames_decord(path: str, start: int, end: int) -> Optional[np.ndarray]:
         return None
 
 
-def _frames_cv2(path: str, start: int, end: int) -> Optional[np.ndarray]:
+def _frames_cv2(path: str, start: int, end: int, stride: int = 1) -> Optional[np.ndarray]:
     try:
         import cv2  # type: ignore
         cap = cv2.VideoCapture(path)
@@ -131,13 +155,21 @@ def _frames_cv2(path: str, start: int, end: int) -> Optional[np.ndarray]:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         s = max(0, min(start, total - 1))
         e = max(s, min(end, total - 1))
+        st = max(1, int(stride))
         cap.set(cv2.CAP_PROP_POS_FRAMES, s)
         out = []
-        for _ in range(s, e + 1):
-            ok, frame = cap.read()
-            if not ok:
-                break
-            out.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        # grab() advances without decoding/converting; retrieve() only decodes
+        # the frames we actually keep. Skipping the colour conversion for
+        # discarded frames is where the stride saving comes from.
+        for i in range(s, e + 1):
+            if (i - s) % st == 0:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                out.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            else:
+                if not cap.grab():
+                    break
         cap.release()
         return np.stack(out, axis=0) if out else None
     except Exception as e:
@@ -145,7 +177,7 @@ def _frames_cv2(path: str, start: int, end: int) -> Optional[np.ndarray]:
         return None
 
 
-def _frames_torchvision(path: str, start: int, end: int) -> Optional[np.ndarray]:
+def _frames_torchvision(path: str, start: int, end: int, stride: int = 1) -> Optional[np.ndarray]:
     try:
         from torchvision.io import read_video  # type: ignore
         # read_video returns (T, H, W, C) uint8.
@@ -155,16 +187,22 @@ def _frames_torchvision(path: str, start: int, end: int) -> Optional[np.ndarray]
         n = video.shape[0]
         s = max(0, min(start, n - 1))
         e = max(s, min(end, n - 1))
-        return video[s:e + 1].numpy()
+        # read_video has already decoded everything, so the stride is just a
+        # slice here — no decode saving available on this backend.
+        return video[s:e + 1:max(1, int(stride))].numpy()
     except Exception as e:
         logger.warning(f"[Bat_VideoLoader] torchvision failed: {e}")
         return None
 
 
-def load_frames(path: str, start: int, end: int) -> np.ndarray:
-    """Return frames [start..end] (inclusive) as a uint8 ndarray (N,H,W,3)."""
+def load_frames(path: str, start: int, end: int, stride: int = 1) -> np.ndarray:
+    """Return frames [start..end] (inclusive), every `stride`-th, as uint8 (N,H,W,3).
+
+    The stride is pushed DOWN into the decoder so we never decode frames that
+    are about to be discarded (see _frames_decord / _frames_cv2).
+    """
     for fn in (_frames_decord, _frames_cv2, _frames_torchvision):
-        out = fn(path, start, end)
+        out = fn(path, start, end, stride)
         if out is not None and len(out) > 0:
             return out
     raise RuntimeError(
@@ -212,6 +250,11 @@ class VideoLoader:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
     CATEGORY = "BAT/video"
+    DESCRIPTION = (
+        "Load a trimmed range of frames from a video file. Type a path (with "
+        "directory autocomplete) and set the range with a dual-handle trim "
+        "slider showing thumbnails of the in/out frames."
+    )
     FUNCTION = "load"
 
     @classmethod
@@ -249,14 +292,16 @@ class VideoLoader:
             _FRAME_CACHE.move_to_end(cache_key)
             return (cached,)
 
-        frames = load_frames(path, start, end)
-        if stride > 1:
-            frames = frames[::stride]
+        # Decode only the frames we're going to KEEP. This used to decode the
+        # whole [start, end] range and then throw most of it away with
+        # `frames[::stride]` — with select_every_nth=10 over a 3000-frame range
+        # that decoded 3000 frames to return 300. Volt_Loader already applies its
+        # stride during frame selection; this brings the two in line.
+        frames = load_frames(path, start, end, stride=stride)
         frames = frames.astype(np.float32) / 255.0
         tensor = torch.from_numpy(frames)
         _FRAME_CACHE[cache_key] = tensor
-        while len(_FRAME_CACHE) > _FRAME_CACHE_MAX:
-            _FRAME_CACHE.popitem(last=False)
+        _trim_frame_cache()
         return (tensor,)
 
 
@@ -282,12 +327,23 @@ async def bat_getpath(request):
         else None
     )
 
+    # Collect names AND mtimes in the single scandir pass — the DirEntry already
+    # carries the stat, so sorting is free. This used to re-stat every entry
+    # inside the sort key (`os.stat(...)` per comparison) on every autocomplete
+    # keystroke, which is slow on network mounts; and one OSError anywhere threw
+    # the whole mtime ordering away and fell back to alphabetical.
     items = []
+    mtimes = {}
     try:
         for entry in os.scandir(path):
             try:
+                try:
+                    mtimes[entry.name] = entry.stat().st_mtime
+                except OSError:
+                    mtimes[entry.name] = 0.0
                 if entry.is_dir():
                     items.append(entry.name + "/")
+                    mtimes[entry.name + "/"] = mtimes.get(entry.name, 0.0)
                     continue
                 ext = entry.name.rsplit(".", 1)[-1].lower() if "." in entry.name else ""
                 if exts is None or ext in exts:
@@ -298,10 +354,7 @@ async def bat_getpath(request):
         logger.error(f"[Bat] getpath error: {e}")
         return server.web.json_response([])
 
-    try:
-        items.sort(key=lambda f: os.stat(os.path.join(path, f)).st_mtime)
-    except OSError:
-        items.sort()
+    items.sort(key=lambda f: mtimes.get(f, 0.0))
     return server.web.json_response(items)
 
 
