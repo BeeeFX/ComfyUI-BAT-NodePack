@@ -15,6 +15,9 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { attachZoomControl } from "./bat_zoom_control.js";
+import { batTrack } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Crop";
 
@@ -53,6 +56,7 @@ function makeEditor(node) {
     const state = {
         img: null, imgW: 0, imgH: 0,
         dispScale: 1, offX: 0, offY: 0,
+        dispZoom: 1,               // display-only zoom (1 = fit-to-canvas)
         handles: [], drag: null,
     };
 
@@ -68,15 +72,29 @@ function makeEditor(node) {
 
     function recomputeDisplay(cw, ch) {
         if (!state.imgW) { state.dispScale = 1; state.offX = 0; state.offY = 0; return; }
-        state.dispScale = Math.min(cw / state.imgW, ch / state.imgH);
-        state.offX = (cw - state.imgW * state.dispScale) / 2;
-        state.offY = (ch - state.imgH * state.dispScale) / 2;
+        // Fit-to-canvas, then apply the display-only zoom + pan. Centred at
+        // zoom 1 / pan 0; zooming out reveals margin (the out-of-frame area
+        // a crop can extend into), pan/zoom-to-cursor shift the centre.
+        const fit = Math.min(cw / state.imgW, ch / state.imgH);
+        state.dispScale = fit * (state.dispZoom || 1);
+        state.offX = (cw - state.imgW * state.dispScale) / 2 + (state.panX || 0);
+        state.offY = (ch - state.imgH * state.dispScale) / 2 + (state.panY || 0);
     }
     const c2d = (x, y) => ({ x: state.offX + x * state.dispScale, y: state.offY + y * state.dispScale });
     const d2c = (x, y) => ({ x: (x - state.offX) / state.dispScale, y: (y - state.offY) / state.dispScale });
 
+    // Whether the crop must stay inside the canvas. Defaults to true when
+    // the widget is missing (older graphs) so behaviour is unchanged.
+    const constrained = () => {
+        const w = W("constrain_to_canvas");
+        return w ? !!w.value : true;
+    };
+
     function clampRectToImage() {
         if (!state.imgW) return;
+        // Off when the artist unlocked "constrain to canvas" — the rect may
+        // then extend past the edge and the backend zero-pads the overhang.
+        if (!constrained()) return;
         // When the rect is rotated it can legitimately stick out past the
         // image bounds (the backend grid_sample handles that with zero
         // padding); only clamp in the axis-aligned case.
@@ -222,7 +240,9 @@ function makeEditor(node) {
         const outH = Math.max(snap, Math.round(ch / snap) * snap);
         const angTxt = Math.abs(ang) >= 0.05 ? `  · ${ang.toFixed(1)}°` : "";
         info.textContent = state.imgW
-            ? `${cw}×${ch}${angTxt}  →  ${outW}×${outH}` + (get("aspect_lock") ? "  · 🔒" : "")
+            ? `${cw}×${ch}${angTxt}  →  ${outW}×${outH}`
+                + (get("aspect_lock") ? "  · 🔒" : "")
+                + (constrained() ? "" : "  · ⛶ free")
             : "no image yet";
     }
 
@@ -327,6 +347,9 @@ function makeEditor(node) {
         const Wimg = state.imgW, Himg = state.imgH;
         const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
         const rotated = Math.abs(base.angDeg) > 1e-3;
+        // When "constrain to canvas" is off the axis-aligned rect is allowed
+        // to run past the image edge (backend zero-pads the overhang).
+        const con = constrained();
 
         if (mode === "rot") {
             const curAng = Math.atan2(cP.y - base.cy, cP.x - base.cx);
@@ -340,7 +363,7 @@ function makeEditor(node) {
 
         if (mode === "move") {
             const dx = cP.x - base.startC.x, dy = cP.y - base.startC.y;
-            if (rotated) {
+            if (rotated || !con) {
                 x = Math.round(base.x + dx);
                 y = Math.round(base.y + dy);
             } else {
@@ -349,17 +372,40 @@ function makeEditor(node) {
             }
             w = base.w; h = base.h;
         } else if (mode === "new") {
-            const ax = base.startC.x, ay = base.startC.y;
-            let nx = Math.min(ax, cP.x), ny = Math.min(ay, cP.y);
-            let nw = Math.abs(cP.x - ax), nh = Math.abs(cP.y - ay);
+            const anchX = base.startC.x, anchY = base.startC.y;
+            const dirX = cP.x >= anchX ? 1 : -1;
+            const dirY = cP.y >= anchY ? 1 : -1;
+            let nw = Math.abs(cP.x - anchX), nh = Math.abs(cP.y - anchY);
             if (base.lock) {
                 const wantH = nw / base.ratio;
                 if (wantH > nh) nh = wantH; else nw = nh * base.ratio;
             }
-            x = clamp(Math.round(nx), 0, Math.max(0, Wimg - 1));
-            y = clamp(Math.round(ny), 0, Math.max(0, Himg - 1));
-            w = clamp(Math.round(nw), 1, Wimg - x);
-            h = clamp(Math.round(nh), 1, Himg - y);
+            if (con && base.lock) {
+                // Uniform shrink about the anchor (the initial click) so the
+                // ratio survives the canvas clamp.
+                let s = 1;
+                if (dirX > 0) s = Math.min(s, (Wimg - anchX) / Math.max(1e-6, nw));
+                else          s = Math.min(s, anchX / Math.max(1e-6, nw));
+                if (dirY > 0) s = Math.min(s, (Himg - anchY) / Math.max(1e-6, nh));
+                else          s = Math.min(s, anchY / Math.max(1e-6, nh));
+                s = Math.max(0, Math.min(1, s));
+                nw *= s; nh *= s;
+                x = Math.round(dirX > 0 ? anchX : anchX - nw);
+                y = Math.round(dirY > 0 ? anchY : anchY - nh);
+                w = Math.max(1, Math.round(nw));
+                h = Math.max(1, Math.round(nh));
+            } else if (con) {
+                const nx = Math.min(anchX, cP.x), ny = Math.min(anchY, cP.y);
+                x = clamp(Math.round(nx), 0, Math.max(0, Wimg - 1));
+                y = clamp(Math.round(ny), 0, Math.max(0, Himg - 1));
+                w = clamp(Math.round(nw), 1, Wimg - x);
+                h = clamp(Math.round(nh), 1, Himg - y);
+            } else {
+                x = Math.round(dirX > 0 ? anchX : anchX - nw);
+                y = Math.round(dirY > 0 ? anchY : anchY - nh);
+                w = Math.max(1, Math.round(nw));
+                h = Math.max(1, Math.round(nh));
+            }
         } else if (rotated) {
             // Rotation-aware resize: project the mouse displacement from the
             // (fixed) anchor onto the rect's local axes.
@@ -405,7 +451,8 @@ function makeEditor(node) {
             if (nr < nx) { const t = nr; nr = nx; nx = t; }
             if (nb < ny) { const t = nb; nb = ny; ny = t; }
             let nw = nr - nx, nh = nb - ny;
-            if (base.lock && which.length === 2) {
+            const locked = base.lock && which.length === 2;
+            if (locked) {
                 const wantH = nw / base.ratio;
                 if (wantH > nh) {
                     if (which.includes("t")) ny = nb - wantH; else nb = ny + wantH;
@@ -416,10 +463,37 @@ function makeEditor(node) {
                     nw = wantW;
                 }
             }
-            x = Math.round(Math.max(0, nx));
-            y = Math.round(Math.max(0, ny));
-            w = Math.max(1, Math.round(Math.min(nr, Wimg) - x));
-            h = Math.max(1, Math.round(Math.min(nb, Himg) - y));
+            if (con && locked) {
+                // Aspect-locked AND constrained: shrink the rect UNIFORMLY
+                // about the fixed anchor corner so it fits the canvas without
+                // breaking the ratio (clamping each edge independently would
+                // deform it). The anchor is the corner NOT being dragged.
+                const ax = which.includes("l") ? nr : nx;   // fixed x edge
+                const ay = which.includes("t") ? nb : ny;   // fixed y edge
+                const dx = which.includes("l") ? -nw : nw;  // signed extent from anchor
+                const dy = which.includes("t") ? -nh : nh;
+                let s = 1;
+                if (dx > 0)      s = Math.min(s, (Wimg - ax) / dx);
+                else if (dx < 0) s = Math.min(s, (0 - ax) / dx);
+                if (dy > 0)      s = Math.min(s, (Himg - ay) / dy);
+                else if (dy < 0) s = Math.min(s, (0 - ay) / dy);
+                s = Math.max(0, Math.min(1, s));
+                const fx = ax + dx * s, fy = ay + dy * s;   // scaled far corner
+                x = Math.round(Math.min(ax, fx));
+                y = Math.round(Math.min(ay, fy));
+                w = Math.max(1, Math.round(Math.abs(fx - ax)));
+                h = Math.max(1, Math.round(Math.abs(fy - ay)));
+            } else if (con) {
+                x = Math.round(Math.max(0, nx));
+                y = Math.round(Math.max(0, ny));
+                w = Math.max(1, Math.round(Math.min(nr, Wimg) - x));
+                h = Math.max(1, Math.round(Math.min(nb, Himg) - y));
+            } else {
+                x = Math.round(nx);
+                y = Math.round(ny);
+                w = Math.max(1, Math.round(nr - nx));
+                h = Math.max(1, Math.round(nb - ny));
+            }
         }
 
         set("crop_x", x);
@@ -438,19 +512,34 @@ function makeEditor(node) {
     canvas.addEventListener("pointerup", endDrag);
     canvas.addEventListener("pointercancel", endDrag);
 
-    new ResizeObserver(() => render()).observe(root);
+    // Tracked so it's disconnected when the node is deleted (see bat_lifecycle).
+    const track = batTrack(node);
+    track.observer(new ResizeObserver(() => render()), root);
+
+    // Display-only zoom control (bottom-left). Lets the artist pull back to
+    // see area outside the frame when placing an off-canvas crop.
+    attachZoomControl({ wrap: root, canvas, state, onChange: render, corner: "bl" });
 
     node._batCrop = { root, canvas, ctx, state, render };
 
     // rAF watcher: re-render whenever any controlling widget changes from
     // ANY source (handles, number widgets, typed values, workflow restore).
     let lastSig = "";
-    (function watch() {
-        if (!root.isConnected) { requestAnimationFrame(watch); return; }
-        const sig = `${get("crop_x")}|${get("crop_y")}|${get("crop_w")}|${get("crop_h")}|${get("crop_angle")}|${get("snap_to")}|${get("aspect_lock")}|${get("aspect_ratio")}`;
+    let lastConstrain = constrained();
+    // track.rafLoop stops rescheduling once the node is removed. The old
+    // hand-rolled loop did `if (!root.isConnected) { requestAnimationFrame(watch);
+    // return; }` — which re-armed itself FOREVER after the node was deleted,
+    // leaking a per-frame callback (and this whole closure) for the session.
+    track.rafLoop(() => {
+        if (!root.isConnected) return;   // detached but node still alive: idle
+        // Re-clamp the rect the moment the artist turns constrain back ON,
+        // so a rect that was dragged off-canvas snaps back inside.
+        const con = constrained();
+        if (con && !lastConstrain && !state.drag) clampRectToImage();
+        lastConstrain = con;
+        const sig = `${get("crop_x")}|${get("crop_y")}|${get("crop_w")}|${get("crop_h")}|${get("crop_angle")}|${get("snap_to")}|${get("aspect_lock")}|${get("aspect_ratio")}|${con}`;
         if (sig !== lastSig) { lastSig = sig; render(); }
-        requestAnimationFrame(watch);
-    })();
+    });
 
     function ingest(b64, w, h) {
         const img = new Image();
@@ -489,8 +578,12 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
             const el = makeEditor(this);
-            this.addDOMWidget("crop_editor", "crop_editor", el, { serialize: false, hideOnZoom: false });
-            this.size = [Math.max(460, this.size[0] || 0), Math.max(this.size[1] || 0, 580)];
+            // Dual-mode sizing. Under Nodes 2.0 this root (height:100%, no
+            // min-height) had NO height source and collapsed to ~1px.
+            addBatDOMWidget(this, "crop_editor", "crop_editor", el, {
+                minWidth: 460, height: 580, growable: true,
+            });
+            clampNodeSize(this, 460, 580);
             return r;
         };
 
