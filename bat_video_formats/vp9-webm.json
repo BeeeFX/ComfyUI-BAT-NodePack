@@ -2,6 +2,8 @@
     "label": "video/vp9-webm",
     "extension": "webm",
     "browser_playable": true,
+    "requires_even_dims": true,
+    "metadata": "ffmpeg_mkv",
     "video_args": [
         "-c:v", "libvpx-vp9",
         "-pix_fmt", "{pix_fmt}",
@@ -15,7 +17,7 @@
     ],
     "audio_args": ["-c:a", "libopus"],
     "widgets": {
-        "crf":     {"type": "INT",   "default": 30, "min": 0, "max": 63},
-        "pix_fmt": {"type": "COMBO", "default": "yuv420p", "options": ["yuv420p", "yuva420p"]}
+        "crf":     {"type": "INT",   "default": 30, "min": 0, "max": 63, "label": "Quality (CRF, lower=better)"},
+        "pix_fmt": {"type": "COMBO", "default": "yuv420p", "label": "Pixel format", "options": ["yuv420p", "yuva420p"]}
     }
 }

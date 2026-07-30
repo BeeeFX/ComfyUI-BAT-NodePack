@@ -2,6 +2,8 @@
     "label": "video/h265-mp4",
     "extension": "mp4",
     "browser_playable": false,
+    "requires_even_dims": true,
+    "metadata": "ffmpeg_mov",
     "video_args": [
         "-c:v", "libx265",
         "-vtag", "hvc1",
@@ -17,9 +19,9 @@
     ],
     "audio_args": ["-c:a", "aac"],
     "widgets": {
-        "crf":     {"type": "INT",   "default": 22, "min": 0, "max": 51},
-        "pix_fmt": {"type": "COMBO", "default": "yuv420p10le", "options": ["yuv420p10le", "yuv420p"]},
-        "preset":  {"type": "COMBO", "default": "medium",
+        "crf":     {"type": "INT",   "default": 22, "min": 0, "max": 51, "label": "Quality (CRF, lower=better)"},
+        "pix_fmt": {"type": "COMBO", "default": "yuv420p10le", "label": "Pixel format", "options": ["yuv420p10le", "yuv420p"]},
+        "preset":  {"type": "COMBO", "default": "medium", "label": "Encode preset",
                     "options": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]}
     }
 }
