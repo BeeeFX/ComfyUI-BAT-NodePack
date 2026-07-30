@@ -108,6 +108,12 @@ class RefAligner:
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("image", "mask")
     CATEGORY = "BAT/wan"
+    DESCRIPTION = (
+        "Align a reference image onto a plate-sized canvas with a "
+        "Photoshop-style transform (translate / scale / rotate). Built for "
+        "Wan 2.2 Animate, where the reference animates better when its "
+        "framing roughly matches the driving plate."
+    )
     FUNCTION = "align"
 
     def align(self, plate, reference, translate_x, translate_y, scale, rotation,

@@ -210,7 +210,7 @@ class VoltWanContextCalculator:
     RETURN_TYPES = ("STRING", "INT", "INT", "INT", "INT", "INT")
     RETURN_NAMES = ("report", "rec_num_frames", "rec_context_frames", "rec_context_stride", "rec_context_overlap", "num_windows")
     FUNCTION = "analyze"
-    CATEGORY = "BAT/WAN"
+    CATEGORY = "BAT/wan"
     OUTPUT_NODE = True
     DESCRIPTION = "Recommend optimal num_frames / context_frames / stride / overlap values for the WAN sliding-context video model based on the input clip and target priorities."
 
