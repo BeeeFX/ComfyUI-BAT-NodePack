@@ -56,9 +56,19 @@ def _broadcast_to(batch, target_n):
         return batch.repeat((target_n,) + (1,) * (batch.ndim - 1))
     if n > target_n:
         return batch[:target_n]
-    # n in (1, target_n): repeat last frame to pad up.
-    reps = (target_n + n - 1) // n
-    return batch.repeat((reps,) + (1,) * (batch.ndim - 1))[:target_n]
+    # n in (1, target_n): HOLD the last frame to pad up.
+    #
+    # This used to `batch.repeat(reps)[:target_n]`, which cyclically TILES the
+    # batch rather than holding — a 3-frame batch into a 10-frame plate became
+    # 0,1,2,0,1,2,0,1,2,0 instead of 0,1,2,2,2,2,2,2,2,2. Since this helper
+    # broadcasts both the plate and the paste, an artist who trimmed a batch
+    # mid-graph got frames composited from the WRONG source frames with no
+    # warning. Matches bat_crop._broadcast_mask_to_n, which always did this
+    # correctly.
+    pad_n = target_n - n
+    return torch.cat(
+        [batch, batch[-1:].expand((pad_n,) + (-1,) * (batch.ndim - 1))], dim=0
+    )
 
 
 def _feather_local(h, w, feather, device, dtype):
@@ -79,11 +89,33 @@ def _feather_local(h, w, feather, device, dtype):
 
 
 def _feather_rect_mask(H, W, x, y, w, h, feather, device, dtype):
-    """A (1,H,W) mask = feathered rect placed at (x,y,w,h) on a HxW canvas."""
+    """A (1,H,W) mask = feathered rect placed at (x,y,w,h) on a HxW canvas.
+
+    Bounds-safe: when the rect extends off the canvas (e.g. an animated
+    crop where the source rect swings past the image edge mid-clip), we
+    clip both the destination slice on the canvas and the source slice
+    on the feathered patch so they always match. The previous bare
+    `mask[0, y:y+h, x:x+w] = …` would silently misbehave with negative x
+    or y — Python's negative slice semantics meant the feather got
+    written to entirely the wrong part of the canvas, producing
+    misaligned mattes during animations where the rect went off-screen.
+    """
     mask = torch.zeros((1, H, W), device=device, dtype=dtype)
     if w <= 0 or h <= 0:
         return mask
-    mask[0, y:y + h, x:x + w] = _feather_local(h, w, feather, device, dtype)
+    src_x0 = max(0, x)
+    src_y0 = max(0, y)
+    src_x1 = min(W, x + w)
+    src_y1 = min(H, y + h)
+    if src_x1 <= src_x0 or src_y1 <= src_y0:
+        return mask
+    feathered = _feather_local(h, w, feather, device, dtype)
+    dst_x0 = src_x0 - x
+    dst_y0 = src_y0 - y
+    mask[0, src_y0:src_y1, src_x0:src_x1] = feathered[
+        dst_y0:dst_y0 + (src_y1 - src_y0),
+        dst_x0:dst_x0 + (src_x1 - src_x0),
+    ]
     return mask
 
 
@@ -107,19 +139,43 @@ class BatUncrop:
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("image", "mask")
     CATEGORY = "BAT/image"
+    DESCRIPTION = (
+        "Paste a processed crop back onto its original plate using the "
+        "BAT_CROP_INFO from Bat_Crop or Bat_AnimatedCrop. Handles rotated "
+        "rects, per-frame animated rects, edge feathering and aspect fit "
+        "modes."
+    )
     FUNCTION = "uncrop"
 
     def uncrop(self, processed, crop_info, fit_mode, filter, feather_px):
         if not isinstance(crop_info, dict) or "original_image" not in crop_info:
             raise ValueError("Bat_Uncrop: missing crop_info from a Bat_Crop node")
         original = crop_info["original_image"]
+        H = int(crop_info["original_h"])
+        W = int(crop_info["original_w"])
+
+        # New: per-frame source rect list, written by Bat_AnimatedCrop.
+        # When present, dispatch to the animated path; otherwise fall
+        # back to the original single-rect implementation untouched.
+        per_frame = crop_info.get("frames")
+        if isinstance(per_frame, list) and per_frame:
+            return self._uncrop_animated(
+                processed, original, per_frame, H, W,
+                fit_mode, filter, feather_px,
+            )
+
         x = int(crop_info["x"])
         y = int(crop_info["y"])
         w = int(crop_info["w"])
         h = int(crop_info["h"])
-        H = int(crop_info["original_h"])
-        W = int(crop_info["original_w"])
         angle = float(crop_info.get("angle", 0.0))  # 0 for back-compat with older crop_info dicts
+
+        # w/h is the destination rect on the plate — correct for pasting.
+        # Bat_Crop now snaps the crop rect BEFORE slicing, so the image it
+        # emitted is exactly w×h and the `pw == w and ph == h` fast path below
+        # hits, i.e. no resampling. (Legacy crop_info dicts written before that
+        # fix may carry a pre-snap w/h with the image actually at out_w×out_h;
+        # those fall through to the fit_mode branches as they always did.)
 
         device = original.device
         dtype = torch.float32
@@ -170,7 +226,22 @@ class BatUncrop:
             m_batch = m.expand(target_n, H, W)
             m4 = m_batch.unsqueeze(-1)
             paste_canvas = torch.zeros_like(base)
-            paste_canvas[:, paste_y:paste_y + paste_h, paste_x:paste_x + paste_w, :] = paste
+            # Bounds-safe blit: the paste rect can start off the top/left edge
+            # (negative paste_x/y) or run past the right/bottom when the crop
+            # was made with constrain_to_canvas off. Clip the destination slice
+            # on the canvas and the matching source slice on the paste so they
+            # stay the same size — a bare negative-index slice would silently
+            # write to the wrong region (same fix as _feather_rect_mask).
+            src_x0 = max(0, paste_x)
+            src_y0 = max(0, paste_y)
+            src_x1 = min(W, paste_x + paste_w)
+            src_y1 = min(H, paste_y + paste_h)
+            if src_x1 > src_x0 and src_y1 > src_y0:
+                dst_x0 = src_x0 - paste_x
+                dst_y0 = src_y0 - paste_y
+                paste_canvas[:, src_y0:src_y1, src_x0:src_x1, :] = \
+                    paste[:, dst_y0:dst_y0 + (src_y1 - src_y0),
+                             dst_x0:dst_x0 + (src_x1 - src_x0), :]
             out = (base * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
             return (out.contiguous(), m_batch.contiguous())
 
@@ -216,3 +287,151 @@ class BatUncrop:
 
         out = (base * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
         return (out.contiguous(), m_batch.contiguous())
+
+    def _uncrop_animated(self, processed, original, per_frame, H, W,
+                         fit_mode, filter, feather_px):
+        """Animated path: paste each processed frame back at its own source
+        rect (read from `crop_info["frames"]`). Frame counts on both sides
+        are broadcast against the per-frame list — same convention as the
+        scalar path. Slower than the scalar path because each frame builds
+        its own resample grid, but typical batch sizes (a few hundred
+        frames) are well within budget.
+
+        fit_mode is intentionally ignored here. Bat_AnimatedCrop does an
+        unconditional non-uniform stretch from each per-frame rect
+        (w_i, h_i) to the fixed uniform output (out_w, out_h) — it has to,
+        because the per-frame rect aspect varies but the output tensor
+        shape must not. The only correct reversal of an unconditional
+        stretch is another unconditional stretch. With fit_mode="fit"
+        (the default) the reverse would letterbox inside the rect on any
+        frame where the aspect drifted from the first keyframe's;
+        "cover" would center-crop. Both produce visible misalignment as
+        the rect is scaled non-uniformly across the clip.
+        """
+        # Forced for the animated path — see docstring.
+        fit_mode = "stretch"
+        device = original.device
+        dtype = torch.float32
+
+        target_n = max(processed.shape[0], original.shape[0], len(per_frame))
+        base = _broadcast_to(original.to(dtype), target_n).clone()
+        proc = _broadcast_to(processed.to(dtype), target_n)
+
+        ph, pw = int(proc.shape[1]), int(proc.shape[2])
+
+        out_frames = []
+        out_masks = []
+
+        # Pixel grid for the rotated path, built ONCE. It depends only on
+        # (H, W, device, dtype) — the per-frame rect centre and angle are applied
+        # to it as cheap arithmetic below. It used to be rebuilt inside the loop,
+        # so a 300-frame 1080p batch constructed 300 redundant 2M-element grids.
+        # Built lazily: the axis-aligned branch never needs it.
+        _grid_cache = {}
+
+        def _pixel_grid():
+            g = _grid_cache.get("yx")
+            if g is None:
+                g = torch.meshgrid(
+                    torch.arange(H, device=device, dtype=dtype),
+                    torch.arange(W, device=device, dtype=dtype),
+                    indexing="ij",
+                )
+                _grid_cache["yx"] = g
+            return g
+
+        for i in range(target_n):
+            # Per-frame rect; clamp index in case `per_frame` is shorter
+            # than the batch (caller may have padded the image batch
+            # after the crop node — we hold the last rect, like the
+            # interpolator does on the encode side).
+            rect = per_frame[min(i, len(per_frame) - 1)]
+            x = float(rect["x"])
+            y = float(rect["y"])
+            w = max(1, int(rect["w"]))
+            h = max(1, int(rect["h"]))
+            angle = float(rect.get("angle", 0.0))
+
+            # Match the scalar path's fit_mode arithmetic but on one
+            # frame at a time.
+            if fit_mode == "stretch" or (pw == w and ph == h):
+                paste = _resize_nhwc(proc[i:i + 1], h, w, filter)
+                paste_x, paste_y, paste_w, paste_h = int(round(x)), int(round(y)), w, h
+            elif fit_mode == "cover":
+                scale = max(w / pw, h / ph)
+                nw = max(1, int(round(pw * scale)))
+                nh = max(1, int(round(ph * scale)))
+                big = _resize_nhwc(proc[i:i + 1], nh, nw, filter)
+                cx = max(0, (nw - w) // 2)
+                cy = max(0, (nh - h) // 2)
+                paste = big[:, cy:cy + h, cx:cx + w, :].contiguous()
+                paste_x, paste_y, paste_w, paste_h = int(round(x)), int(round(y)), w, h
+            else:  # "fit"
+                scale = min(w / pw, h / ph)
+                nw = max(1, int(round(pw * scale)))
+                nh = max(1, int(round(ph * scale)))
+                paste = _resize_nhwc(proc[i:i + 1], nh, nw, filter)
+                paste_x = int(round(x)) + (w - nw) // 2
+                paste_y = int(round(y)) + (h - nh) // 2
+                paste_w, paste_h = nw, nh
+
+            base_i = base[i:i + 1]
+
+            if abs(angle) < 1e-3:
+                # Axis-aligned fast path for this frame.
+                m = _feather_rect_mask(H, W, paste_x, paste_y, paste_w, paste_h,
+                                       feather_px, device, dtype)
+                m4 = m.unsqueeze(-1)
+                paste_canvas = torch.zeros_like(base_i)
+                # Clip the paste region to the canvas so out-of-bounds rects
+                # don't blow up the slice.
+                src_x0 = max(0, paste_x)
+                src_y0 = max(0, paste_y)
+                src_x1 = min(W, paste_x + paste_w)
+                src_y1 = min(H, paste_y + paste_h)
+                dst_x0 = src_x0 - paste_x
+                dst_y0 = src_y0 - paste_y
+                if src_x1 > src_x0 and src_y1 > src_y0:
+                    paste_canvas[:, src_y0:src_y1, src_x0:src_x1, :] = \
+                        paste[:, dst_y0:dst_y0 + (src_y1 - src_y0),
+                                 dst_x0:dst_x0 + (src_x1 - src_x0), :]
+                frame_out = (base_i * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
+                out_frames.append(frame_out)
+                out_masks.append(m)
+                continue
+
+            # Rotated path: same math as the scalar branch but for one frame.
+            rect_cx = x + w / 2.0
+            rect_cy = y + h / 2.0
+            a = math.radians(angle)
+            cos_t, sin_t = math.cos(a), math.sin(a)
+            ys, xs = _pixel_grid()   # built once, reused every frame
+            dx = xs - rect_cx
+            dy = ys - rect_cy
+            u = cos_t * dx + sin_t * dy
+            v = -sin_t * dx + cos_t * dy
+            pu = u + paste_w / 2.0
+            pv = v + paste_h / 2.0
+            gx = pu / max(1, paste_w - 1) * 2.0 - 1.0
+            gy = pv / max(1, paste_h - 1) * 2.0 - 1.0
+            grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
+
+            paste_nchw = paste.permute(0, 3, 1, 2)
+            sampled = F.grid_sample(paste_nchw, grid, mode="bilinear",
+                                    padding_mode="zeros", align_corners=True)
+            paste_canvas = sampled.permute(0, 2, 3, 1).clamp(0, 1)
+
+            local = _feather_local(paste_h, paste_w, feather_px, device, dtype)
+            local_n = local.unsqueeze(0).unsqueeze(0)
+            m_sampled = F.grid_sample(local_n, grid, mode="bilinear",
+                                      padding_mode="zeros", align_corners=True)
+            m_batch = m_sampled[:, 0].clamp(0, 1)
+            m4 = m_batch.unsqueeze(-1)
+
+            frame_out = (base_i * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
+            out_frames.append(frame_out)
+            out_masks.append(m_batch)
+
+        out = torch.cat(out_frames, dim=0).contiguous()
+        m_out = torch.cat(out_masks, dim=0).contiguous()
+        return (out, m_out)
