@@ -2,6 +2,7 @@
     "label": "video/ffv1-mkv",
     "extension": "mkv",
     "browser_playable": false,
+    "input_color_depth": "16bit",
     "video_args": [
         "-c:v", "ffv1",
         "-level", "3",
@@ -14,10 +15,10 @@
     ],
     "audio_args": ["-c:a", "flac"],
     "widgets": {
-        "slices":  {"type": "COMBO", "default": "16",
+        "slices":  {"type": "COMBO", "default": "16", "label": "Slices",
                     "options": ["4", "6", "9", "12", "16", "20", "24", "30"]},
-        "pix_fmt": {"type": "COMBO", "default": "bgra",
-                    "options": ["bgra", "rgba64le", "yuv420p", "yuv422p", "yuv444p",
+        "pix_fmt": {"type": "COMBO", "default": "rgba64le", "label": "Pixel format",
+                    "options": ["rgba64le", "bgra", "yuv420p", "yuv422p", "yuv444p",
                                 "yuva420p", "yuva422p", "yuva444p",
                                 "yuv420p10le", "yuv422p10le", "yuv444p10le"]}
     }

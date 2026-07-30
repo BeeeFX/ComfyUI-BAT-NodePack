@@ -2,6 +2,8 @@
     "label": "image/webp",
     "extension": "webp",
     "browser_playable": true,
+    "requires_even_dims": true,
+    "metadata": "webp_exif",
     "video_args": [
         "-c:v", "libwebp_anim",
         "-pix_fmt", "yuv420p",
@@ -10,6 +12,6 @@
     ],
     "audio_args": null,
     "widgets": {
-        "quality": {"type": "INT", "default": 80, "min": 0, "max": 100}
+        "quality": {"type": "INT", "default": 80, "min": 0, "max": 100, "label": "Quality (higher=better)"}
     }
 }

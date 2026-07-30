@@ -9,9 +9,9 @@
     ],
     "audio_args": null,
     "widgets": {
-        "pix_fmt": {"type": "COMBO", "default": "gbrpf32le",
+        "pix_fmt": {"type": "COMBO", "default": "gbrpf32le", "label": "Pixel format",
                     "options": ["gbrpf32le", "gbrapf32le"]},
-        "compression": {"type": "COMBO", "default": "zip",
+        "compression": {"type": "COMBO", "default": "zip", "label": "Compression",
                     "options": ["none", "rle", "zip1", "zip", "piz", "pxr24"]}
     }
 }

@@ -8,7 +8,7 @@
     ],
     "audio_args": null,
     "widgets": {
-        "dither": {"type": "COMBO", "default": "sierra2_4a",
+        "dither": {"type": "COMBO", "default": "sierra2_4a", "label": "Dither",
                    "options": ["none", "bayer", "heckbert", "floyd_steinberg", "sierra2", "sierra2_4a"]}
     }
 }

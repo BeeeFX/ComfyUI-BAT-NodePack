@@ -20,8 +20,275 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
+import { batTrack, batNodeCacheKey } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_VideoCombine";
+
+// ─── Dynamic per-format codec widgets ────────────────────────────────────────
+//
+// The node exposes one "format" COMBO (h264 / prores / webm / …). Each format
+// declares its own knobs (crf, preset, profile, …) in bat_video_formats/*.json;
+// we fetch those specs from /bat/video/formats and, whenever the chosen format
+// changes, swap the widgets shown below "format" to match. The widget *names*
+// equal the JSON keys, so ComfyUI's graphToPrompt serialises them straight into
+// the node's inputs, where the Python combine() picks them up via
+// **format_widget_kwargs — no extra plumbing needed.
+//
+// `derived` widgets (e.g. ProRes pix_fmt) aren't shown; they're recomputed from
+// a visible widget (profile) so the user can't pick an invalid combo. They're
+// still serialised (the backend re-derives authoritatively regardless).
+
+let _formatSpecsPromise = null;
+function getFormatSpecs() {
+    // Fetched once per session; the specs are static for a server run.
+    if (!_formatSpecsPromise) {
+        _formatSpecsPromise = api.fetchApi("/bat/video/formats")
+            .then((r) => r.json())
+            .catch((err) => {
+                console.error("[Bat_VideoCombine] could not load format specs:", err);
+                return {};
+            });
+    }
+    return _formatSpecsPromise;
+}
+
+// Marker so we only ever remove widgets WE added (never the node's own).
+const CODEC_WIDGET_FLAG = "_batCodecWidget";
+
+function removeCodecWidgets(node) {
+    if (!node.widgets) return;
+    for (let i = node.widgets.length - 1; i >= 0; i--) {
+        const w = node.widgets[i];
+        if (!w[CODEC_WIDGET_FLAG]) continue;
+        // Prefer the node's own removeWidget (clears _widgetSlotsDirty / store
+        // registration in modern litegraph); fall back to splice on older builds.
+        if (typeof node.removeWidget === "function") {
+            try { node.removeWidget(w); }
+            catch (e) { node.widgets.splice(i, 1); }
+        } else {
+            node.widgets.splice(i, 1);
+        }
+        if (typeof w.onRemove === "function") { try { w.onRemove(); } catch (e) {} }
+    }
+}
+
+// Build (but don't insert) a litegraph widget object from one JSON spec.
+function makeCodecWidget(node, spec, savedValue) {
+    const type = String(spec.type || "STRING").toUpperCase();
+    const hasSaved = savedValue !== undefined && savedValue !== null;
+    const w = {
+        name: spec.name,
+        [CODEC_WIDGET_FLAG]: true,
+        // `label` is what litegraph draws; `name` is what serialises.
+        label: spec.label || spec.name,
+        options: {},
+    };
+
+    if (type === "COMBO" || Array.isArray(spec.options)) {
+        w.type = "combo";
+        w.options = { values: spec.options || [] };
+        w.value = hasSaved ? savedValue : (spec.default ?? (spec.options || [])[0]);
+    } else if (type === "INT" || type === "FLOAT") {
+        w.type = "number";
+        w.options = {
+            min: spec.min, max: spec.max,
+            // INT steps by whole numbers; litegraph's internal step is /10.
+            step: type === "INT" ? 10 : 1,
+            precision: type === "INT" ? 0 : 2,
+        };
+        w.value = hasSaved ? savedValue : (spec.default ?? spec.min ?? 0);
+        w.callback = function (v) {
+            let val = Number(v);
+            if (type === "INT") val = Math.round(val);
+            if (spec.min != null) val = Math.max(spec.min, val);
+            if (spec.max != null) val = Math.min(spec.max, val);
+            this.value = val;
+        };
+    } else if (type === "BOOLEAN") {
+        w.type = "toggle";
+        w.value = hasSaved ? savedValue : !!spec.default;
+    } else {
+        w.type = "text";
+        w.value = hasSaved ? savedValue : (spec.default ?? "");
+    }
+
+    // Hidden (derived) widgets still serialise — the prompt serialiser keys off
+    // widget.name and only skips options.serialize===false, not w.hidden — but
+    // must not draw or reserve a row. Current litegraph excludes widgets with
+    // `w.hidden` from layout (`this.widgets.filter(w => !w.hidden)`); the
+    // computeSize:[0,-4] is a fallback for older builds that size by height.
+    if (spec.hidden) {
+        // `type = "hidden"` is what Nodes 2.0 keys its collapse rule on: the
+        // Vue DOMWidget's computeLayoutSize returns all-zero sizes only when
+        // `this.type === "hidden"`. Setting just `w.hidden = true` left the type
+        // as "number"/"combo"/"text", so derived widgets the artist must NOT
+        // touch (e.g. ProRes pix_fmt) would render as visible, editable rows.
+        // The other two are the Nodes 1.0 legs: litegraph filters on `w.hidden`,
+        // and computeSize:[0,-4] covers older builds that size by height.
+        w.type = "hidden";
+        w.hidden = true;
+        w.computeSize = () => [0, -4];
+    }
+
+    w.node = node;
+    return w;
+}
+
+// Apply a format's `derived` rules: set each hidden target widget's value from
+// its source widget via the JSON map. Called on build and on source change.
+function applyDerived(node, derived) {
+    if (!derived) return;
+    for (const [target, rule] of Object.entries(derived)) {
+        const src = node.widgets?.find((w) => w.name === rule.from);
+        const dst = node.widgets?.find((w) => w.name === target);
+        if (!dst) continue;
+        const key = src != null ? String(src.value) : undefined;
+        const mapped = (rule.map && key in rule.map) ? rule.map[key]
+                     : (rule.default ?? dst.value);
+        dst.value = mapped;
+    }
+}
+
+// Rebuild the codec widgets for the node's currently-selected format.
+// `savedValues` (name→value) lets us restore values after a workflow load.
+async function rebuildCodecWidgets(node, formatLabel, savedValues) {
+    const specs = await getFormatSpecs();
+    const def = specs[formatLabel];
+    removeCodecWidgets(node);
+    if (!def) {
+        console.warn("[Bat_VideoCombine] no widget spec for format", formatLabel,
+                     "— known:", Object.keys(specs));
+        return;
+    }
+    console.info("[Bat_VideoCombine] building", (def.widgets || []).length,
+                 "codec widgets for", formatLabel,
+                 "→", (def.widgets || []).map((w) => w.name));
+
+    // Add via addCustomWidget (NOT a raw node.widgets.push): litegraph wraps the
+    // plain spec into a concrete widget class (toConcreteWidget), marks the slot
+    // layout dirty and binds the node id — a bare push skips all of that and the
+    // widget silently never renders.
+    //
+    // addCustomWidget *appends* to the tail of node.widgets. That tail is past
+    // the DOM player widget (added in onNodeCreated), and a DOM widget occupies
+    // every row from its own `y` down to the node's bottom edge. Anything left
+    // after it therefore lands inside the player's area and is painted over by
+    // the player's <div> — present in node.widgets, positioned, but invisible.
+    // (This is what made the ProRes `profile` dropdown vanish: it sat at y≈336
+    // behind a player spanning y=190→bottom of a 360px-tall node.) So after each
+    // append we move the widget to just *before* the player, giving it a normal
+    // row above the player. Codec widgets still sit after every static widget, so
+    // positional widgets_values restore on load never shifts onto a static one.
+    // (The DOM player is serialize:false, so the serialiser skips it anyway.)
+    const playerIndex = () => node.widgets.findIndex((w) => w.name === "bat_video_player");
+    const derived = def.derived || {};
+    for (const spec of def.widgets || []) {
+        const saved = savedValues ? savedValues[spec.name] : undefined;
+        const plain = makeCodecWidget(node, spec, saved);
+        // addCustomWidget returns the concrete instance; fall back to the plain
+        // object on any older build that lacks the method.
+        const w = (typeof node.addCustomWidget === "function")
+            ? node.addCustomWidget(plain)
+            : (node.widgets.push(plain), plain);
+        // Carry the marker onto the concrete instance (toClass copies own
+        // props, but be explicit so removeCodecWidgets always finds it).
+        w[CODEC_WIDGET_FLAG] = true;
+        // Same three-way hide as makeCodecWidget: type for Nodes 2.0, `hidden`
+        // for current litegraph, computeSize for older builds. (Serialisation is
+        // unaffected — the frontend keys that off serializeValue/options.serialize,
+        // never the widget type — so derived values still reach the backend.)
+        if (spec.hidden) {
+            w.type = "hidden";
+            w.hidden = true;
+            w.computeSize = () => [0, -4];
+        }
+        // Relocate from the tail to just before the DOM player so it draws in a
+        // real row instead of behind the player. No-op when there's no player
+        // widget (the index is then -1 and the widget is already at the tail).
+        const pi = playerIndex();
+        if (pi !== -1 && pi < node.widgets.length - 1) {
+            const idx = node.widgets.indexOf(w);
+            if (idx !== -1) {
+                node.widgets.splice(idx, 1);
+                node.widgets.splice(playerIndex(), 0, w);
+            }
+        }
+        // When a source of a derived rule changes, recompute the target.
+        const drivesDerived = Object.values(derived).some((r) => r.from === spec.name);
+        if (drivesDerived) {
+            const prev = w.callback;
+            w.callback = function (v) {
+                if (typeof prev === "function") prev.call(this, v);
+                applyDerived(node, derived);
+            };
+        }
+    }
+    applyDerived(node, derived);
+
+    // addCustomWidget doesn't resize the node (unlike addWidget, which calls
+    // expandToFitContent), so force a re-layout to grow the node enough to draw
+    // the newly inserted rows.
+    relayoutNode(node);
+}
+
+// Minimum on-canvas size for the node (matches the floor set in onNodeCreated
+// so the DOM player keeps usable room).
+const MIN_NODE_W = 420;
+const MIN_NODE_H = 360;
+
+// Force a node to recompute its size so freshly added widgets actually draw.
+// computeSize() sums every *visible* widget row (the player included, now that
+// codec widgets sit ahead of it), so we take its height as authoritative rather
+// than clamping up from the current height — clamping is what previously pinned
+// the node to the player's size and left no room for the codec rows. We keep a
+// hard floor (MIN_NODE_*) so removing all codec widgets can't shrink the node
+// below a usable player, and grow-only on width to preserve a manual resize.
+function relayoutNode(node) {
+    try {
+        if (typeof node.computeSize === "function") {
+            const computed = node.computeSize();
+            const w = Math.max(node.size?.[0] || 0, computed[0], MIN_NODE_W);
+            const h = Math.max(computed[1] || 0, MIN_NODE_H);
+            if (typeof node.setSize === "function") node.setSize([w, h]);
+            else node.size = [w, h];
+        } else if (typeof node.expandToFitContent === "function") {
+            node.expandToFitContent();
+        }
+    } catch (e) {
+        console.warn("[Bat_VideoCombine] relayout failed:", e);
+    }
+    if (typeof node.setDirtyCanvas === "function") node.setDirtyCanvas(true, true);
+}
+
+// Hook the node's "format" COMBO so changing it rebuilds the codec widgets, and
+// do the initial build. The widget is created by ComfyUI's own node setup, which
+// across frontend versions may finish just after our onNodeCreated runs — so we
+// retry on animation frames until it exists (bounded), then wire it exactly once.
+function wireFormatWidget(node, attempt) {
+    attempt = attempt || 0;
+    const formatWidget = node.widgets?.find((w) => w.name === "format");
+    if (!formatWidget) {
+        if (attempt < 20) {
+            const raf = (typeof requestAnimationFrame === "function")
+                ? requestAnimationFrame : (cb) => setTimeout(cb, 16);
+            raf(() => wireFormatWidget(node, attempt + 1));
+        } else {
+            console.warn("[Bat_VideoCombine] 'format' widget never appeared; codec widgets disabled.");
+        }
+        return;
+    }
+    if (formatWidget[CODEC_WIDGET_FLAG + "_wired"]) return;  // hook once
+    formatWidget[CODEC_WIDGET_FLAG + "_wired"] = true;
+    console.info("[Bat_VideoCombine] wired format widget, value =", formatWidget.value,
+                 "| addCustomWidget?", typeof node.addCustomWidget);
+
+    const prevCb = formatWidget.callback;
+    formatWidget.callback = function (value, ...rest) {
+        if (typeof prevCb === "function") prevCb.call(this, value, ...rest);
+        rebuildCodecWidgets(node, value);
+    };
+    rebuildCodecWidgets(node, formatWidget.value);
+}
 
 function fmtTime(secs) {
     if (!isFinite(secs) || secs < 0) secs = 0;
@@ -29,6 +296,44 @@ function fmtTime(secs) {
     const s  = Math.floor(secs) % 60;
     const m  = Math.floor(secs / 60);
     return `${m}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+}
+
+// ── last-preview persistence ────────────────────────────────────────────
+// `state.preview` used to be populated ONLY from onExecuted, and the DOM player
+// widget is serialize:false — so switching ComfyUI tabs (which tears the widget
+// down and re-runs onConfigure) left the node with no <video src> and the player
+// went black until the graph was re-run. The encoded file is still sitting in
+// the output dir, so all we actually lost was the small JSON reference to it.
+//
+// We stash that reference in localStorage (per-machine, like the roto/anim-crop
+// bg-thumb caches) rather than in a serialised widget: Bat_VideoCombine restores
+// its codec widgets POSITIONALLY from widgets_values (see onConfigure), so adding
+// another serialised widget would shift that offset and break every saved
+// workflow.
+//
+// The key includes the workflow identity, not just node.id. Keying on node id
+// alone (as the roto/anim-crop caches do) collides across workflows — node 14 in
+// another graph would restore this graph's video.
+function _vcPreviewCacheKey(node) {
+    // Shared helper so all four editors scope their caches identically.
+    return batNodeCacheKey(app, "bat_vc_preview", node);
+}
+
+function _vcSavePreview(node, preview) {
+    try {
+        if (!preview) localStorage.removeItem(_vcPreviewCacheKey(node));
+        else localStorage.setItem(_vcPreviewCacheKey(node), JSON.stringify(preview));
+    } catch (_) { /* quota exceeded / storage disabled — non-fatal */ }
+}
+
+function _vcLoadPreview(node) {
+    try {
+        const raw = localStorage.getItem(_vcPreviewCacheKey(node));
+        if (!raw) return null;
+        const p = JSON.parse(raw);
+        // Minimum viable payload — anything less can't build a URL.
+        return (p && typeof p.filename === "string" && p.filename) ? p : null;
+    } catch (_) { return null; }
 }
 
 function buildPreviewUrl(preview) {
@@ -134,6 +439,8 @@ function buildPlayer(node) {
             background:none; border:1px solid #2a2f37; color:#cdd;
             padding:2px 6px; font-size:11px; border-radius:3px; cursor:pointer;
             min-width:22px;
+            white-space:nowrap; line-height:1; display:inline-flex;
+            align-items:center; justify-content:center;
         `;
         b.onmouseover = () => { b.style.background = "rgba(76,158,255,0.15)"; };
         b.onmouseout  = () => { b.style.background = "none"; };
@@ -242,9 +549,25 @@ function buildPlayer(node) {
     // doesn't require us to hook into LiteGraph's onResize. Kept on the
     // node so we can disconnect if the node ever exposes a teardown hook.
     try {
-        const ro = new ResizeObserver(_syncResponsiveSizes);
-        ro.observe(root);
-        node._batVCResizeObserver = ro;
+        // The teardown hook this comment anticipated now exists — batTrack
+        // disconnects the observer (and pauses/releases the <video>) when the
+        // node is removed.
+        const track = batTrack(node);
+        track.observer(new ResizeObserver(_syncResponsiveSizes), root);
+        node._batVCResizeObserver = null;   // superseded by the tracker
+        track.dispose(() => {
+            // Release the media element so a deleted node stops buffering and
+            // drops its decoded frames.
+            try {
+                videoEl.pause();
+                videoEl.removeAttribute("src");
+                videoEl.load();
+                thumbVideo.pause();
+                thumbVideo.removeAttribute("src");
+                thumbVideo.load();
+            } catch (_) {}
+            state.preview = null;
+        });
     } catch (_) { /* very old browsers — sizes stay at the initial values */ }
 
     // ── derived helpers ──────────────────────────────────────────────
@@ -468,8 +791,19 @@ function buildPlayer(node) {
         else          handleTimelineHover(e);
     });
     timeline.addEventListener("pointerup", (e) => {
+        const wasScrub = (dragging === "scrub");
         dragging = null;
         try { timeline.releasePointerCapture(e.pointerId); } catch (_) {}
+        if (wasScrub) {
+            // After a fastSeek-driven drag the video may have landed on
+            // the wrong frame (nearest keyframe rather than the exact
+            // target). Snap precisely now that the user has settled.
+            const f = (state.scrubPendingFrame != null)
+                ? state.scrubPendingFrame
+                : Math.round(timelinePosToTime(e.clientX) * state.fps);
+            state.scrubPendingFrame = null;
+            _seekToFrame(f);
+        }
     });
     timeline.addEventListener("pointercancel", () => { dragging = null; });
     timeline.addEventListener("pointerleave", () => {
@@ -484,19 +818,57 @@ function buildPlayer(node) {
     function handleTimelineMove(e) {
         const t = timelinePosToTime(e.clientX);
         if (dragging === "scrub") {
-            // Repaint the playhead from the requested time IMMEDIATELY,
-            // before the video element finishes seeking. The eye reads
-            // the cursor moving smoothly with the mouse; the frame catches
-            // up when the 'seeked' event fires (which then updates the
-            // label via the existing listener).
+            // The playhead repaints + the time label update immediately
+            // off the requested time, so the cursor glides with the
+            // mouse even while the video decoder is still chewing on
+            // the previous seek.
             _paintPlayhead(t);
-            snapToFrame(Math.round(t * state.fps));
+            const f = Math.max(0, Math.min((state.frameCount || 1) - 1,
+                                            Math.round(t * state.fps)));
+            state.displayedMediaTime = f / state.fps;
+            updateTimeLabel();
+            // Coalesce seeks — only ONE seek in flight at a time.
+            // pointermove can fire ~120 Hz on a high-DPI trackpad, but
+            // each currentTime= write triggers a decoder seek that may
+            // take 10-30ms even for all-I-frame encodes; firing one
+            // per move event piles up backlog and the playhead lags
+            // the cursor. Instead we stash the latest requested frame
+            // and only kick off the next seek when the previous one
+            // resolves (see the `seeked` handler).
+            state.scrubPendingFrame = f;
+            if (!state.scrubSeeking) _drainScrub();
         } else if (dragging === "in") {
             state.loopIn = t;
             inPin.style.left = timeToPctStr(t);
         } else if (dragging === "out") {
             state.loopOut = t;
             outPin.style.left = timeToPctStr(t);
+        }
+    }
+
+    function _drainScrub() {
+        if (state.scrubPendingFrame == null) return;
+        const f = state.scrubPendingFrame;
+        state.scrubPendingFrame = null;
+        state.scrubSeeking = true;
+        // Optimistically anchor stepping math on the requested frame —
+        // a follow-up frame-step click should pick up where the scrub
+        // visually landed, not on the previous video position.
+        state.pendingTarget = f;
+        try {
+            // fastSeek hints to the browser to seek to the nearest
+            // keyframe — for all-I-frame encodes that's exact, for
+            // long-GOP encodes it's an approximation that resolves
+            // far quicker than currentTime=. We snap to exact frame on
+            // pointerup (see below) for the final position.
+            if (typeof videoEl.fastSeek === "function") {
+                videoEl.fastSeek((f + 0.5) / state.fps);
+            } else {
+                videoEl.currentTime = (f + 0.5) / state.fps;
+            }
+        } catch (_) {
+            state.scrubSeeking = false;
+            state.scrubPendingFrame = f;
         }
     }
 
@@ -636,6 +1008,11 @@ function buildPlayer(node) {
         // landed. _paintPlayhead is idempotent, so calling it during
         // drag-scrub on top of the drag handler's call is harmless.
         _paintPlayhead(videoEl.currentTime);
+        // If a scrub coalesced another target while this seek was in
+        // flight, kick off the next one. Done BEFORE the pendingTarget
+        // reconcile below so the in-flight chain stays alive.
+        state.scrubSeeking = false;
+        if (state.scrubPendingFrame != null) _drainScrub();
         const actualFrame = _frameForTime(videoEl.currentTime);
         if (state.pendingTarget != null) {
             // Reconcile the eager update from _seekToFrame against
@@ -707,8 +1084,13 @@ function buildPlayer(node) {
     }
 
     // ── exposed API for onExecuted ───────────────────────────────────
-    async function loadPreview(preview) {
+    // `restoring` is true when we're re-applying a cached preview after a tab
+    // switch / workflow reload rather than reacting to a fresh encode. In that
+    // case we don't autoplay (the artist didn't just ask for this) and we don't
+    // re-write the cache entry we just read.
+    async function loadPreview(preview, restoring = false) {
         state.preview = preview;
+        if (!restoring) _vcSavePreview(node, preview);
         // Seed metadata from the encode payload — fast path so the
         // counter shows the right total before /bat/video/meta resolves.
         state.fps = preview.frame_rate || 24;
@@ -724,7 +1106,9 @@ function buildPlayer(node) {
         const url = buildPreviewUrl(preview);
         videoEl.src = url;
         videoEl.load();
-        videoEl.play().catch(() => {});
+        // Autoplay only for a fresh encode. On a restore we load the first frame
+        // and sit paused, so returning to a tab doesn't start N videos playing.
+        if (!restoring) videoEl.play().catch(() => {});
         // Hidden decoder follows the visible video — same URL, same byte
         // range cache, so the browser usually services its seeks from
         // already-buffered data.
@@ -761,6 +1145,37 @@ function buildPlayer(node) {
 
     node._batVCLoadPreview = loadPreview;
 
+    // Re-apply the last preview after a tab switch / workflow reload. Verified
+    // against the server first: the cached reference can outlive the file (temp
+    // dir cleared, output pruned, encode overwritten), and pointing <video> at a
+    // 404 shows the same black player we're trying to fix. A HEAD-ish GET on the
+    // meta route is cheap and tells us whether the file is still there.
+    node._batVCRestorePreview = async function restorePreview() {
+        if (state.preview) return;              // a fresh encode already landed
+        const cached = _vcLoadPreview(node);
+        if (!cached) return;
+        try {
+            const params = new URLSearchParams({
+                filename: cached.filename,
+                type:     cached.type || "output",
+                subfolder: cached.subfolder || "",
+            });
+            const resp = await api.fetchApi(`/bat/video/meta?${params.toString()}`);
+            if (!resp.ok) { _vcSavePreview(node, null); return; }
+        } catch (_) {
+            // Server unreachable — leave the cache alone and skip the restore;
+            // a later run (or reload) can try again.
+            return;
+        }
+        if (state.preview) return;              // raced with an encode; it wins
+        loadPreview(cached, true);
+    };
+
+    // Kick a restore on build. onConfigure also calls this for the
+    // workflow-load path, where the cached entry may not be readable until the
+    // graph's identity is known.
+    setTimeout(() => { node._batVCRestorePreview?.(); }, 0);
+
     // ResizeObserver isn't necessary — flex layout + native <video> handle
     // the scaling. The DPR pixelation we fixed elsewhere doesn't apply here
     // because we don't render to a canvas at all.
@@ -776,13 +1191,73 @@ app.registerExtension({
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-            const el = buildPlayer(this);
-            this.addDOMWidget("bat_video_player", "bat_video_player", el, {
-                serialize: false, hideOnZoom: false,
+            // The player and the codec widgets are independent — guard the
+            // player build so an addDOMWidget signature change in some frontend
+            // version can't abort onNodeCreated before the codec widgets wire up.
+            try {
+                const el = buildPlayer(this);
+                // Dual-mode sizing (see bat_node_layout.js). Under Nodes 2.0 the
+                // node height comes from computeLayoutSize, so the this.size
+                // assignment below is a no-op there and the player would
+                // otherwise disagree with the node box.
+                addBatDOMWidget(this, "bat_video_player", "bat_video_player", el, {
+                    minWidth: MIN_NODE_W, height: MIN_NODE_H, growable: true,
+                });
+                // Wider than the default to give the controls + scrubber room.
+                clampNodeSize(this, MIN_NODE_W, MIN_NODE_H);
+            } catch (e) {
+                console.error("[Bat_VideoCombine] player widget setup failed:", e);
+            }
+
+            // Wire the format COMBO so picking a codec swaps in its knobs, and
+            // build the knobs for the current selection right away. onConfigure
+            // (below) rebuilds again with saved values when loading a workflow.
+            //
+            // The "format" widget is created by ComfyUI's own node setup. Across
+            // frontend versions that can land slightly after this onNodeCreated
+            // hook, so we don't assume it's present yet: wireFormatWidget retries
+            // on the next frame until it appears, then hooks it once.
+            wireFormatWidget(this);
+            return r;
+        };
+
+        // On workflow load, ComfyUI restores the static widget values
+        // positionally (including "format") and THEN calls onConfigure. At
+        // that point the codec widgets don't exist yet, so their saved values
+        // sit unused at the tail of info.widgets_values. We rebuild the codec
+        // widgets for the restored format and re-apply those tail values in
+        // order (their save order equals the format's JSON widget order).
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            const formatWidget = this.widgets?.find((w) => w.name === "format");
+            if (!formatWidget) return r;
+
+            // Static (serialised) widgets currently present — codec widgets
+            // aren't built yet, so this count is exactly the static prefix
+            // length in the saved widgets_values array.
+            const savedVals = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+            const staticCount = this.widgets.filter(
+                (w) => w.name && w.options?.serialize !== false
+            ).length;
+
+            getFormatSpecs().then((specs) => {
+                const def = specs[formatWidget.value];
+                let savedByName;
+                if (savedVals && def) {
+                    // Tail values after the static prefix map to this format's
+                    // widgets in JSON order (the same order they serialised in).
+                    const tail = savedVals.slice(staticCount);
+                    savedByName = {};
+                    (def.widgets || []).forEach((spec, i) => {
+                        if (i < tail.length) savedByName[spec.name] = tail[i];
+                    });
+                }
+                rebuildCodecWidgets(this, formatWidget.value, savedByName);
             });
-            // Wider than the default to give the controls + scrubber room.
-            this.size = [Math.max(420, this.size[0] || 0),
-                         Math.max(this.size[1] || 0, 360)];
+            // Re-apply the last preview for this workflow+node. Deferred a tick
+            // so the graph's identity (used in the cache key) is settled.
+            setTimeout(() => { this._batVCRestorePreview?.(); }, 0);
             return r;
         };
 

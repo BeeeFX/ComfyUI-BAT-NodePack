@@ -2,6 +2,9 @@
     "label": "video/prores-mov",
     "extension": "mov",
     "browser_playable": false,
+    "requires_even_dims": true,
+    "metadata": "ffmpeg_mov",
+    "input_color_depth": "16bit",
     "video_args": [
         "-c:v", "prores_ks",
         "-profile:v", "{profile}",
@@ -14,9 +17,23 @@
     ],
     "audio_args": ["-c:a", "pcm_s16le"],
     "widgets": {
-        "profile": {"type": "COMBO", "default": "hq",
+        "profile": {"type": "COMBO", "default": "hq", "label": "ProRes profile",
                     "options": ["proxy", "lt", "standard", "hq", "4444", "4444xq"]},
-        "pix_fmt": {"type": "COMBO", "default": "yuv422p10le",
+        "pix_fmt": {"type": "COMBO", "default": "yuv422p10le", "hidden": true,
                     "options": ["yuv422p10le", "yuv444p10le", "yuva444p10le"]}
+    },
+    "derived": {
+        "pix_fmt": {
+            "from": "profile",
+            "default": "yuv422p10le",
+            "map": {
+                "proxy":  "yuv422p10le",
+                "lt":     "yuv422p10le",
+                "standard": "yuv422p10le",
+                "hq":     "yuv422p10le",
+                "4444":   "yuva444p10le",
+                "4444xq": "yuva444p10le"
+            }
+        }
     }
 }
