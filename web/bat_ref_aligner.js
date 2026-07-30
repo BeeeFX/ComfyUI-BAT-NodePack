@@ -13,6 +13,8 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { batTrack } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_RefAligner";
 const HANDLE_R = 7;
@@ -245,7 +247,9 @@ function makeEditor(node) {
     canvas.addEventListener("pointercancel", endDrag);
 
     // Re-render on resize.
-    new ResizeObserver(() => render()).observe(root);
+    // Tracked so it's disconnected when the node is deleted (see bat_lifecycle).
+    const track = batTrack(node);
+    track.observer(new ResizeObserver(() => render()), root);
 
     function ingest(b64, which, w, h) {
         const img = new Image();
@@ -275,12 +279,14 @@ function makeEditor(node) {
     // callback while dragging, so poll the transform values each frame and
     // re-render on any change (cheap — only redraws when something moved).
     let lastSig = "";
-    (function watch() {
-        if (!root.isConnected) { requestAnimationFrame(watch); return; }
+    // track.rafLoop stops rescheduling once the node is removed. The old loop
+    // re-armed itself forever when detached, leaking a per-frame callback (and
+    // this closure, including the decoded reference image) for the session.
+    track.rafLoop(() => {
+        if (!root.isConnected) return;   // detached but node alive: idle
         const sig = `${get("translate_x")}|${get("translate_y")}|${get("scale")}|${get("rotation")}`;
         if (sig !== lastSig) { lastSig = sig; render(); }
-        requestAnimationFrame(watch);
-    })();
+    });
 
     render();
     return root;
@@ -295,7 +301,10 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
             const el = makeEditor(this);
-            this.addDOMWidget("ref_editor", "ref_editor", el, { serialize: false, hideOnZoom: false });
+            // Dual-mode sizing — same collapse as bat_crop under Nodes 2.0.
+            addBatDOMWidget(this, "ref_editor", "ref_editor", el, {
+                minWidth: 460, height: 560, growable: true,
+            });
             // re-render when transform widgets change by hand
             const self = this;
             for (const name of ["translate_x", "translate_y", "scale", "rotation"]) {
@@ -308,7 +317,7 @@ app.registerExtension({
                     };
                 }
             }
-            this.size = [Math.max(460, this.size[0] || 0), Math.max(this.size[1] || 0, 560)];
+            clampNodeSize(this, 460, 560);
             return r;
         };
 

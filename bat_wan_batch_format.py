@@ -181,7 +181,7 @@ class VoltWanBatchFormat:
     RETURN_NAMES = ("image", "mask", "control_video", "debug_window_viz",
                     "frames_added_start", "frames_added_end", "total_frames")
     FUNCTION = "format"
-    CATEGORY = "BAT/WAN"
+    CATEGORY = "BAT/wan"
     DESCRIPTION = "Format an input image batch into the WAN sliding-context structure. Pads / trims to target frame count, applies static-standard window timing, and emits a debug viz of window boundaries."
 
     def format(self, mode, pad_method, pad_position, target_num_frames, pad_frames,
@@ -299,7 +299,7 @@ class VoltWanBatchCrop:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
     RETURN_NAMES = ("image", "mask", "control_video")
     FUNCTION = "crop"
-    CATEGORY = "BAT/WAN"
+    CATEGORY = "BAT/wan"
     DESCRIPTION = "Crop a WAN-formatted batch back to its original frame count after generation, removing the start/end padding produced by ETC WAN Batch Format."
 
     def crop(self, frames_added_start, frames_added_end, image=None, mask=None, control_video=None):

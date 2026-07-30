@@ -63,7 +63,7 @@ class VoltVideoBatchFormat:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "INT")
     RETURN_NAMES = ("image", "mask", "control_video", "frames_added_start", "frames_added_end", "total_frames")
     FUNCTION = "format"
-    CATEGORY = "BAT/Video"
+    CATEGORY = "BAT/video"
     DESCRIPTION = "Generic video batch formatter — pad / trim / normalise an image batch to a target frame count using the selected model's temporal stride."
 
     def format(self, model, custom_temporal_stride, mode, pad_method, pad_position,

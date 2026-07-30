@@ -74,7 +74,7 @@ class VaceBatchTool:
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("images", "masks")
     FUNCTION = "build"
-    CATEGORY = "BAT/VACE"
+    CATEGORY = "BAT/vace"
     DESCRIPTION = "Batch builder for VACE (Video Authoring Compositor) workflows. Composes per-frame image / mask / control inputs into a single stacked batch with optional fill colour and premultiplication."
 
     def build(self, num_frames, premultiply, fill_color, **kwargs):
@@ -159,8 +159,14 @@ class VaceBatchTool:
             if kf_mask is not None:
                 km = _resize_mask(kf_mask, H, W).to(masks.dtype).cpu()
                 masks[idx] = km[0]
-            else:
-                # Image given without a mask → preserve frame (black mask)
+            elif kf_img is not None:
+                # Image given without a mask → preserve frame (black mask).
+                #
+                # This `else` used to hang off `if kf_mask is not None` alone, so
+                # a keyframe that supplied ONLY a mask (no image) also fell in
+                # here and had the mask it just set overwritten with zeros.
+                # Now it only fires for the image-without-mask case the comment
+                # describes.
                 masks[idx] = 0.0
 
         if premultiply:

@@ -1,3 +1,4 @@
+import math
 import torch
 
 class VideoGridSplit:
@@ -18,20 +19,34 @@ class VideoGridSplit:
     RETURN_TYPES = ("IMAGE",)
     OUTPUT_IS_LIST = (True,) 
     FUNCTION = "split_video"
-    CATEGORY = "BAT/Video"
+    CATEGORY = "BAT/video"
     DESCRIPTION = "Split a video frame batch into a grid of sub-clips with optional overlap. Useful for tiled rendering where one input video maps to N output regions."
 
     def split_video(self, images, columns, rows, overlap, start_index, end_index):
         # Input shape: [Batch, Height, Width, Channels]
         b, h, w, c = images.shape
-        
+
+        # Reject grids finer than the pixel grid. Without this, tile_h/tile_w
+        # truncated to 0 and every returned tile was an EMPTY tensor
+        # ([N,0,W,C]), which blows up somewhere downstream with an opaque error
+        # instead of naming the real problem here.
+        if rows > h or columns > w:
+            raise ValueError(
+                f"Bat_VideoGridSplit: grid {columns}x{rows} is finer than the "
+                f"image ({w}x{h}px) — each tile would be zero pixels. Reduce "
+                f"rows/columns."
+            )
+
         # 1. Calculate the Base Tile Size
         base_tile_h = h / rows
         base_tile_w = w / columns
-        
+
         # 2. Calculate the Actual Tile Size (Base + Overlap)
-        tile_h = int(base_tile_h * (1 + overlap))
-        tile_w = int(base_tile_w * (1 + overlap))
+        #    ceil, not int(): truncating dropped the last pixel row/column on
+        #    any size that doesn't divide evenly (e.g. h=1081, rows=3 lost a
+        #    row), leaving a seam when the tiles were recombined.
+        tile_h = min(h, math.ceil(base_tile_h * (1 + overlap)))
+        tile_w = min(w, math.ceil(base_tile_w * (1 + overlap)))
         
         output_list = []
         

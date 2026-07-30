@@ -78,9 +78,14 @@ to 1024 on the longest side; original image dimensions are kept.
             else:
                 pos_coordinates.append({'x': coord['x'], 'y': coord['y']})
 
-        if neg_coordinates:
-            coordinates = json.loads(neg_coordinates)
-            neg_coordinates = []
+        # Parse into a fresh list ALWAYS. Previously `neg_coordinates` stayed a
+        # raw string when falsy (""), so the json.dumps() at the end emitted
+        # '""' instead of '[]' and downstream nodes got a string where they
+        # expected a list.
+        raw_neg = neg_coordinates
+        neg_coordinates = []
+        if raw_neg:
+            coordinates = json.loads(raw_neg)
             for coord in coordinates:
                 coord['x'] = int(round(coord['x']))
                 coord['y'] = int(round(coord['y']))
@@ -108,22 +113,28 @@ to 1024 on the longest side; original image dimensions are kept.
 
                 valid_bboxes.append((x_min, y_min, x_max, y_max))
 
-            bboxes_xyxy = []
+        # NOTE: this block used to be indented INSIDE the loop above, which
+        # (a) re-painted the mask for every accumulated bbox on each iteration
+        # (1+2+3=6 paints for 3 bboxes) and (b) reassigned `bboxes` — the very
+        # list being iterated — to a list of tuples, so the next iteration hit
+        # `tuple.get(...)` and raised AttributeError. The node therefore crashed
+        # with more than one bbox. Dedented to run once after the loop.
+        bboxes_xyxy = []
+        for bbox in valid_bboxes:
+            x_min, y_min, x_max, y_max = bbox
+            bboxes_xyxy.append((x_min, y_min, x_max, y_max))
+            mask[y_min:y_max, x_min:x_max] = 1
+
+        if bbox_format == "xywh":
+            bboxes_xywh = []
             for bbox in valid_bboxes:
                 x_min, y_min, x_max, y_max = bbox
-                bboxes_xyxy.append((x_min, y_min, x_max, y_max))
-                mask[y_min:y_max, x_min:x_max] = 1
-
-            if bbox_format == "xywh":
-                bboxes_xywh = []
-                for bbox in valid_bboxes:
-                    x_min, y_min, x_max, y_max = bbox
-                    w = x_max - x_min
-                    h = y_max - y_min
-                    bboxes_xywh.append((x_min, y_min, w, h))
-                bboxes = bboxes_xywh
-            else:
-                bboxes = bboxes_xyxy
+                w = x_max - x_min
+                h = y_max - y_min
+                bboxes_xywh.append((x_min, y_min, w, h))
+            bboxes = bboxes_xywh
+        else:
+            bboxes = bboxes_xyxy
 
         mask_tensor = torch.from_numpy(mask)
         mask_tensor = mask_tensor.unsqueeze(0).float().cpu()

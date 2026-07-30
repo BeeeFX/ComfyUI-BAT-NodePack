@@ -35,7 +35,11 @@ def _nearest_4n_plus_1(current_frames, round_up):
     upper = lower if lower >= current_frames else lower + VAE_TEMPORAL_STRIDE
 
     if round_up:
-        return upper if upper >= current_frames else upper + VAE_TEMPORAL_STRIDE
+        # `upper` is already >= current_frames by construction (it's `lower`
+        # when lower >= current_frames, else lower + stride), so the old
+        # `upper if upper >= current_frames else upper + STRIDE` fallback was
+        # dead code that could only ever overshoot by a whole stride.
+        return upper
 
     return lower if abs(current_frames - lower) <= abs(upper - current_frames) else upper
 
@@ -76,7 +80,7 @@ class BatWanBatchFrameFormat:
     RETURN_TYPES = ("IMAGE", "MASK", "IMAGE", "INT", "INT", "INT")
     RETURN_NAMES = ("image", "mask", "control_video", "frames_added_start", "frames_added_end", "total_frames")
     FUNCTION = "format"
-    CATEGORY = "BAT/WAN"
+    CATEGORY = "BAT/wan"
     DESCRIPTION = "Pad an image+mask (+optional control_video) batch to a WAN-compatible 4n+1 frame length (or a specific/arbitrary count). Returns the padding counts so VoltWanBatchCrop can trim back after generation."
 
     def format(self, mode, pad_method, pad_position, target_num_frames, pad_frames,
@@ -105,11 +109,23 @@ class BatWanBatchFrameFormat:
         current_frames = ref_count
         H, W = sources[0][2], sources[0][3]
 
-        # Manufacture the missing companion so we always output both
+        # Manufacture the missing companion so we always output both.
+        #
+        # Inherit device AND dtype from whichever input we do have: these used to
+        # be hardcoded CPU/float32, so a CUDA control_video hit
+        # "Expected all tensors to be on the same device" on the torch.cat below.
+        _ref = None
+        for _cand in (image, mask, control_video):
+            if _cand is not None and hasattr(_cand, "device"):
+                _ref = _cand
+                break
+        _dev = _ref.device if _ref is not None else None
+        _dt = _ref.dtype if _ref is not None else torch.float32
         if image is None:
-            image = torch.full((current_frames, H, W, 3), grey_value, dtype=torch.float32)
+            image = torch.full((current_frames, H, W, 3), grey_value,
+                               dtype=_dt, device=_dev)
         if mask is None:
-            mask = torch.zeros((current_frames, H, W), dtype=torch.float32)
+            mask = torch.zeros((current_frames, H, W), dtype=_dt, device=_dev)
 
         # Resolve pad count
         if mode == "arbitrary_pad":
@@ -121,7 +137,11 @@ class BatWanBatchFrameFormat:
             pad_count = max(0, target - current_frames)
 
         if pad_count <= 0:
-            cv_out = control_video if control_video is not None else torch.full((current_frames, H, W, 3), grey_value, dtype=torch.float32)
+            # Same device/dtype inheritance as the manufacture block above — this
+            # early-return path also hardcoded CPU/float32.
+            cv_out = (control_video if control_video is not None
+                      else torch.full((current_frames, H, W, 3), grey_value,
+                                      dtype=_dt, device=_dev))
             return (image, mask, cv_out, 0, 0, current_frames)
 
         # Decide split between start and end
