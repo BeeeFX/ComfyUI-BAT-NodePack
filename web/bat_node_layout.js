@@ -83,6 +83,13 @@ export function vueNodesEnabled() {
  *   ...rest                       forwarded to addDOMWidget options
  * @returns the created widget (or null if addDOMWidget threw)
  */
+/**
+ * Headroom for a growable widget with no explicit `maxHeight`: the artist can
+ * drag an editor to this multiple of its design height, but the layout won't
+ * expand it there on its own. Pass an explicit `maxHeight` to override.
+ */
+const GROW_FACTOR = 3;
+
 export function addBatDOMWidget(node, name, type, el, opts = {}) {
     const {
         minWidth = 320,
@@ -98,8 +105,19 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
         : () => (typeof height === "number" ? height : 240);
 
     const getMin = () => Math.max(1, Math.round(measure()));
+    // A growable widget with no explicit cap used to advertise
+    // Number.MAX_SAFE_INTEGER. Under Nodes 1.0 that was harmless — clampNodeSize
+    // pinned node.size straight after. Under Nodes 2.0 clampNodeSize is a no-op
+    // and height is derived from this ceiling, so "unbounded" reads as "absorb
+    // all available height" and the node grew past the bottom of the viewport
+    // (and resisted manual resize, since the layout re-derived every frame).
+    // Default to a multiple of the design height instead: the node opens at its
+    // design size, the artist can still drag it taller, and it never self-expands
+    // to fill the canvas. An explicit maxHeight still wins.
     const getMax = growable
-        ? () => (maxHeight != null ? Math.round(maxHeight) : Number.MAX_SAFE_INTEGER)
+        ? () => (maxHeight != null
+            ? Math.round(maxHeight)
+            : Math.round(getMin() * GROW_FACTOR))
         : getMin;                       // pinned: min === max
 
     let w = null;
@@ -123,11 +141,13 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
     // default happening to consult our options. This mirrors what the frontend's
     // own video widget does.
     try {
+        // maxHeight goes through getMax() so the growable-with-no-cap case
+        // reports the same real ceiling as the option callbacks above. Returning
+        // `undefined` here previously left the 2.0 layout with no ceiling at all,
+        // which is the other half of the runaway-height bug.
         w.computeLayoutSize = () => ({
             minHeight: getMin(),
-            maxHeight: growable
-                ? (maxHeight != null ? Math.round(maxHeight) : undefined)
-                : getMin(),
+            maxHeight: getMax(),
             minWidth,
         });
     } catch (_) { /* frozen widget object on some builds — options still apply */ }
@@ -137,9 +157,11 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
     // is what the `height:100%`-only editors were missing.
     try {
         el.style.setProperty("--comfy-widget-min-height", `${getMin()}px`);
-        if (!growable) {
-            el.style.setProperty("--comfy-widget-max-height", `${getMin()}px`);
-        }
+        // Publish the ceiling too. Previously only the pinned case set this, so a
+        // growable editor gave the frontend a floor and no ceiling — the CSS-var
+        // half of the runaway-height bug.
+        // (getMax() === getMin() in the pinned case, so this covers both.)
+        el.style.setProperty("--comfy-widget-max-height", `${getMax()}px`);
         // A plain min-height so the element has a height source in ANY flex
         // context — this alone stops bat_crop / bat_ref_aligner collapsing.
         if (!el.style.minHeight) el.style.minHeight = `${getMin()}px`;

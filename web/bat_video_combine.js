@@ -21,6 +21,7 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { batTrack, batNodeCacheKey } from "./bat_lifecycle.js";
+import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 
 const NODE_TYPE = "Bat_VideoCombine";
 
