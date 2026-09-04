@@ -37,6 +37,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .bat_hdr_preview import hdr_tile
+
 # Re-use the grade math from the static node so the two stay in lockstep.
 from .bat_grade import _apply_grade
 
@@ -165,7 +167,7 @@ class BatAnimatedGrade:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "grade"
-    CATEGORY = "BAT/image"
+    CATEGORY = "BAT/Colour"
     DESCRIPTION = (
         "Nuke-style grade with per-frame keyframes. Same math as Bat_Grade "
         "but every parameter is animatable across the input batch via the "
@@ -270,6 +272,20 @@ class BatAnimatedGrade:
             "stride": [int(stride)],
             "frame_count": [int(n)],
         }
+
+        # One high-precision tile for the viewer's Inspect mode. Only one:
+        # the scrub strip above can be 240 frames, and a 16-bit tile per
+        # frame would push tens of megabytes through the UI channel on every
+        # execution. Checking whether a source is really 16-bit is a spot
+        # check on a gradient, not something you scrub, so a single frame
+        # earns its keep and 240 do not. `hdr_frame` tells the JS which one
+        # it got so the viewer can label it rather than imply it follows the
+        # playhead. See bat_hdr_preview.py.
+        hdr_idx = 0
+        tile = hdr_tile(image[hdr_idx])
+        if tile is not None:
+            ui["hdr_tile"] = [tile]
+            ui["hdr_frame"] = [int(hdr_idx)]
         if mask is not None:
             # Send the first mask frame as a thumbnail so the JS preview
             # can replicate the gate too.

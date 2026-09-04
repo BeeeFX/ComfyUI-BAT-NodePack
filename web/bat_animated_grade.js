@@ -20,6 +20,9 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import {
+    hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
+} from "./bat_hdr_preview.js";
 import { batTrack, batNodeCacheKey } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_AnimatedGrade";
@@ -203,8 +206,14 @@ function buildEditor(node) {
         doc: readStateWidget() || { keyframes: {} },
         // image / mask thumbs
         imgW: 0, imgH: 0,
-        sourceData: null,        // ImageData of the current frame thumb
-        maskData:   null,        // ImageData of the mask thumb (grayscale in R channel)
+        // Both sources are the SourceBuffer shape from bat_hdr_preview.js —
+        // RGB interleaved Float32, stride 3 — so the paint loop never branches
+        // on which one is live.
+        source8:    null,        // SourceBuffer for the current frame thumb
+        sourceHdr:  null,        // SourceBuffer for the 16-bit tile, or null
+        hdrFrame:   0,           // which frame that tile came from
+        maskImg:    null,        // <img> of the mask thumb, or null
+        maskCache:  new Map(),   // "WxH" -> Float32Array, rasterised on demand
         previewFrames: [],       // Image objects
         bgStride: 1,
         frameCount: 1,
@@ -254,28 +263,79 @@ function buildEditor(node) {
         };
     }
 
+    // The high-precision tile and the frame thumbs are different sizes
+    // (256px vs 720px long edge), so the mask is rasterised per source size on
+    // demand rather than once at ingest. Cached — a slider drag repaints every
+    // frame. This also replaces the old "only gate when the byte offsets line
+    // up" guard: resampling to the active source means they always line up.
+    function maskFor(w, h) {
+        if (!state.maskImg) return null;
+        const key = `${w}x${h}`;
+        const hit = state.maskCache.get(key);
+        if (hit) return hit;
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        const mctx = c.getContext("2d", { willReadFrequently: true });
+        mctx.drawImage(state.maskImg, 0, 0, w, h);
+        const px = mctx.getImageData(0, 0, w, h).data;
+        const out = new Float32Array(w * h);
+        for (let i = 0, p = 0; i < out.length; i++, p += 4) out[i] = px[p] / 255;
+        state.maskCache.set(key, out);
+        return out;
+    }
+
+    const inspectBar = buildInspectBar({
+        node,
+        storageKey: `bat_anim_grade_view_${node?.id ?? "_"}`,
+        hasHdr: () => !!state.sourceHdr,
+        onChange: () => { updateInspectNote(); schedulePaint(); },
+    });
+
+    // Inspect pins the canvas to the one frame we shipped a 16-bit tile for,
+    // so say so plainly rather than letting the playhead imply otherwise.
+    const inspectNote = document.createElement("span");
+    inspectNote.style.cssText = "opacity:0.75; color:#e8c07a; white-space:nowrap;";
+    function updateInspectNote() {
+        inspectNote.textContent = inspectBar.inspect
+            ? `16-bit \u00b7 frame ${state.hdrFrame + 1}`
+            : "";
+    }
+    inspectBar.el.appendChild(inspectNote);
+
+    function activeSource() {
+        return (inspectBar.inspect && state.sourceHdr) ? state.sourceHdr : state.source8;
+    }
+
     function paintCanvas() {
-        if (!state.sourceData) return;
-        const p = resolveGradeAtFrame(state.currentFrame);
+        const source = activeSource();
+        if (!source) return;
+        // In Inspect the pixels come from the tile's frame, so resolve the
+        // animated grade at that frame too — showing frame 0's pixels under
+        // frame 90's curve would be a lie about both.
+        const gradeFrame = (inspectBar.inspect && state.sourceHdr)
+            ? state.hdrFrame : state.currentFrame;
+        const p = resolveGradeAtFrame(gradeFrame);
         const bp = +p.blackpoint, wp = +p.whitepoint;
         const lift = +p.lift, gain = +p.gain, mult = +p.multiply, off = +p.offset;
         const gamma = Math.max(+p.gamma, 0.01);
         const wpMbp = Math.max(wp - bp, 1e-6), invG = 1 / gamma;
         const cw = !!p.clamp_white, cb = !!p.clamp_black;
-        const src = state.sourceData.data;
-        const w = state.sourceData.width, h = state.sourceData.height;
+        // Float32, stride 3, whether it came from a frame JPEG or the 16-bit
+        // tile. Grading in float and quantising only at the write below is the
+        // point: an 8-bit intermediate here would flatten a 16-bit source to
+        // the same 256 levels as an 8-bit one, which is what the old
+        // Uint8ClampedArray path did.
+        const src = source.data;
+        const w = source.width, h = source.height;
+        const n = w * h;
         const out = ctx.createImageData(w, h);
         const dst = out.data;
-        // Only enable the mask gate when the mask thumb is exactly the
-        // same size as the source thumb — otherwise the per-pixel byte
-        // offset misaligns the gate (paints the right hue in the wrong
-        // place). Set in ingest + restore via mimg.naturalWidth/Height.
-        const mask = (state.maskData
-                      && state.maskData.width === w
-                      && state.maskData.height === h) ? state.maskData.data : null;
-        for (let i = 0; i < src.length; i += 4) {
-            let r = src[i] / 255, g = src[i + 1] / 255, b = src[i + 2] / 255;
-            r = (r - bp) / wpMbp; g = (g - bp) / wpMbp; b = (b - bp) / wpMbp;
+        const mask = maskFor(w, h);
+        // Viewer exposure — after the grade, display only, never rendered.
+        const view = inspectBar.gain;
+        for (let i = 0, sp = 0, q = 0; i < n; i++, sp += 3, q += 4) {
+            const r0 = src[sp], g0 = src[sp + 1], b0 = src[sp + 2];
+            let r = (r0 - bp) / wpMbp, g = (g0 - bp) / wpMbp, b = (b0 - bp) / wpMbp;
             r = r * (gain - lift) + lift;
             g = g * (gain - lift) + lift;
             b = b * (gain - lift) + lift;
@@ -286,15 +346,16 @@ function buildEditor(node) {
             if (cw) { if (r > 1) r = 1; if (g > 1) g = 1; if (b > 1) b = 1; }
             if (cb) { if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0; }
             if (mask) {
-                const m = mask[i] / 255, inv = 1 - m;
-                r = r * m + (src[i]     / 255) * inv;
-                g = g * m + (src[i + 1] / 255) * inv;
-                b = b * m + (src[i + 2] / 255) * inv;
+                const m = mask[i], inv = 1 - m;
+                r = r * m + r0 * inv;
+                g = g * m + g0 * inv;
+                b = b * m + b0 * inv;
             }
-            dst[i]     = r > 1 ? 255 : (r < 0 ? 0 : Math.round(r * 255));
-            dst[i + 1] = g > 1 ? 255 : (g < 0 ? 0 : Math.round(g * 255));
-            dst[i + 2] = b > 1 ? 255 : (b < 0 ? 0 : Math.round(b * 255));
-            dst[i + 3] = 255;
+            if (view !== 1) { r *= view; g *= view; b *= view; }
+            dst[q]     = r > 1 ? 255 : (r < 0 ? 0 : Math.round(r * 255));
+            dst[q + 1] = g > 1 ? 255 : (g < 0 ? 0 : Math.round(g * 255));
+            dst[q + 2] = b > 1 ? 255 : (b < 0 ? 0 : Math.round(b * 255));
+            dst[q + 3] = 255;
         }
         if (canvas.width !== w || canvas.height !== h) {
             canvas.width = w; canvas.height = h;
@@ -564,13 +625,29 @@ function buildEditor(node) {
     });
 
     // ── frame strip seek + range strip pan/zoom ──────────────────────
+    // Playback is held for the duration of a scrub and restored on release.
+    // Without this the play interval keeps ticking under the drag and wraps
+    // end→start, so holding the handle at the last frame flicks between the end
+    // and the start of the loop range. Looping at the end of playback is
+    // deliberate and unchanged — it just shouldn't fire while the artist is
+    // dragging the playhead.
+    let resumeAfterScrub = false;
+    const endScrub = () => {
+        if (!resumeAfterScrub) return;
+        resumeAfterScrub = false;
+        if (!state.playing) togglePlay();
+    };
     frameStrip.addEventListener("pointerdown", (e) => {
+        resumeAfterScrub = state.playing;
+        if (state.playing) togglePlay();
         frameStrip.setPointerCapture(e.pointerId);
         seekFromMouse(e);
     });
     frameStrip.addEventListener("pointermove", (e) => {
         if (e.buttons & 1) seekFromMouse(e);
     });
+    frameStrip.addEventListener("pointerup", endScrub);
+    frameStrip.addEventListener("pointercancel", endScrub);
     function seekFromMouse(e) {
         const r = frameStrip.getBoundingClientRect();
         setFrame(Math.round(pxToFrame(e.clientX - r.left, r.width)));
@@ -694,9 +771,10 @@ function buildEditor(node) {
                 const back = document.createElement("canvas");
                 back.width = img.naturalWidth;
                 back.height = img.naturalHeight;
-                const bctx = back.getContext("2d");
+                const bctx = back.getContext("2d", { willReadFrequently: true });
                 bctx.drawImage(img, 0, 0);
-                state.sourceData = bctx.getImageData(0, 0, back.width, back.height);
+                state.source8 = imageDataToSource(
+                    bctx.getImageData(0, 0, back.width, back.height));
                 state.imgW = img.naturalWidth;
                 state.imgH = img.naturalHeight;
                 _applyCanvasAspect();
@@ -736,7 +814,8 @@ function buildEditor(node) {
     });
 
     // ── ingest from backend ──────────────────────────────────────────
-    node._batAnimGradeIngest = async (frames, w, h, frameCount, stride, b64Mask) => {
+    node._batAnimGradeIngest = async (frames, w, h, frameCount, stride, b64Mask,
+                                      hdrTile, hdrFrame) => {
         state.imgW = w; state.imgH = h;
         state.bgStride = Math.max(1, stride || 1);
         state.previewFrames = await Promise.all(frames.map(b64 => new Promise((res, rej) => {
@@ -763,23 +842,31 @@ function buildEditor(node) {
                 mimg.onload = res; mimg.onerror = rej;
                 mimg.src = `data:image/png;base64,${b64Mask}`;
             });
-            // Use the THUMB's natural dimensions, not the original W/H.
-            // Both the frame and mask thumbs are downsampled server-side
-            // (same _b64 helper, max_dim=720), so they share natural
-            // dimensions when the source mask matches the source image.
-            // Storing the mask at thumb resolution keeps it pixel-
-            // aligned with `state.sourceData` — the paint loop indexes
-            // both ImageData buffers by the same byte offset, so a
-            // mismatch silently misaligns the gate.
-            const mb = document.createElement("canvas");
-            mb.width = mimg.naturalWidth;
-            mb.height = mimg.naturalHeight;
-            const mctx = mb.getContext("2d");
-            mctx.drawImage(mimg, 0, 0);
-            state.maskData = mctx.getImageData(0, 0, mb.width, mb.height);
+            // Kept as an <img> and rasterised to whichever source is live
+            // (see maskFor). The frame thumbs and the 16-bit tile are
+            // different sizes, so storing one pre-rasterised copy would
+            // misalign the gate the moment Inspect is switched on.
+            state.maskImg = mimg;
         } else {
-            state.maskData = null;
+            state.maskImg = null;
         }
+        state.maskCache.clear();
+
+        // High-precision tile for Inspect. Optional at every step — no tile
+        // from the backend, or a browser without DecompressionStream, just
+        // leaves Inspect disabled instead of breaking the frame preview.
+        state.sourceHdr = null;
+        state.hdrFrame = Math.max(0, parseInt(hdrFrame, 10) || 0);
+        if (hdrTile && hdrSupported()) {
+            try {
+                state.sourceHdr = await decodeHdrTile(hdrTile);
+            } catch (e) {
+                console.warn("[Bat_AnimatedGrade] high-precision tile failed to decode:", e);
+            }
+        }
+        inspectBar.refresh();
+        updateInspectNote();
+
         setFrame(Math.min(state.currentFrame, state.frameCount - 1));
     };
 
@@ -804,13 +891,10 @@ function buildEditor(node) {
                 if (cached.mask) {
                     const mim = new Image();
                     mim.onload = () => {
-                        // Same thumb-aligned reasoning as the ingest path.
-                        const mb = document.createElement("canvas");
-                        mb.width = mim.naturalWidth;
-                        mb.height = mim.naturalHeight;
-                        const mctx = mb.getContext("2d");
-                        mctx.drawImage(mim, 0, 0);
-                        state.maskData = mctx.getImageData(0, 0, mb.width, mb.height);
+                        // Same as the ingest path: keep the <img> and let
+                        // maskFor rasterise it to whichever source is live.
+                        state.maskImg = mim;
+                        state.maskCache.clear();
                         schedulePaint();
                     };
                     mim.src = `data:image/png;base64,${cached.mask}`;
@@ -864,6 +948,7 @@ function buildEditor(node) {
     });
     _restoreCachedPreview();
 
+    root.appendChild(inspectBar.el);
     return root;
 }
 
@@ -912,7 +997,11 @@ app.registerExtension({
             const fc = one(message.frame_count) || frames.length || 1;
             const stride = one(message.stride) || 1;
             const mask = one(message.input_mask) || null;
-            if (frames.length && w && h) this._batAnimGradeIngest(frames, w, h, fc, stride, mask);
+            const hdr = one(message.hdr_tile);
+            const hdrFrame = one(message.hdr_frame);
+            if (frames.length && w && h) {
+                this._batAnimGradeIngest(frames, w, h, fc, stride, mask, hdr, hdrFrame);
+            }
             return r;
         };
     },

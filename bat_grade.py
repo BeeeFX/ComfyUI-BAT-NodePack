@@ -26,6 +26,8 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .bat_hdr_preview import hdr_tile
+
 
 def _first(t: torch.Tensor) -> torch.Tensor:
     return t[0:1] if t is not None and t.shape[0] > 1 else t
@@ -134,7 +136,7 @@ class BatGrade:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "grade"
-    CATEGORY = "BAT/image"
+    CATEGORY = "BAT/Colour"
     DESCRIPTION = (
         "Nuke-style grade with blackpoint/whitepoint, lift/gain, "
         "multiply, offset, and gamma. Optional mask gates the grade. "
@@ -171,6 +173,16 @@ class BatGrade:
             "h": [int(image.shape[1])],
             "preview_frame": [int(idx)],
         }
+
+        # Second, high-precision copy of the same frame for the viewer's
+        # Inspect mode. The JPEG above is clamped, 8-bit and lossy, so a
+        # 16-bit and an 8-bit source are indistinguishable through it; this
+        # tile keeps the source's real quantisation steps so a view exposure
+        # can reveal banding. See bat_hdr_preview.py. None on failure, and
+        # the JS falls back to the JPEG.
+        tile = hdr_tile(preview_img[0])
+        if tile is not None:
+            ui["hdr_tile"] = [tile]
         if mask is not None:
             # Same-frame index for the mask, again clamped to its own
             # batch length (mask may be a single-frame mask used across
