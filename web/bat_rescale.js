@@ -48,7 +48,9 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
-import { batTrack, isNodeAlive, batNodeCacheKey } from "./bat_lifecycle.js";
+import {
+    batTrack, isNodeAlive, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay,
+} from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Rescale";
 
@@ -1167,6 +1169,10 @@ function buildViewer(node) {
     };
 
     node._batRescaleRestore = async () => {
+        // A full-res draft replayed from this session's last run beats the
+        // cached thumbnail; both this decode and the token revalidation below
+        // would otherwise land on top of it.
+        if (batPreviewWillReplay(node)) { paintChrome(); return; }
         const cached = loadJson(cacheKey(node), null);
         if (!cached) { paintChrome(); return; }
         state.frames = Number(cached.frames) || 1;
@@ -1228,6 +1234,10 @@ app.registerExtension({
     name: "Bat_Rescale",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

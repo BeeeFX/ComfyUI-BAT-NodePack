@@ -23,6 +23,7 @@ import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import {
     hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
 } from "./bat_hdr_preview.js";
+import { batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Grade";
 
@@ -284,6 +285,9 @@ function buildPreview(node) {
     // live preview shows something the first time the workflow opens,
     // before any Run.
     node._batGradeRestoreFromCache = () => {
+        // A full-res source replayed from this session's last run beats the
+        // cached thumbnail; don't decode over the top of it.
+        if (batPreviewWillReplay(node)) return;
         const cached = _loadCachedPreview(node);
         if (!cached?.image) return;
         node._batGradeIngest(cached.image, cached.mask || null, null);
@@ -297,6 +301,10 @@ app.registerExtension({
     name: "Bat_Grade",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

@@ -39,7 +39,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
-import { batTrack, batNodeCacheKey } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 
@@ -2991,10 +2991,17 @@ function buildEditor(node) {
             state.viewEnd = Math.max(0, state.frameCount - 1);
         }
         // 2) thumbnail from localStorage.
+        // A full-res strip replayed from this session's last run beats the
+        // cached thumbnail; its async decode must not land on top of it.
+        if (batPreviewWillReplay(node)) return;
         const cached = _loadCachedPreview(node);
         if (cached?.firstFrame) {
             const im = new Image();
             im.onload = () => {
+                // The decode may finish after a replayed full-res strip has
+                // landed (this is kicked off before onAfterGraphConfigured
+                // runs), so re-check rather than clobber it.
+                if (batPreviewWillReplay(node)) return;
                 state.previewFrames = [im];
                 state.bgImage = im;
                 state.bgStride = Math.max(1, state.frameCount); // 1 cached frame for the whole range
@@ -3099,6 +3106,10 @@ app.registerExtension({
     name: "Bat_Roto",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

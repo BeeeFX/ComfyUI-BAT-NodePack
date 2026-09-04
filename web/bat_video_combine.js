@@ -31,7 +31,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { batTrack, batNodeCacheKey } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batReplayLastExecution } from "./bat_lifecycle.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 
 const NODE_TYPE = "Bat_VideoCombine";
@@ -1598,6 +1598,10 @@ app.registerExtension({
     name: "Bat_VideoCombine",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         // Rewrite pre-2026-08-06 saved data before LiteGraph applies it. This
         // sits on configure() rather than onConfigure() because by the time

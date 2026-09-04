@@ -37,6 +37,7 @@
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
+import { batReplayLastExecution } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_HDRTonalComposite";
 const MAX_HDR_VERSIONS = 8;   // must match MAX_HDR_VERSIONS in the .py
@@ -801,6 +802,10 @@ app.registerExtension({
     name: "Bat_HDRTonalComposite",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

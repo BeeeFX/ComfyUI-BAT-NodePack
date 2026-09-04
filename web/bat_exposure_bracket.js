@@ -56,7 +56,9 @@
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive } from "./bat_lifecycle.js";
+import {
+    batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution,
+} from "./bat_lifecycle.js";
 import { exposeToSdr, encodeFromLinear, toLinear } from "./bat_transfer.js";
 
 const BRACKET_TYPE = "Bat_ExposureBracket";
@@ -1101,6 +1103,9 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === BRACKET_TYPE) {
             registerCleanup(nodeType);
+            // A graph reload (Ctrl+Z is one) destroys and rebuilds every node,
+            // so replay the last run's tiles into the new instance.
+            batReplayLastExecution(nodeType);
 
             const onCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {
@@ -1176,6 +1181,9 @@ app.registerExtension({
 
         if (nodeData.name === MERGE_TYPE) {
             registerCleanup(nodeType);
+            // A graph reload (Ctrl+Z is one) destroys and rebuilds every node,
+            // so replay the last run's tiles into the new instance.
+            batReplayLastExecution(nodeType);
 
             const onCreated = nodeType.prototype.onNodeCreated;
             nodeType.prototype.onNodeCreated = function () {

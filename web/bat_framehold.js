@@ -66,7 +66,7 @@ import { api } from "../../scripts/api.js";
 import {
     addBatDOMWidget, clampNodeSize, disposeBatLayout, refreshBatLayout,
 } from "./bat_node_layout.js";
-import { batTrack, isNodeAlive, batNodeCacheKey } from "./bat_lifecycle.js";
+import { batTrack, isNodeAlive, batNodeCacheKey, batReplayLastExecution } from "./bat_lifecycle.js";
 
 const NODE_TYPE    = "Bat_Framehold";
 const INFO_ROUTE   = "/bat/framehold/info";
@@ -918,6 +918,10 @@ app.registerExtension({
     name: "BAT.Framehold",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

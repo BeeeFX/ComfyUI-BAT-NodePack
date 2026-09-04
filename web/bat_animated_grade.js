@@ -23,7 +23,7 @@ import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import {
     hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
 } from "./bat_hdr_preview.js";
-import { batTrack, batNodeCacheKey } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_AnimatedGrade";
 
@@ -879,10 +879,17 @@ function buildEditor(node) {
             state.viewStart = 0;
             state.viewEnd = Math.max(0, state.frameCount - 1);
         }
+        // A full-res strip replayed from this session's last run beats the
+        // cached thumbnail; its async decode must not land on top of it.
+        if (batPreviewWillReplay(node)) return;
         const cached = _loadCachedPreview(node);
         if (cached?.firstFrame) {
             const im = new Image();
             im.onload = () => {
+                // The decode may finish after a replayed full-res strip has
+                // landed (this is kicked off before onAfterGraphConfigured
+                // runs), so re-check rather than clobber it.
+                if (batPreviewWillReplay(node)) return;
                 state.previewFrames = [im];
                 state.bgStride = Math.max(1, state.frameCount);
                 if (cached.imgW) state.imgW = cached.imgW;
@@ -956,6 +963,10 @@ app.registerExtension({
     name: "Bat_AnimatedGrade",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

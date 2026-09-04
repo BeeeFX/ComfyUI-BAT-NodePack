@@ -29,7 +29,7 @@
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive } from "./bat_lifecycle.js";
+import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 import { compositeStack, paintLayered } from "./bat_layered_core.js";
 import { MODES, MODE_LABELS } from "./bat_blend_modes.js";
@@ -846,6 +846,10 @@ app.registerExtension({
     name: "Bat_LayeredImages",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         registerCleanup(nodeType);
 

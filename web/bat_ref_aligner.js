@@ -14,7 +14,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
-import { batTrack } from "./bat_lifecycle.js";
+import { batTrack, batReplayLastExecution } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_RefAligner";
 const HANDLE_R = 7;
@@ -301,6 +301,10 @@ app.registerExtension({
     name: "BAT.RefAligner",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {

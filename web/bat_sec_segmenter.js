@@ -43,7 +43,7 @@ import { api } from "../../scripts/api.js";
 import { chainCallback, resolveSourcePreview, captureVideoFrame } from "./bat_points_editor/utility.js";
 import { BaseEditorCanvas } from "./bat_points_editor/editor_base.js";
 import { BatPointsEditor } from "./bat_points_editor/point_editor_canvas.js";
-import { batNodeCacheKey } from "./bat_lifecycle.js";
+import { batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_SecSegmenter";
 
@@ -479,6 +479,10 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData?.name !== NODE_TYPE) return;
 
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
+
         // Duplicating a node used to blank its canvas. The plate lives in two
         // places that a copy can't reach on its own — the in-memory strip from
         // the last run, and a localStorage entry keyed on the node's id (which
@@ -571,6 +575,10 @@ app.registerExtension({
             // a workflow isn't a grey canvas until the first Run.
             setTimeout(async () => {
                 if (!node.editor || node.properties?.imgData) return;
+                // A strip replayed from this session's last run beats the
+                // cached plate — this fires after it, so bail rather than
+                // overwrite the live plate with the stale one.
+                if (batPreviewWillReplay(node)) { updateFrameBounds(node); return; }
                 const cached = loadCachedPlate(node);
                 if (!(await applyCachedPlate(node, cached))) refreshPlate(node);
                 updateFrameBounds(node);
