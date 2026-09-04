@@ -10,14 +10,15 @@
  *   – click inside the box → move it (clamped to image bounds)
  *   – drag a corner → resize from that corner (uniform aspect when
  *     aspect_lock is on, ratio parsed from `aspect_ratio`)
- *   – drag an edge midpoint → resize that single axis
+ *   – drag an edge midpoint → resize that single axis (with aspect_lock on
+ *     the other axis follows the ratio, centred on the rect's centre line)
  *   – click on empty image outside the box → start a fresh rectangle
  */
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
-import { batTrack } from "./bat_lifecycle.js";
+import { batTrack, batReplayLastExecution } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Crop";
 
@@ -429,9 +430,14 @@ function makeEditor(node) {
                     else new_w = new_h * base.ratio;
                 }
             } else if (lx === 0) {
+                // Edge handle: the dragged axis follows the mouse, the other
+                // follows the locked ratio. offx/offy are 0 on the free axis,
+                // so it grows symmetrically about the anchor edge's midpoint.
                 new_h = Math.max(1, Math.abs(v));
+                if (base.lock) new_w = Math.max(1, new_h * base.ratio);
             } else {
                 new_w = Math.max(1, Math.abs(u));
+                if (base.lock) new_h = Math.max(1, new_w / base.ratio);
             }
             // new_center = anchor + R(θ) * (lx * new_w/2, ly * new_h/2)
             const offx = lx * new_w / 2;
@@ -456,8 +462,8 @@ function makeEditor(node) {
             if (nr < nx) { const t = nr; nr = nx; nx = t; }
             if (nb < ny) { const t = nb; nb = ny; ny = t; }
             let nw = nr - nx, nh = nb - ny;
-            const locked = base.lock && which.length === 2;
-            if (locked) {
+            const locked = base.lock;
+            if (locked && which.length === 2) {
                 const wantH = nw / base.ratio;
                 if (wantH > nh) {
                     if (which.includes("t")) ny = nb - wantH; else nb = ny + wantH;
@@ -467,27 +473,49 @@ function makeEditor(node) {
                     if (which.includes("l")) nx = nr - wantW; else nr = nx + wantW;
                     nw = wantW;
                 }
+            } else if (locked && (which === "l" || which === "r")) {
+                // Side handle: width follows the mouse, height follows the
+                // ratio and grows symmetrically about the rect's centre line
+                // so the opposite edge stays put and the ratio holds.
+                nh = nw / base.ratio;
+                ny = base.cy - nh / 2; nb = ny + nh;
+            } else if (locked) {
+                // Top/bottom handle: height follows the mouse, width follows.
+                nw = nh * base.ratio;
+                nx = base.cx - nw / 2; nr = nx + nw;
             }
             if (con && locked) {
-                // Aspect-locked AND constrained: shrink the rect UNIFORMLY
-                // about the fixed anchor corner so it fits the canvas without
-                // breaking the ratio (clamping each edge independently would
-                // deform it). The anchor is the corner NOT being dragged.
-                const ax = which.includes("l") ? nr : nx;   // fixed x edge
-                const ay = which.includes("t") ? nb : ny;   // fixed y edge
-                const dx = which.includes("l") ? -nw : nw;  // signed extent from anchor
-                const dy = which.includes("t") ? -nh : nh;
+                // Aspect-locked AND constrained: fit the rect to the canvas
+                // with a UNIFORM shrink so the ratio survives (clamping each
+                // edge independently would deform it).
+                // Per axis the anchor is either the edge that isn't being
+                // dragged, or — on a side handle's free axis — the rect's
+                // centre line (dx/dy 0), which shrinks from both ends.
+                const hasL = which.includes("l"), hasR = which.includes("r");
+                const hasT = which.includes("t"), hasB = which.includes("b");
+                const ax = hasL ? nr : (hasR ? nx : base.cx);
+                const ay = hasT ? nb : (hasB ? ny : base.cy);
+                const dx = hasL ? -nw : (hasR ? nw : 0);
+                const dy = hasT ? -nh : (hasB ? nh : 0);
                 let s = 1;
                 if (dx > 0)      s = Math.min(s, (Wimg - ax) / dx);
                 else if (dx < 0) s = Math.min(s, (0 - ax) / dx);
+                else s = Math.min(s, Wimg / Math.max(1e-6, nw));
                 if (dy > 0)      s = Math.min(s, (Himg - ay) / dy);
                 else if (dy < 0) s = Math.min(s, (0 - ay) / dy);
+                else s = Math.min(s, Himg / Math.max(1e-6, nh));
                 s = Math.max(0, Math.min(1, s));
-                const fx = ax + dx * s, fy = ay + dy * s;   // scaled far corner
-                x = Math.round(Math.min(ax, fx));
-                y = Math.round(Math.min(ay, fy));
-                w = Math.max(1, Math.round(Math.abs(fx - ax)));
-                h = Math.max(1, Math.round(Math.abs(fy - ay)));
+                const fw = dx !== 0 ? Math.abs(dx * s) : nw * s;
+                const fh = dy !== 0 ? Math.abs(dy * s) : nh * s;
+                // An anchored axis keeps its anchor; a centred one only has to
+                // *fit*, so slide it into frame rather than shrinking the rect
+                // (which would fight the drag).
+                x = Math.round(dx !== 0 ? Math.min(ax, ax + dx * s)
+                                        : clamp(ax - fw / 2, 0, Math.max(0, Wimg - fw)));
+                y = Math.round(dy !== 0 ? Math.min(ay, ay + dy * s)
+                                        : clamp(ay - fh / 2, 0, Math.max(0, Himg - fh)));
+                w = Math.max(1, Math.round(fw));
+                h = Math.max(1, Math.round(fh));
             } else if (con) {
                 x = Math.round(Math.max(0, nx));
                 y = Math.round(Math.max(0, ny));
@@ -578,6 +606,10 @@ app.registerExtension({
     name: "BAT.Crop",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
+        // replay the last run's preview payload into the new instance.
+        batReplayLastExecution(nodeType);
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
