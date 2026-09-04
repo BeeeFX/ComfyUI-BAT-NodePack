@@ -2,7 +2,7 @@
 ComfyUI-BAT-NodePack
 ====================
 Personal node pack — batch / video / VACE / WAN helpers. Authored by
-Baptiste. Not part of the ETC pipeline but kept in the ETC Suite
+BeeeFX. Not part of the ETC pipeline but kept in the ETC Suite
 *About* listing so the nodes are still discoverable.
 
 Historical note: this pack was previously named ``ComfyUI-ETC_Tools``

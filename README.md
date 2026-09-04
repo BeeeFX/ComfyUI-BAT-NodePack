@@ -5,7 +5,7 @@ sliding-context video models (WAN, VACE), generic per-frame batch
 manipulation, and a set of interactive on-node canvas editors — crop,
 animated crop, grade, and roto — for VFX-style shot work.
 
-These are personal tools that I (Baptiste) reach for in everyday workflows;
+These are personal tools that I (BeeeFX) reach for in everyday workflows;
 sharing them in case they're useful to others.
 
 ---
@@ -353,7 +353,7 @@ sequence pattern, so it works on any machine.
 
 ## Author
 
-[Baptiste](https://github.com/BeeeFX) · 2026
+[BeeeFX](https://github.com/BeeeFX) · 2026
 
 ## Licence
 
