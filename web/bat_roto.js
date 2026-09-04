@@ -247,7 +247,18 @@ function buildEditor(node) {
     topRow.appendChild(canvasWrap);
 
     const canvas = document.createElement("canvas");
-    canvas.style.cssText = "width:100%; height:100%; display:block; touch-action:none;";
+    // Absolutely positioned, NOT in flow, and that's load-bearing under Nodes
+    // 2.0. Node height there is clamped every pointer move to
+    // measureMinContentHeight(candidateWidth), which blanks the node's height
+    // and measures the natural DOM height. With the canvas in flow its
+    // `height:100%` resolves against an indefinite parent — i.e. to `auto` — so
+    // it falls back to the intrinsic ratio of its width/height ATTRIBUTES, which
+    // render() sets from the last measured box. Natural height then scales with
+    // width (measured: +962px of height per +100px of width) and the node is
+    // locked to a ~9.6:1 vertical strip that grows taller the wider you drag it.
+    // Out of flow it contributes nothing to that measurement, while filling the
+    // wrap exactly as before whenever the height IS definite.
+    canvas.style.cssText = "position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none;";
     canvasWrap.appendChild(canvas);
 
     const hint = document.createElement("div");
@@ -2199,13 +2210,29 @@ function buildEditor(node) {
 
     // Timeline interaction — seek using viewport-aware px↔frame mapping
     // so scrubbing in a zoomed-in view targets the right frame.
+    // Playback is held for the duration of a scrub and restored on release.
+    // Without this the play interval keeps ticking under the drag and wraps
+    // end→start (see nextPlaybackFrame), so holding the handle at the last
+    // frame flicks between the end and the start of the loop range. Looping at
+    // the end of playback is deliberate and unchanged — it just shouldn't fire
+    // while the artist is dragging the playhead.
+    let resumeAfterScrub = false;
+    const endScrub = () => {
+        if (!resumeAfterScrub) return;
+        resumeAfterScrub = false;
+        if (!state.playing) togglePlay();
+    };
     timelineWrap.addEventListener("pointerdown", (e) => {
+        resumeAfterScrub = state.playing;
+        if (state.playing) togglePlay();
         timelineWrap.setPointerCapture(e.pointerId);
         seekFromMouse(e);
     });
     timelineWrap.addEventListener("pointermove", (e) => {
         if (e.buttons & 1) seekFromMouse(e);
     });
+    timelineWrap.addEventListener("pointerup", endScrub);
+    timelineWrap.addEventListener("pointercancel", endScrub);
     function seekFromMouse(e) {
         const r = timelineWrap.getBoundingClientRect();
         setFrame(Math.round(pxToFrame(e.clientX - r.left, r.width)));
@@ -2496,7 +2523,14 @@ function buildEditor(node) {
         list.style.cssText = "display:flex; flex-direction:column; gap:3px; margin-top:6px;";
         sidebar.appendChild(list);
 
-        for (const sh of state.doc.shapes) {
+        // Listed TOP-DOWN: last in the array paints last, so it's the topmost
+        // layer and belongs at the top of the panel — same as every compositing
+        // app. Rendering the array in its natural order put the bottom layer at
+        // the top of the list, which inverted the whole panel against the
+        // picture and made "▲ raise" walk a row DOWNWARDS. The array itself is
+        // still bottom-to-top paint order, matching bat_roto.py's loop; only the
+        // presentation is flipped.
+        for (const sh of [...state.doc.shapes].reverse()) {
             const isActive = sh.id === state.activeId;
             const row = document.createElement("div");
             row.style.cssText = `
@@ -2635,7 +2669,8 @@ function buildEditor(node) {
                 persist(); recordHistory(); refreshSidebar(); render();
             };
             headTop.append(swatch, name);
-            headBtns.append(downBtn, upBtn, eye, del);
+            // ▲ above ▼, reading the same direction they move the row.
+            headBtns.append(upBtn, downBtn, eye, del);
             head.append(headTop, headBtns);
             row.appendChild(head);
 

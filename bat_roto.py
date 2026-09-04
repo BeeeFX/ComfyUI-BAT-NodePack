@@ -258,7 +258,7 @@ class BatRoto:
     RETURN_TYPES = ("MASK",)
     RETURN_NAMES = ("mask",)
     FUNCTION = "render"
-    CATEGORY = "BAT/image"
+    CATEGORY = "BAT/Mask"
     DESCRIPTION = (
         "Draw animated bezier roto masks on top of an image (sequence). "
         "Multi-shape stacking, per-shape opacity / invert / feather, "
@@ -312,7 +312,14 @@ class BatRoto:
                     # same final intensity = opacity × 1.0.
                     value = float(shape.get("value", 1.0))
                     opacity = float(shape.get("opacity", 1.0))
-                    if value <= 0 or opacity <= 0:
+                    # Only a zero-ALPHA shape is a no-op. A zero-VALUE shape is
+                    # a black matte, and under the src-over composite below it
+                    # erases whatever is beneath it — that's how an artist
+                    # punches a hole through a shape lower in the stack. Skipping
+                    # it here meant the holes existed in the canvas preview (the
+                    # JS composites every visible shape regardless of value) but
+                    # never in the rendered output.
+                    if opacity <= 0:
                         continue
                     points = _resolve_shape_at_frame(shape, f)
                     if not points or len(points) < 2:
