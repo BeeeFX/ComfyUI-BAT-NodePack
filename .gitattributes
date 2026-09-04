@@ -1,0 +1,18 @@
+# Keep all text LF in the repository and on checkout. The pack is edited from
+# a Linux NFS install and from Windows, and a mixed tree turns a one-line
+# change into a whole-file rewrite.
+* text=auto eol=lf
+
+*.exr           binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.webp          binary
+*.mov           binary
+*.mp4           binary
+*.pth           binary
+*.pt            binary
+*.safetensors   binary
+*.ttf           binary
+*.woff2         binary
