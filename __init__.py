@@ -13,17 +13,21 @@ reference the legacy ``Volt_*`` class names trigger ETC_Core's
 "Deprecated nodes detected" migration popup on load — see
 ``ComfyUI-ETC_Core/web/js/etc-node-migration.js`` and
 ``web/bat-migrations.js`` below.
+
+2026-09-02: ``Bat_VideoBatchFormat`` and ``Bat_WanBatchFrameFormat``
+were merged into the single ``Bat_BatchFormat`` ("🦇 Batch Format"),
+which covers every model's frame-count grid rather than one each.
+Both old keys migrate via the same popup.
 """
 
 from .bat_video_grid_split import VideoGridSplit
 from .bat_vace_batch import VaceBatchTool
 from .bat_wan_context_calculator import VoltWanContextCalculator
 from .bat_wan_batch_format import VoltWanBatchFormat, VoltWanBatchCrop
-from .bat_video_batch_format import VoltVideoBatchFormat
+from .bat_batch_format import BatBatchFormat
 from .bat_video_loader import VideoLoader
 from .bat_frame_picker import BatFramePicker
 from .bat_points_editor import BatPointsEditor
-from .bat_wan_frame_format import BatWanBatchFrameFormat
 from .bat_ref_aligner import RefAligner
 from .bat_crop import BatCrop
 from .bat_uncrop import BatUncrop
@@ -31,10 +35,17 @@ from .bat_animated_crop import BatAnimatedCrop
 from .bat_video_combine import BatVideoCombine
 from .bat_grade import BatGrade
 from .bat_animated_grade import BatAnimatedGrade
+from .bat_hdr_tonal_composite import BatHDRTonalComposite
+from .bat_advanced_blend import BatAdvancedBlend
+from .bat_layered_images import BatLayeredImages
+from .bat_rescale import BatRescale
+from .bat_exposure_bracket import BatExposureBracket, BatExposureMerge
 from .bat_roto import BatRoto
 from .bat_filename_prefix import BatFilenamePrefix
 from .bat_mask_morph import BatGrowMask, BatErodeMask
 from .bat_framehold import BatFramehold
+from .bat_sec_segmenter import BatSecSegmenter
+from .bat_sec_advanced import BatSecAdvancedParams
 
 # class_type keys — bumped from Volt_* to Bat_* with the rename. The
 # in-UI migration tool (ETC_Core) detects the old keys on workflow
@@ -46,11 +57,10 @@ NODE_CLASS_MAPPINGS = {
     "Bat_WanContextCalculator": VoltWanContextCalculator,
     "Bat_WanBatchFormat":       VoltWanBatchFormat,
     "Bat_WanBatchCrop":         VoltWanBatchCrop,
-    "Bat_VideoBatchFormat":     VoltVideoBatchFormat,
+    "Bat_BatchFormat":          BatBatchFormat,
     "Bat_VideoLoader":          VideoLoader,
     "Bat_FramePicker":          BatFramePicker,
     "Bat_PointsEditor":         BatPointsEditor,
-    "Bat_WanBatchFrameFormat":  BatWanBatchFrameFormat,
     "Bat_RefAligner":           RefAligner,
     "Bat_Crop":                 BatCrop,
     "Bat_AnimatedCrop":         BatAnimatedCrop,
@@ -58,11 +68,19 @@ NODE_CLASS_MAPPINGS = {
     "Bat_VideoCombine":         BatVideoCombine,
     "Bat_Grade":                BatGrade,
     "Bat_AnimatedGrade":        BatAnimatedGrade,
+    "Bat_HDRTonalComposite":    BatHDRTonalComposite,
+    "Bat_AdvancedBlend":        BatAdvancedBlend,
+    "Bat_LayeredImages":        BatLayeredImages,
+    "Bat_Rescale":              BatRescale,
+    "Bat_ExposureBracket":      BatExposureBracket,
+    "Bat_ExposureMerge":        BatExposureMerge,
     "Bat_Roto":                 BatRoto,
     "Bat_FilenamePrefix":       BatFilenamePrefix,
     "Bat_GrowMask":             BatGrowMask,
     "Bat_ErodeMask":            BatErodeMask,
     "Bat_Framehold":            BatFramehold,
+    "Bat_SecSegmenter":         BatSecSegmenter,
+    "Bat_SecAdvancedParams":    BatSecAdvancedParams,
 }
 
 # Display names — bat emoji prefix so the nodes stand out as
@@ -72,12 +90,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_VaceBatchTool":        "🦇 VACE Batch Tool",
     "Bat_WanContextCalculator": "🦇 WAN Context Calculator",
     "Bat_WanBatchFormat":       "🦇 WAN Batch Format",
-    "Bat_WanBatchCrop":         "🦇 WAN Batch Crop",
-    "Bat_VideoBatchFormat":     "🦇 Video Batch Format",
+    "Bat_WanBatchCrop":         "🦇 Batch Crop",
+    "Bat_BatchFormat":          "🦇 Batch Format",
     "Bat_VideoLoader":          "🦇 Video Loader",
     "Bat_FramePicker":          "🦇 BAT Frame Picker",
     "Bat_PointsEditor":         "🦇 Points Editor",
-    "Bat_WanBatchFrameFormat":  "🦇 WAN Batch Frame Format",
     "Bat_RefAligner":           "🦇 Wan Reference Aligner",
     "Bat_Crop":                 "🦇 Crop",
     "Bat_AnimatedCrop":         "🦇 Animated Crop",
@@ -85,11 +102,19 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_VideoCombine":         "🦇 Video Combine",
     "Bat_Grade":                "🦇 Grade",
     "Bat_AnimatedGrade":        "🦇 Animated Grade",
+    "Bat_HDRTonalComposite":    "🦇 HDR Tonal Composite",
+    "Bat_AdvancedBlend":        "🦇 Advanced Blend",
+    "Bat_LayeredImages":        "🦇 Layered Images",
+    "Bat_Rescale":              "🦇 Rescale",
+    "Bat_ExposureBracket":      "🦇 Exposure Bracket",
+    "Bat_ExposureMerge":        "🦇 Exposure Merge",
     "Bat_Roto":                 "🦇 Roto",
     "Bat_FilenamePrefix":       "🦇 Filename Prefix",
     "Bat_GrowMask":             "🦇 Grow Mask",
     "Bat_ErodeMask":            "🦇 Erode Mask",
     "Bat_Framehold":            "🦇 Framehold",
+    "Bat_SecSegmenter":         "🦇 SeC Segmenter",
+    "Bat_SecAdvancedParams":    "🦇 SeC Advanced Params",
 }
 
 WEB_DIRECTORY = "./web"
