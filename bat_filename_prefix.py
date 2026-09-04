@@ -119,13 +119,20 @@ class BatFilenamePrefix:
                 # Hidden widget, populated/serialised entirely by the front-end.
                 # Holds a JSON list of segment dicts. Kept "required" + STRING so
                 # it serialises into the workflow and rides along on load.
-                "segments": ("STRING", {"default": "[]", "multiline": True}),
+                #
+                # NOT multiline: a multiline STRING makes the frontend build a
+                # real <textarea> DOM widget, and a DOM widget is only hidden by
+                # `widget.hidden` (not by `type = "hidden"`) — one missed flag and
+                # the stranded textarea renders as a full-height grey strip
+                # beside/below the node. A single-line STRING is a plain canvas
+                # widget with no element at all, and holds the JSON just as well.
+                "segments": ("STRING", {"default": "[]", "multiline": False}),
             }
         }
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("filename_prefix",)
-    CATEGORY = "BAT/io"
+    CATEGORY = "BAT/Utility"
     DESCRIPTION = (
         "Build a `filename_prefix` string from an ordered list of path "
         "segments (names and auto-incrementing version numbers), replacing a "

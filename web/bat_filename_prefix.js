@@ -18,6 +18,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { unpinWidgetWidth } from "./bat_node_layout.js";
 
 const NODE_TYPE = "Bat_FilenamePrefix";
 const VERSION_MODES = ["fixed", "increment", "decrement", "randomize"];
@@ -239,9 +240,35 @@ function render(node) {
     node._batPreview.textContent = previewString(node) || "(empty)";
     if (root) root.style.minHeight = "0";
     resize(node);
-    // scrollHeight may be 0 until the browser lays the rows out; re-measure on
-    // the next frame so the node settles to the real content height.
-    requestAnimationFrame(() => resize(node));
+    settle(node);
+}
+
+// The root is still detached during onNodeCreated, and even once attached the
+// first animation frame can land before layout has run — so a single rAF
+// re-measure sometimes kept a stale (too tall) height. Re-measure until the
+// number stops changing, capped so a hidden/collapsed node can't spin forever.
+function settle(node, tries = 5, last = -1) {
+    requestAnimationFrame(() => {
+        const h = contentHeight(node);
+        resize(node);
+        if (h !== last && tries > 0) settle(node, tries - 1, h);
+    });
+}
+
+// Keep the reserved height honest when the editor reflows for reasons we don't
+// drive — node resized narrower so a row wraps, font loaded, zoom changed.
+function observe(node) {
+    if (node._batRO || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => resize(node));
+    ro.observe(node._batRoot);
+    node._batRO = ro;
+
+    const onRemoved = node.onRemoved;
+    node.onRemoved = function () {
+        ro.disconnect();
+        node._batRO = null;
+        return onRemoved ? onRemoved.apply(this, arguments) : undefined;
+    };
 }
 
 // ─── Mutations ───────────────────────────────────────────────────────────────
@@ -283,10 +310,49 @@ function applyAfterGenerate(node) {
 
 // Measured content height of the editor, used both to size the DOM widget's
 // reserved slot (so litegraph doesn't leave a giant grey gap) and to grow the
-// node. Falls back to a sane estimate before the DOM has laid out.
+// node.
+//
+// scrollHeight is the *content* box — it omits the root's padding and border,
+// and it reads 0 before the element is laid out. Both cases used to feed a
+// too-tall number into the pinned widget height, which litegraph then painted
+// as grey node background below the editor. So: sum the children's border boxes
+// plus the flex gaps and the root's own padding/border, which is exact and works
+// even while detached, and only fall back to scrollHeight if that yields 0.
 function contentHeight(node) {
-    const h = node._batRoot ? node._batRoot.scrollHeight : 0;
-    return h || 120;
+    const root = node._batRoot;
+    if (!root) return 0;
+
+    const cs = getComputedStyle(root);
+    const px = (v) => Number.parseFloat(v) || 0;
+    const chrome = px(cs.paddingTop) + px(cs.paddingBottom) +
+                   px(cs.borderTopWidth) + px(cs.borderBottomWidth);
+    const gap = px(cs.rowGap);
+
+    // getBoundingClientRect() reports the box AFTER the canvas zoom transform,
+    // in screen pixels, while everything else here — the padding and gaps from
+    // getComputedStyle, offsetHeight, scrollHeight, and the node height this
+    // feeds — is in unscaled layout units. Mixing the two made the measured
+    // height track the zoom level, so the node grew and shrank as the canvas
+    // zoomed. Divide the rect back out by the transform the element is actually
+    // under, taken from the element itself rather than app.canvas.ds.scale, so
+    // it stays right under whatever container the renderer mounts widgets in.
+    const rootRect = root.getBoundingClientRect();
+    const zoom = (rootRect.width > 0 && root.offsetWidth > 0)
+        ? rootRect.width / root.offsetWidth
+        : 1;
+
+    let inner = 0, n = 0;
+    for (const child of root.children) {
+        const rect = child.getBoundingClientRect().height;
+        const r = rect ? rect / zoom : (child.offsetHeight || child.scrollHeight);
+        if (!r) continue;
+        inner += r;
+        n += 1;
+    }
+    if (n > 1) inner += gap * (n - 1);
+
+    const measured = inner ? inner + chrome : root.scrollHeight + chrome;
+    return Math.ceil(measured);
 }
 
 // Snap the node to fit its content. computeSize() now reflects the DOM widget's
@@ -294,8 +360,23 @@ function contentHeight(node) {
 // well as growing, so removing segments doesn't leave a grey gap. Width keeps
 // the user's wider value but never goes below the minimum.
 function resize(node) {
+    // computeSize() reads the DOM widget's pinned height via getMinHeight /
+    // getMaxHeight, but some frontend versions cache the widget's computed
+    // layout. Clear that cache first or a height measured while the editor was
+    // still taller (or not yet laid out) sticks, and the leftover space paints
+    // as grey node background under the editor.
+    const dom = node._batDom;
+    if (dom) {
+        dom.computedHeight = undefined;
+        if (dom.options) dom.options.minHeight = undefined;
+    }
+
     const min = node.computeSize();
     const w = Math.max(node.size[0] || 0, min[0], 340);
+    // The ResizeObserver that calls this watches the element this resize moves,
+    // so a no-op write is a redraw for nothing — and, if a measurement ever
+    // wobbles by a pixel, a loop. Only write when the size actually changes.
+    if (node.size[0] === w && node.size[1] === min[1]) return;
     node.setSize([w, min[1]]);
     node.setDirtyCanvas(true, true);
 }
@@ -358,8 +439,33 @@ app.registerExtension({
         function initNode(node) {
             const segsWidget = node.widgets?.find((w) => w.name === "segments");
             if (segsWidget) {
+                // Hiding a widget takes all three legs — see the same trio in
+                // bat_animated_grade.js / bat_video_combine.js.
+                //
+                // `type = "hidden"` is what the Nodes 2.0 DOMWidget keys its
+                // zero-size computeLayoutSize() on, and computeSize [0,-4] is
+                // the Nodes 1.0 leg that stops it reserving a row. Neither one
+                // hides the ELEMENT: DomWidgets.vue mounts/shows a DOM widget on
+                // `widget.isVisible()`, which reads `!widget.hidden` and never
+                // looks at the type. `segments` was declared multiline, so the
+                // frontend built it as a real <textarea> DOM widget — and with
+                // `hidden` unset that textarea stayed live: laid out at
+                // widget.y (the top of the node, behind our editor, since it is
+                // registered first), width (widget.width ?? node.width) - 20,
+                // and height computedHeight - 20 = -20. A negative height is an
+                // invalid inline style, so the element fell back to its
+                // `size-full` class — height:100% of the canvas layer. Result:
+                // a borderless grey strip (var(--comfy-input-bg)) hidden behind
+                // the editor and visible as a long box below the node.
+                //
+                // `segments` is also no longer multiline on the Python side, so
+                // there is no textarea to strand any more; this stays correct
+                // for whichever widget flavour the frontend hands us.
                 segsWidget.type = "hidden";
+                segsWidget.hidden = true;
                 segsWidget.computeSize = () => [0, -4];
+                segsWidget.draw = () => {};
+                if (segsWidget.element) segsWidget.element.style.display = "none";
             }
             node._batSegsWidget = segsWidget;
             loadSegments(node);
@@ -378,15 +484,22 @@ app.registerExtension({
             // measured content height makes the widget reserve EXACTLY the
             // editor's height — otherwise it's treated as "growable" and expands
             // to fill the node, producing the grey overflow rectangle.
-            const h = () => contentHeight(node) + 4;
+            const h = () => contentHeight(node);
             const dom = node.addDOMWidget("bat_prefix_editor", "bat_prefix_editor", root, {
                 serialize: false, hideOnZoom: false,
                 getMinHeight: h, getMaxHeight: h, getHeight: h,
             });
+            // Never let a stamped pixel width govern the editor's slot — the
+            // parameters panel brands unrecognised widget types with its own
+            // width via WidgetLegacy. See unpinWidgetWidth() for the full story.
+            unpinWidgetWidth(dom);
             node._batDom = dom;
 
-            node.size = [Math.max(360, node.size[0] || 0), node.size[1] || 0];
+            // Only seed the width; the height comes from the measured editor, so
+            // seeding it here would just be another number to grow out of.
+            node.size[0] = Math.max(360, node.size[0] || 0);
             render(node);
+            observe(node);
         }
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
