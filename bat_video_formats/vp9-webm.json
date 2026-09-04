@@ -18,6 +18,24 @@
     "audio_args": ["-c:a", "libopus"],
     "widgets": {
         "crf":     {"type": "INT",   "default": 30, "min": 0, "max": 63, "label": "Quality (CRF, lower=better)"},
-        "pix_fmt": {"type": "COMBO", "default": "yuv420p", "label": "Pixel format", "options": ["yuv420p", "yuva420p"]}
+        "pix_fmt": {"type": "COMBO", "default": "yuv420p", "label": "Pixel format", "hidden": true,
+                    "options": ["yuv420p", "yuva420p", "yuv420p10le", "yuv420p12le"]},
+        "alpha":   {"type": "BOOLEAN", "default": false, "label": "Alpha channel (8-bit only)"},
+        "bit_depth": {"type": "COMBO", "default": "8", "label": "Bit depth",
+                    "options": ["8", "10", "12"]}
+    },
+    "derived": {
+        "pix_fmt": {
+            "from": ["alpha", "bit_depth"],
+            "default": "yuv420p",
+            "map": {
+                "false|8":  "yuv420p",
+                "false|10": "yuv420p10le",
+                "false|12": "yuv420p12le",
+                "true|8":   "yuva420p",
+                "true|10":  "yuva420p",
+                "true|12":  "yuva420p"
+            }
+        }
     }
 }

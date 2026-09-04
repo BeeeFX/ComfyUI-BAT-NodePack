@@ -7,13 +7,20 @@ The encoder side is ffmpeg-driven (subprocess.Popen, stdin-piped raw RGB
 frames) and reads format definitions from `bat_video_formats/*.json`,
 so adding a new codec is one JSON file. Each format declares whether
 browsers can decode it natively; for those that can't (ProRes, FFV1,
-h265, raw image sequences) the preview path automatically transcodes
+h265, EXR/PNG sequences) the preview path automatically transcodes
 through a lightweight H.264/MP4 endpoint so the on-canvas `<video>`
 element always has something to play.
+
+Image sequences are addressed by their printf pattern rather than a
+filename, so `/bat/video/*` resolves a pattern into the ordered frame list
+on disk (see _resolve_request_target) and feeds ffmpeg the pattern plus a
+`-framerate` and `-start_number`. EXR additionally accepts a view transform
+(`trc=srgb|rec709`) for scene-linear renders, which read near-black 1:1.
 
 Sibling JS file: ``web/bat_video_combine.js`` owns the player UI.
 """
 
+import asyncio
 import hashlib
 import io
 import json
@@ -60,14 +67,49 @@ _ALPHA_PIX_FALLBACK = {
     "yuva444p12le": "yuv444p12le",
     "yuva444p16le": "yuv444p16le",
     "yuva444p":     "yuv444p",
+    "yuva422p16le": "yuv422p16le",
+    "yuva422p12le": "yuv422p12le",
     "yuva422p10le": "yuv422p10le",
     "yuva422p":     "yuv422p",
+    "yuva420p16le": "yuv420p16le",
+    "yuva420p12le": "yuv420p12le",
+    "yuva420p10le": "yuv420p10le",
     "yuva420p":     "yuv420p",
+    "gbrap16le":    "gbrp16le",
+    "gbrap12le":    "gbrp12le",
+    "gbrap10le":    "gbrp10le",
+    "gbrapf32le":   "gbrpf32le",
     "rgba64le":     "rgb48le",
     "rgba64be":     "rgb48be",
     "rgba":         "rgb24",
-    "bgra":         "bgr24",
+    # bgr0, not bgr24: bgra's only user is FFV1's 8-bit RGB layout, and ffv1
+    # encodes bgr0 but not bgr24 (`ffmpeg -h encoder=ffv1`).
+    "bgra":         "bgr0",
 }
+
+
+def _pix_fmt_bits(pix_fmt: str) -> int:
+    """Bits per component implied by an ffmpeg pix_fmt name.
+
+    Used only to cross-check the artist's `bit_depth` against the pix_fmt the
+    format's `derived` rules actually landed on, so a codec that can't honour
+    the requested depth in the requested layout says so in the log.
+
+    Packed RGB names carry the TOTAL width across components (rgb48 = 3x16,
+    rgba64 = 4x16); planar names carry the per-component width (yuv420p10le,
+    gbrp12le). Names with no digits at all (rgb24 aside) are 8-bit."""
+    if not pix_fmt:
+        return 8
+    if pix_fmt.endswith(("f32le", "f32be")):
+        return 32
+    m = re.match(r"^(rgba|bgra|rgb|bgr)(\d+)(?:le|be)?$", pix_fmt)
+    if m:
+        comps = 4 if m.group(1) in ("rgba", "bgra") else 3
+        return (int(m.group(2)) // comps) or 8
+    m = re.search(r"p(\d{1,2})(?:le|be)$", pix_fmt)
+    if m:
+        return int(m.group(1))
+    return 8
 
 # ─── Format catalogue ───────────────────────────────────────────────────────
 
@@ -100,16 +142,83 @@ def _format_choices() -> list:
     return list(_load_formats().keys()) or ["video/h264-mp4"]
 
 
+_DERIVED_SEP = "|"
+
+
+def _derived_sources(rule: dict) -> list:
+    """Normalise a `derived` rule's `from` to a list of widget names.
+
+    Single-source rules spell it as a bare name ("profile"); composite rules
+    spell it as a list (["layout", "bit_depth"]) and join the source values
+    with `sep` to key the map ("yuv444|12"). Composite rules exist because
+    bit depth and chroma/alpha layout are independent axes that together pick
+    one pix_fmt — enumerating a flat pix_fmt list instead is what used to put
+    "rgba64le" and "yuv420p" in the same dropdown."""
+    src = rule.get("from")
+    if src is None:
+        return []
+    return list(src) if isinstance(src, (list, tuple)) else [src]
+
+
+def _map_key(value) -> str:
+    """Stringify a widget value the way `derived` map keys spell it.
+
+    JSON — and therefore the JS mirror of these rules — spells booleans
+    "true"/"false", but str(True) in Python is "True", so a BOOLEAN widget
+    (the alpha toggles) would never match its own map entry without this."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _infer_sources(fmt: dict, overrides: dict, values: dict) -> None:
+    """Back-fill a derived rule's *sources* from an explicitly-passed *target*.
+
+    Retro-compat leg. `bit_depth` (and the alpha/layout widgets beside it) were
+    added after these formats shipped, so a workflow saved before then carries
+    only the old visible `pix_fmt` in its widgets_values and no bit_depth at
+    all. Re-deriving from the bit_depth *default* would silently rewrite such a
+    workflow's pixel format — a 10-bit h265 saved last month would come back
+    8-bit. So when the caller supplied the target but left its sources out
+    entirely, run the map backwards to recover the sources that produced it.
+
+    Only fires for sources the caller omitted; an explicitly-passed source
+    always wins, and the forward derivation still runs afterwards, so an
+    invalid hand-passed combination still can't survive.
+
+    web/bat_video_combine.js mirrors this in onConfigure, against the
+    positional widgets_values tail — see inferSourcesFromDerived() there."""
+    for target, rule in (fmt.get("derived") or {}).items():
+        if overrides.get(target) is None:
+            continue
+        sources = _derived_sources(rule)
+        missing = [s for s in sources if overrides.get(s) is None]
+        if not sources or not missing:
+            continue
+        wanted = _map_key(overrides[target])
+        key = next((k for k, v in (rule.get("map") or {}).items()
+                    if _map_key(v) == wanted), None)
+        if key is None:
+            continue
+        parts = str(key).split(rule.get("sep", _DERIVED_SEP))
+        if len(parts) != len(sources):
+            continue
+        for name, part in zip(sources, parts):
+            if name in missing:
+                values[name] = part
+
+
 def _resolve_widget_values(fmt: dict, overrides: dict) -> dict:
     """Resolve every codec-widget value for one format.
 
     For each declared widget: take the caller's override if present, else the
     JSON default. Then apply `derived` mappings, which compute one widget's
-    value from another's (e.g. ProRes pix_fmt from the chosen profile, so the
-    UI only needs to expose `profile`). Derived widgets are resolved *after*
-    the base pass and always win over any incoming value — they exist so an
-    invalid hand-passed combination (4444 profile + 4:2:2 pix_fmt) can't slip
-    through, whether it comes from the UI's hidden widget or a raw API call."""
+    value from one or more others (e.g. ProRes pix_fmt from the chosen profile,
+    h265 pix_fmt from the chosen bit depth, so the UI only exposes the axes an
+    artist actually thinks in). Derived widgets are resolved *after* the base
+    pass and always win over any incoming value — they exist so an invalid
+    hand-passed combination (4444 profile + 4:2:2 pix_fmt) can't slip through,
+    whether it comes from the UI's hidden widget or a raw API call."""
     widgets = fmt.get("widgets") or {}
     values = {}
     for name, spec in widgets.items():
@@ -118,14 +227,59 @@ def _resolve_widget_values(fmt: dict, overrides: dict) -> dict:
         else:
             values[name] = spec.get("default")
 
+    # Drop values that are no longer on offer. An option list can change shape
+    # between versions (EXR's `compression` listed four names ffmpeg rejects,
+    # so the saved value could be one ffmpeg refuses to parse); a stale value
+    # would otherwise reach ffmpeg and fail the whole encode.
+    for name, spec in widgets.items():
+        opts = spec.get("options")
+        if opts and values.get(name) is not None and values[name] not in opts:
+            logger.warning(
+                "Bat_VideoCombine: %s is not a valid %s for %s — using %r.",
+                values[name], name, fmt.get("label", "format"), spec.get("default"),
+            )
+            values[name] = spec.get("default", opts[0])
+
+    _infer_sources(fmt, overrides, values)
+
     for target, rule in (fmt.get("derived") or {}).items():
-        source = rule.get("from")
-        src_val = values.get(source)
+        sources = _derived_sources(rule)
+        sep = rule.get("sep", _DERIVED_SEP)
+        key = sep.join(_map_key(values.get(s)) for s in sources)
         mapping = rule.get("map") or {}
-        # str() so int/enum source values still key the (JSON string) map.
-        values[target] = mapping.get(str(src_val), rule.get("default", values.get(target)))
+        values[target] = mapping.get(key, rule.get("default", values.get(target)))
 
     return values
+
+
+def _pipe_depth(fmt: dict, widget_values: dict):
+    """How deep to pack the frames we hand ffmpeg on stdin: 8, 16 or "32f".
+
+    This is the *pipe*, not the file — it only has to be at least as deep as
+    the codec, so the encoder quantises from the float tensor rather than from
+    an already-truncated 8-bit copy.
+
+    Preference order:
+      1. `input_color_depth: "32f"` — the format is float end to end (EXR).
+         Never narrow that to an integer pipe whatever bit_depth says; EXR
+         picks half vs. float with its own `-format` arg, downstream of us.
+      2. The format's `bit_depth` widget, when it declares one. "8" gets the
+         cheap 8-bit pipe (half the bytes over stdin); 10 / 12 / 16 need 16.
+      3. The legacy static `input_color_depth` key, for formats that declare
+         no bit_depth widget of their own."""
+    declared = fmt.get("input_color_depth")
+    if declared == "32f":
+        return "32f"
+    bd = widget_values.get("bit_depth")
+    if bd is not None:
+        text = str(bd).strip().lower()
+        if text.endswith("f"):          # "16f" / "32f" — float codecs
+            return "32f"
+        try:
+            return 8 if int(text) <= 8 else 16
+        except ValueError:
+            pass
+    return 16 if declared == "16bit" else 8
 
 
 def _expand_widget_args(args: list, widget_values: dict) -> list:
@@ -231,54 +385,120 @@ def _safe_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)
 
 
-def _tensor_to_bytes(images: torch.Tensor, bit_depth: int = 8) -> bytes:
-    """Flatten an (N, H, W, 3 or 4) float tensor to packed RGB(A) bytes.
+# Cleared the first time torch's uint16 bridge to numpy turns out to be
+# missing (it landed in torch 2.3, and this pack ships into checkouts on
+# older builds). Once cleared we stay on the numpy path for the process —
+# the capability can't come back mid-run, so there's no point re-probing it
+# once per frame.
+_TORCH_U16_OK = True
+
+
+def _packed_bytes(arr: np.ndarray, dtype) -> bytes:
+    """Raw bytes of `arr` in an explicitly little-endian dtype.
+
+    The pipe layouts ffmpeg is told to expect (rgb48le/rgba64le, gbrpf32le)
+    are little-endian by name, so the byte order has to be pinned rather than
+    inherited from the host. `copy=False` makes that free on x86 — the cast is
+    a no-op there and only does real work on a big-endian host."""
+    return arr.astype(dtype, copy=False).tobytes()
+
+
+def _pack(t: torch.Tensor, bit_depth) -> bytes:
+    """Pack a float tensor of shape (..., H, W, 3 or 4) to raw frame bytes.
 
     bit_depth=8 packs uint8 (rgb24/rgba). bit_depth=16 packs little-endian
     uint16 (rgb48le/rgba64le) so codecs that carry more than 8 bits per
-    channel — ProRes (10-bit), FFV1, 16-bit PNG — receive the full precision
-    of the incoming float tensor instead of a value pre-truncated to 256
-    levels. Feeding 8-bit input into a 10-bit codec (the previous behaviour)
-    produced a file *labelled* 10-bit but with only 8 bits of real data;
-    banding in smooth gradients survived the round-trip. ComfyUI IMAGE
-    tensors are float in [0,1], so the extra precision is genuinely present
-    whenever upstream nodes work in float (grades, blurs, VAE decode)."""
-    arr = images.detach().cpu().numpy()
+    channel — ProRes (10-bit), h265 (up to 12), FFV1 and 16-bit PNG — receive
+    the full precision of the incoming float tensor instead of a value
+    pre-truncated to 256 levels. Feeding 8-bit input into a 10-bit codec (the
+    behaviour before `input_color_depth`) produced a file *labelled* 10-bit
+    with only 8 bits of real data; banding in smooth gradients survived the
+    round-trip.
+
+    bit_depth="32f" packs float32 as PLANAR G, B, R (+A) — ffmpeg's
+    gbrpf32le/gbrapf32le rawvideo layout — for EXR. That path deliberately
+    does NOT clamp: EXR is scene-referred, so values outside [0,1] are the
+    whole point of choosing it, and clamping here would throw away exactly the
+    headroom an EXR deliverable exists to carry. (Note that ComfyUI's own
+    VAE.decode clamps its output to [0,1], so an unclamped range only survives
+    if the graph produces it some other way.)
+
+    The quantise runs in torch rather than numpy, and *before* any move off the
+    GPU. Two reasons, both measured at 1080p/4K on a 28-core box:
+
+      1. numpy's `np.clip(arr * 65535.0 + 0.5, 0, 65535).astype("<u2")` — what
+         this used to be — walks the frame four times and materialises three
+         full-frame float32 temporaries, single-threaded: 17 ms/frame at 1080p,
+         86 ms at 4K. Torch does the same arithmetic across its thread pool in
+         4.7 / 29.5 ms. On the streaming encode that mattered, because packing
+         was the bottleneck, not the codec: a 4K h264 encode spent 4.3s of 7.3s
+         in here, i.e. we were starving ffmpeg rather than waiting on it.
+      2. Quantising first and copying second halves what crosses the PCIe bus
+         for a GPU-resident tensor (float32 -> uint16), and does the arithmetic
+         on the device. Packing a CUDA frame went 102 ms -> 25 ms at 4K; the old
+         order was actually *slower* than a CPU tensor.
+
+    Bit-for-bit identical to the numpy version it replaced — same float32
+    arithmetic, same round-half-up bias, same truncating cast — so this is a
+    speed change only. Nothing here may run in-place: callers hand us a view
+    into the caller's IMAGE tensor (see _iter_encode_frames), and ComfyUI
+    caches node outputs, so mutating it would poison the cached upstream
+    result. `mul()` allocates; only the fresh tensor it returns is touched
+    in-place after that."""
+    global _TORCH_U16_OK
+    t = t.detach()
+    if bit_depth == "32f":
+        # (..., H, W, C) -> (..., C, H, W), then reorder RGB(A) to GBR(A).
+        order = [1, 2, 0] + ([3] if t.shape[-1] == 4 else [])
+        idx = torch.tensor(order, device=t.device)
+        planar = torch.index_select(t.to(torch.float32).movedim(-1, -3), -3, idx)
+        return _packed_bytes(planar.contiguous().cpu().numpy(), "<f4")
     if bit_depth == 16:
-        arr = np.clip(arr * 65535.0 + 0.5, 0, 65535).astype("<u2")
-        return arr.tobytes()
-    arr = np.clip(arr * 255.0 + 0.5, 0, 255).astype(np.uint8)
-    return arr.tobytes()
+        if _TORCH_U16_OK:
+            try:
+                q = (t.to(torch.float32).mul(65535.0).add_(0.5)
+                     .clamp_(0, 65535).to(torch.uint16))
+                return _packed_bytes(q.cpu().numpy(), "<u2")
+            except (RuntimeError, TypeError):
+                _TORCH_U16_OK = False
+                logger.debug(
+                    "Bat_VideoCombine: torch has no uint16->numpy bridge on "
+                    "this build; packing 16-bit frames via numpy instead."
+                )
+        arr = t.cpu().numpy()
+        return np.clip(arr * 65535.0 + 0.5, 0, 65535).astype("<u2").tobytes()
+    q = t.to(torch.float32).mul(255.0).add_(0.5).clamp_(0, 255).to(torch.uint8)
+    return _packed_bytes(q.cpu().numpy(), np.uint8)
 
 
-def _frame_to_bytes(frame: torch.Tensor, bit_depth: int = 8) -> bytes:
+def _tensor_to_bytes(images: torch.Tensor, bit_depth=8) -> bytes:
+    """Flatten an (N, H, W, 3 or 4) float tensor to packed RGB(A) bytes.
+
+    ComfyUI IMAGE tensors are float, so the extra precision the 16-bit and
+    float pipes carry is genuinely present whenever upstream nodes work in
+    float (grades, blurs, VAE decode). See _pack for the layouts."""
+    return _pack(images, bit_depth)
+
+
+def _frame_to_bytes(frame: torch.Tensor, bit_depth=8) -> bytes:
     """Pack a single (H, W, 3 or 4) float frame to raw RGB(A) bytes.
 
     Same packing as _tensor_to_bytes but for one frame at a time, so the
     streaming encoder can convert-and-pipe frame N while ffmpeg encodes frame
     N-1 — no full-clip intermediate array. Kept separate (rather than looping
     _tensor_to_bytes over a length-1 slice) to avoid the per-call unsqueeze /
-    reshape churn on the hot path."""
-    arr = frame.detach().cpu().numpy()
-    if bit_depth == 16:
-        return np.clip(arr * 65535.0 + 0.5, 0, 65535).astype("<u2").tobytes()
-    return np.clip(arr * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes()
+    reshape churn on the hot path. The move off the GPU happens inside _pack,
+    after the quantise, so only the packed bytes cross the bus."""
+    return _pack(frame, bit_depth)
 
 
-def _iter_encode_frames(images: torch.Tensor, pingpong: bool):
+def _iter_encode_frames(images: torch.Tensor):
     """Yield frames in encode order without materialising a second copy.
 
-    pingpong appends the reversed middle frames (1..n-2) after the forward
-    pass so the clip palindromes — but as a lazy index walk, not a
-    torch.cat of the whole reversed tensor. Each yielded item is a single
-    (H, W, C) view into the original tensor; padding/packing happen
-    downstream per frame."""
-    n = images.shape[0]
-    for i in range(n):
+    Each yielded item is a single (H, W, C) view into the original tensor;
+    padding/packing happen downstream per frame."""
+    for i in range(images.shape[0]):
         yield images[i]
-    if pingpong and n > 2:
-        for i in range(n - 2, 0, -1):
-            yield images[i]
 
 
 def _audio_to_pcm_path(audio: dict, temp_dir: str) -> Optional[str]:
@@ -581,6 +801,102 @@ def _embed_png_sequence_metadata(seq_dir: str, metadata: dict) -> None:
             logger.warning("Bat_VideoCombine: could not embed PNG metadata in %s: %s", fn, exc)
 
 
+# ─── OpenImageIO writer (image sequences) ───────────────────────────────────
+
+
+def _oiio():
+    """Import OpenImageIO, or None if this build doesn't have it."""
+    try:
+        import OpenImageIO  # noqa: PLC0415 - optional, probed per call
+        return OpenImageIO
+    except Exception:
+        return None
+
+
+def _write_sequence_oiio(images, fmt, widget_values, output_path, metadata) -> None:
+    """Write an EXR sequence through OpenImageIO rather than ffmpeg.
+
+    ffmpeg's `exr` encoder only offers none / rle / zip1 / zip16 — no DWAA,
+    DWAB, PIZ, PXR24 or B44 — so any format whose JSON declares
+    `writer: "oiio"` is written here instead. OIIO also lets us set the pixel
+    type and arbitrary header attributes directly, so the workflow metadata
+    lands in the EXR header rather than being dropped as it was before.
+
+    `_encode` keeps the ffmpeg args in the same JSON as a fallback for builds
+    without OIIO, which is why the format still carries a hidden
+    `ffmpeg_compression` derived from the real one.
+    """
+    oiio = _oiio()
+    if oiio is None:
+        raise RuntimeError("OpenImageIO is not available")
+
+    n, h, w, c = images.shape
+    want_alpha = str(widget_values.get("pix_fmt", "")).startswith("gbra")
+    channels = 4 if (want_alpha and c == 4) else 3
+    if want_alpha and c != 4:
+        logger.warning(
+            "Bat_VideoCombine: alpha requested but the input image has %d "
+            "channels — writing RGB.", c,
+        )
+
+    dtype = oiio.HALF if widget_values.get("pixel_type") == "half" else oiio.FLOAT
+
+    # OIIO spells the DWA quality as a suffix on the compression name
+    # ("dwaa:45"); every other codec takes the bare name.
+    compression = str(widget_values.get("compression") or "zip")
+    if compression in ("dwaa", "dwab"):
+        try:
+            level = int(widget_values.get("dwa_level", 45))
+        except (TypeError, ValueError):
+            level = 45
+        compression = f"{compression}:{max(0, level)}"
+
+    pbar = None
+    try:
+        if _ProgressBar is not None:
+            pbar = _ProgressBar(n)
+    except Exception:
+        pbar = None
+
+    for i in range(n):
+        frame = images[i]
+        arr = frame.detach().cpu().numpy()
+        # Deliberately no clamp — EXR is scene-referred, and preserving values
+        # outside [0,1] is most of the reason to pick it. Matches the "32f"
+        # branch of _pack.
+        arr = np.ascontiguousarray(arr[:, :, :channels], dtype=np.float32)
+
+        # image2's printf pattern is 1-based, so keep the same numbering the
+        # ffmpeg path produced or a re-render would sit alongside the old
+        # frames instead of replacing them.
+        path = output_path % (i + 1) if "%" in output_path else output_path
+
+        spec = oiio.ImageSpec(w, h, channels, dtype)
+        spec.attribute("compression", compression)
+        for key, value in (metadata or {}).items():
+            # Header attributes, not sidecars — a stray attribute must never
+            # cost the artist the frame, so failures here are swallowed.
+            try:
+                spec.attribute(str(key), str(value))
+            except Exception:
+                pass
+
+        out = oiio.ImageOutput.create(path)
+        if out is None:
+            raise RuntimeError(f"OpenImageIO has no writer for {path}: {oiio.geterror()}")
+        if not out.open(path, spec):
+            raise RuntimeError(f"OpenImageIO could not open {path}: {out.geterror()}")
+        try:
+            if not out.write_image(arr):
+                raise RuntimeError(f"OpenImageIO failed writing {path}: {out.geterror()}")
+        finally:
+            out.close()
+
+        if pbar is not None:
+            try: pbar.update(1)
+            except Exception: pbar = None
+
+
 # ─── Encoder ────────────────────────────────────────────────────────────────
 
 
@@ -591,8 +907,6 @@ def _encode(
     frame_rate: float,
     output_path: str,
     audio_path: Optional[str],
-    loop_count: int,
-    pingpong: bool,
     metadata: Optional[dict] = None,
 ) -> None:
     """Pipe raw frames through ffmpeg to produce a video at output_path."""
@@ -600,10 +914,22 @@ def _encode(
     if c not in (3, 4):
         raise ValueError(f"Expected RGB/RGBA tensor, got {c} channels.")
 
-    # pingpong is now applied lazily by _iter_encode_frames (no torch.cat of
-    # the reversed tensor); compute the resulting frame count for logging only.
-    if pingpong and n > 2:
-        n = 2 * n - 2
+    # Formats whose codec ffmpeg can't drive properly are written by a library
+    # instead. Only EXR so far (ffmpeg has no DWAA/PIZ/B44), and the format
+    # JSON keeps a full set of ffmpeg args so a build without OpenImageIO still
+    # produces a valid file rather than failing the render — at a compression
+    # ffmpeg does support, which the hidden `ffmpeg_compression` derives.
+    if fmt.get("writer") == "oiio":
+        if _oiio() is not None:
+            _write_sequence_oiio(images, fmt, widget_values, output_path, metadata)
+            return
+        logger.warning(
+            "Bat_VideoCombine: OpenImageIO not available — falling back to "
+            "ffmpeg for %s, so compression %r becomes %r.",
+            fmt.get("label", "format"),
+            widget_values.get("compression"),
+            widget_values.get("ffmpeg_compression"),
+        )
 
     # Even-dimensions guard: codecs paired with YUV 4:2:0/4:2:2 chroma
     # subsampling (h264, h265, vp9, av1, prores, animated webp) refuse
@@ -627,13 +953,14 @@ def _encode(
         )
         h, w = new_h, new_w
 
-    # Input bit depth is a per-format property: codecs that store >8 bits
-    # (ProRes, FFV1, 16-bit PNG) declare `input_color_depth: "16bit"` in their
-    # JSON so we pipe rgb48le/rgba64le and preserve the float tensor's
-    # precision. Everything else stays 8-bit rgb24/rgba. Mirrors VHS's
-    # input_color_depth handling (videohelpersuite/nodes.py).
-    bit_depth = 16 if fmt.get("input_color_depth") == "16bit" else 8
-    if bit_depth == 16:
+    # Input bit depth follows the format's `bit_depth` widget where it has one
+    # (so picking 8-bit h264 doesn't pay for a 16-bit pipe), falling back to
+    # the static `input_color_depth` key for formats with a fixed depth. See
+    # _pipe_depth. Float formats (EXR) get a planar float32 pipe.
+    bit_depth = _pipe_depth(fmt, widget_values)
+    if bit_depth == "32f":
+        input_pix = "gbrapf32le" if c == 4 else "gbrpf32le"
+    elif bit_depth == 16:
         input_pix = "rgba64le" if c == 4 else "rgb48le"
     else:
         input_pix = "rgba" if c == 4 else "rgb24"
@@ -664,6 +991,23 @@ def _encode(
                 "cannot store it — the alpha will be discarded. Pick an alpha-"
                 "capable profile (e.g. ProRes 4444) to keep it.",
                 out_pix,
+            )
+
+    # Cross-check the two halves against each other: `bit_depth` is what the
+    # artist asked for, `pix_fmt` is what the codec will actually write. They
+    # can legitimately disagree where a codec supports a layout at only one
+    # depth — libvpx-vp9 carries alpha in 8-bit yuva420p and nothing else — and
+    # that is precisely the case worth a line in the log rather than a file
+    # that is quietly shallower than the widget claims.
+    want_bits = widget_values.get("bit_depth")
+    final_pix = widget_values.get("pix_fmt")
+    if final_pix and str(want_bits).isdigit():
+        got_bits = _pix_fmt_bits(str(final_pix))
+        if got_bits != int(want_bits):
+            logger.warning(
+                "Bat_VideoCombine: %s cannot write %s-bit in this layout — "
+                "encoding %s (%d-bit) instead.",
+                fmt.get("label", "format"), want_bits, final_pix, got_bits,
             )
 
     # Project metadata for containers ffmpeg can tag directly (mov/mkv
@@ -701,14 +1045,6 @@ def _encode(
             args += ["-shortest"]
         elif not audio_path:
             args += ["-an"]
-
-        # GIFs and WebP use the format's own loop arg; for normal videos we
-        # respect loop_count by post-processing only the saved file's metadata
-        # (browser <video loop> is the real loop; loop_count > 0 here is a
-        # no-op pending demand — VHS has the same caveat).
-        if loop_count and fmt.get("extension") in ("gif", "webp"):
-            # Last "-loop" in args wins; append override if user wants finite loops.
-            args += ["-loop", str(int(loop_count))]
 
         if meta_file:
             # Pull global metadata from the ffmetadata input. For the MP4/MOV
@@ -752,8 +1088,8 @@ def _encode(
             return b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
         try:
-            # Convert-and-pipe one frame at a time. pingpong ordering and the
-            # even-dims pad are applied here, per frame, so peak memory stays
+            # Convert-and-pipe one frame at a time. The even-dims pad is
+            # applied here, per frame, so peak memory stays
             # at ~one frame of overhead instead of a full converted copy of
             # the clip — and ffmpeg encodes frame N-1 while we pack frame N.
             # Pad buffer is allocated ONCE and reused per frame (it used to be a
@@ -765,14 +1101,11 @@ def _encode(
             pbar = None
             try:
                 if _ProgressBar is not None:
-                    total = images.shape[0]
-                    if pingpong and total > 2:
-                        total += total - 2
-                    pbar = _ProgressBar(total)
+                    pbar = _ProgressBar(images.shape[0])
             except Exception:
                 pbar = None
 
-            for frame in _iter_encode_frames(images, pingpong):
+            for frame in _iter_encode_frames(images):
                 if pad_h or pad_w:
                     fh, fw, fc = frame.shape
                     if pad_buf is None:
@@ -829,14 +1162,12 @@ class BatVideoCombine:
             "required": {
                 "images":          ("IMAGE",),
                 "frame_rate":      ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.01}),
-                "loop_count":      ("INT",   {"default": 0, "min": 0, "max": 100}),
                 "filename_prefix": ("STRING", {"default": "BatVideo"}),
                 # H264 is the studio default — broad player support, sane
                 # quality/size trade-off, hardware-decoded on every artist
                 # box. The legacy implicit-first-alphabetical default was
                 # `av1-webm`, which is now gone from the formats dir.
                 "format":          (_format_choices(), {"default": "video/h264-mp4"}),
-                "pingpong":        ("BOOLEAN", {"default": False}),
                 "save_output":     ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -855,17 +1186,37 @@ class BatVideoCombine:
     RETURN_NAMES = ("filepath",)
     OUTPUT_NODE = True
     FUNCTION = "combine"
-    CATEGORY = "BAT/video"
+    CATEGORY = "BAT/Video"
     DESCRIPTION = (
         "Encode an IMAGE batch to a video file (h264, ProRes, webm, gif, "
-        "EXR sequence, …) with a frame-accurate canvas preview. ProRes "
-        "and other non-web-playable formats are transcoded for the preview "
-        "automatically — no setting to flip."
+        "EXR sequence, …) with a frame-accurate canvas preview. ProRes, "
+        "EXR/PNG sequences and other non-web-playable formats are transcoded "
+        "for the preview automatically — no setting to flip. Each format "
+        "exposes its own "
+        "knobs, including the bit depths that codec can actually write; "
+        "formats fixed at 8-bit (gif, webp) show no bit-depth widget."
     )
 
-    def combine(self, images, frame_rate, loop_count, filename_prefix, format,
-                pingpong, save_output, audio=None, prompt=None, extra_pnginfo=None,
+    def combine(self, images, frame_rate, filename_prefix, format,
+                save_output, audio=None, prompt=None, extra_pnginfo=None,
+                loop_count=None, pingpong=None,
                 **format_widget_kwargs):
+        # `loop_count` and `pingpong` were dropped from the node on 2026-08-06.
+        # An API-format prompt exported from the Stable release still names
+        # them, and they are named there, not positional, so they'd otherwise
+        # fall into **format_widget_kwargs and be ignored in silence. Accept
+        # them explicitly and say so in the log: an artist re-running an old
+        # farm job deserves to know their ping-pong isn't happening, rather
+        # than wondering why the render looks different. (The frontend does the
+        # equivalent for saved graphs — see STATIC_LAYOUTS in the sibling JS.)
+        for name, value, retired_default in (("loop_count", loop_count, 0),
+                                             ("pingpong", pingpong, False)):
+            if value is not None and value != retired_default:
+                logger.warning(
+                    "Bat_VideoCombine: %s=%r comes from a workflow saved before "
+                    "that widget was removed — ignoring it.", name, value,
+                )
+
         fmt = _load_formats().get(format)
         if fmt is None:
             raise RuntimeError(f"Unknown format {format!r}")
@@ -900,7 +1251,12 @@ class BatVideoCombine:
             seq_dir = os.path.join(full_dir, f"{base}_{counter:05d}")
             os.makedirs(seq_dir, exist_ok=True)
             output_path = os.path.join(seq_dir, ext)
-            preview_filename = f"{base}_{counter:05d}/{ext.replace('%', '%%')}"
+            # filename is the BARE printf pattern and subfolder is the
+            # sequence directory: previously the directory appeared in both
+            # and the `%` was doubled, so joining them addressed
+            # `<seq>/<seq>/%%05d.exr` — a path that can never exist, which is
+            # why every /bat/video/* route 404'd and the player stayed black.
+            preview_filename = ext
             preview_subfolder = os.path.relpath(seq_dir, output_dir)
         else:
             output_path = os.path.join(full_dir, f"{base}_{counter:05d}.{ext}")
@@ -927,8 +1283,6 @@ class BatVideoCombine:
                 frame_rate=float(frame_rate),
                 output_path=output_path,
                 audio_path=audio_path,
-                loop_count=int(loop_count),
-                pingpong=bool(pingpong),
                 metadata=metadata,
             )
         finally:
@@ -953,9 +1307,7 @@ class BatVideoCombine:
                     meta_mode, exc,
                 )
 
-        n_frames = int(images.shape[0]) * (2 if pingpong and images.shape[0] > 2 else 1)
-        if pingpong and images.shape[0] > 2:
-            n_frames = images.shape[0] * 2 - 2
+        n_frames = int(images.shape[0])
 
         preview = {
             "filename": preview_filename,
@@ -965,6 +1317,12 @@ class BatVideoCombine:
             "frame_rate": float(frame_rate),
             "frame_count": n_frames,
             "browser_playable": bool(fmt.get("browser_playable", True)),
+            # The player needs to know it's addressing a numbered directory
+            # rather than a file: a sequence carries no frame rate of its own
+            # (so the preview URL must pass one) and, for EXR, offers a view
+            # transform the player exposes as a dropdown.
+            "is_sequence": seq_dir is not None,
+            "is_exr": str(ext).lower().endswith(".exr"),
             "fullpath": output_path,
         }
 
@@ -984,6 +1342,24 @@ class BatVideoCombine:
 _PREVIEW_CACHE_DIR_NAME = "bat_video_preview_cache"
 _PREVIEW_CACHE_MAX = 32
 
+# One lock per cache entry. The player points BOTH its <video> elements (the
+# visible one and the hidden hover-thumb decoder) at the same preview URL at
+# the same moment, so a cache miss always arrives twice. While the transcode
+# ran inline on the event loop that was harmless — the second request couldn't
+# be serviced until the first had finished and populated the cache — but it now
+# runs in a worker thread, so without this the two would encode concurrently
+# into the same output path.
+_PREVIEW_LOCKS: dict = {}
+_PREVIEW_LOCKS_GUARD = threading.Lock()
+
+
+def _preview_lock(key: str) -> asyncio.Lock:
+    with _PREVIEW_LOCKS_GUARD:
+        lock = _PREVIEW_LOCKS.get(key)
+        if lock is None:
+            lock = _PREVIEW_LOCKS[key] = asyncio.Lock()
+        return lock
+
 
 def _safe_under(root: str, *parts: str) -> Optional[str]:
     """Join under root, refuse if the join escapes root via traversal."""
@@ -1000,9 +1376,77 @@ def _safe_under(root: str, *parts: str) -> Optional[str]:
     return candidate
 
 
-def _resolve_request_path(request) -> Optional[str]:
-    """Resolve query (filename, type, subfolder) into an absolute path under
-    output/ or temp/. Refuses anything else. Used by every API route below."""
+# ─── Image-sequence addressing ──────────────────────────────────────────────
+#
+# Sequence formats (EXR, PNG) don't write one file: they write a numbered
+# directory of frames, and the preview payload addresses them by their
+# printf pattern (`%05d.exr`) rather than by a filename. Nothing can
+# `os.path.isfile()` a pattern, which is why every /bat/video/* route used to
+# 404 on a sequence and the node sat on a black player — the transcode the
+# module docstring promised was never reachable for EXR/PNG output. These
+# helpers turn a pattern into the concrete, ordered frame list on disk so
+# probe / transcode / frame-grab treat a sequence exactly like a single file.
+
+_SEQ_TOKEN_RE = re.compile(r"%(0?\d*)d")
+
+
+def _seq_frame_matcher(pattern_name: str):
+    """Regex matching one frame filename of `pattern_name`, capturing its index.
+
+    Mirrors ffmpeg's image2 demuxer: `%05d` matches exactly five digits, a
+    bare `%d` matches one or more. Returns None if there's no printf token,
+    which is how callers tell a sequence from a plain filename."""
+    m = _SEQ_TOKEN_RE.search(pattern_name)
+    if m is None:
+        return None
+    spec = m.group(1) or ""
+    digits = r"(\d{%d})" % int(spec) if (spec.startswith("0") and len(spec) > 1) else r"(\d+)"
+    return re.compile(
+        "^" + re.escape(pattern_name[:m.start()]) + digits
+        + re.escape(pattern_name[m.end():]) + "$"
+    )
+
+
+def _scan_sequence(seq_dir: str, pattern_name: str) -> list:
+    """List (index, abs_path) for every frame of `pattern_name` in `seq_dir`,
+    sorted by index. Empty list if the directory holds none."""
+    rx = _seq_frame_matcher(pattern_name)
+    if rx is None:
+        return []
+    try:
+        names = os.listdir(seq_dir)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        m = rx.match(name)
+        if m:
+            found.append((int(m.group(1)), os.path.join(seq_dir, name)))
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+class _FakeQueryRequest:
+    """Minimal stand-in exposing `.rel_url.query` so a POST body can be fed
+    through _resolve_request_target instead of duplicating its traversal
+    guard. Used only by /bat/video/save_frame."""
+
+    class _RelUrl:
+        def __init__(self, query):
+            self.query = query
+
+    def __init__(self, query: dict):
+        self.rel_url = self._RelUrl(query)
+
+
+def _resolve_request_target(request) -> Optional[dict]:
+    """Resolve query (filename, type, subfolder) into a media target under
+    output/ or temp/. Refuses anything else. Used by every API route below.
+
+    Returns either ``{"kind": "file", "path": ...}`` or, when `filename`
+    carries a printf token, ``{"kind": "sequence", "dir", "pattern",
+    "frames", "indices"}`` — `pattern` being the absolute printf path ffmpeg
+    wants and `frames` the frames that actually exist, in order."""
     q = request.rel_url.query
     filename = q.get("filename") or q.get("file") or ""
     typ = q.get("type", "output")
@@ -1015,13 +1459,118 @@ def _resolve_request_path(request) -> Optional[str]:
         root = folder_paths.get_temp_directory()
     else:
         return None
-    if subfolder:
-        path = _safe_under(root, subfolder, filename)
-    else:
-        path = _safe_under(root, filename)
+
+    # Tolerate two shapes an older preview payload used for sequences, both of
+    # which still arrive from localStorage after an upgrade: a doubled `%%` in
+    # the pattern, and the sequence directory named in `filename` as well as in
+    # `subfolder`. Normalise instead of 404-ing a preview whose frames are
+    # sitting right there on disk.
+    filename = filename.replace("%%", "%")
+    head, tail = os.path.split(filename.replace("\\", "/"))
+    if head:
+        parts = [p for p in subfolder.replace("\\", "/").split("/") if p]
+        head_parts = [p for p in head.split("/") if p]
+        if parts[-len(head_parts):] != head_parts:
+            parts += head_parts
+        subfolder = "/".join(parts)
+        filename = tail
+
+    base = _safe_under(root, subfolder) if subfolder else os.path.realpath(root)
+    if base is None or not os.path.isdir(base):
+        return None
+
+    if _SEQ_TOKEN_RE.search(filename):
+        frames = _scan_sequence(base, filename)
+        if not frames:
+            return None
+        return {
+            "kind": "sequence",
+            "dir": base,
+            "pattern": os.path.join(base, filename),
+            "indices": [i for i, _ in frames],
+            "frames": [p for _, p in frames],
+        }
+
+    path = _safe_under(base, filename)
     if path is None or not os.path.isfile(path):
         return None
-    return path
+    return {"kind": "file", "path": path}
+
+
+# EXR is scene-referred, so a preview needs to know which transfer curve to
+# apply on the way to an 8-bit player. Values are the OpenEXR decoder's
+# `apply_trc` names; the keys are what the front-end sends.
+_SEQ_TRC = {
+    "srgb":   "iec61966_2_1",
+    "rec709": "bt709",
+}
+
+
+def _query_fps(request, default: float = 24.0) -> float:
+    """Playback rate for a sequence, from the `fps` query param.
+
+    A printf pattern has no inherent frame rate — image2 assumes 25 — so the
+    node passes its own `frame_rate` through and the preview plays at the
+    speed the artist actually rendered."""
+    try:
+        fps = float(request.rel_url.query.get("fps") or default)
+    except (TypeError, ValueError):
+        fps = default
+    return fps if 0.01 <= fps <= 1000 else default
+
+
+def _target_input_args(target: dict, fps: float = 24.0, trc: str = "") -> list:
+    """ffmpeg input args for a target — one file, or a numbered sequence.
+
+    A sequence needs `-framerate` (see _query_fps) and `-start_number` (the
+    first frame on disk is `00001`, not `00000`, because image2's printf
+    pattern is 1-based — see _write_sequence_oiio).
+
+    `-apply_trc` is an OpenEXR *decoder* option, so it is only ever passed for
+    an `.exr` pattern; handing it to the PNG decoder is a hard ffmpeg error.
+    No TRC is the default on purpose: Video Combine writes the IMAGE tensor
+    into EXR verbatim (no linearisation), and ffmpeg's EXR decoder default is
+    identity — so a 1:1 read reproduces exactly what the h264 export of the
+    same frames looks like. The sRGB / Rec.709 options exist for genuinely
+    scene-linear renders, which read near-black straight."""
+    if target["kind"] != "sequence":
+        return ["-i", target["path"]]
+    args = ["-framerate", f"{fps:.6f}", "-start_number", str(target["indices"][0])]
+    mapped = _SEQ_TRC.get((trc or "").lower())
+    if mapped and target["pattern"].lower().endswith(".exr"):
+        args += ["-apply_trc", mapped]
+    args += ["-i", target["pattern"]]
+    return args
+
+
+def _target_cache_stamp(target: dict) -> Optional[str]:
+    """Content stamp used to key the transcode cache.
+
+    Single file: mtime + size, as before. Sequence: frame count + newest
+    mtime + total size, so re-rendering the sequence (or writing more frames
+    into it) invalidates the cached mp4 the same way."""
+    try:
+        if target["kind"] != "sequence":
+            st = os.stat(target["path"])
+            src, stamp = target["path"], f"{int(st.st_mtime)}_{st.st_size}"
+        else:
+            newest = total = 0
+            for p in target["frames"]:
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                newest = max(newest, int(st.st_mtime))
+                total += st.st_size
+            src = target["pattern"]
+            stamp = f"seq{len(target['frames'])}_{newest}_{total}"
+    except OSError:
+        return None
+    # Stable digest — Python's built-in hash() is salted per process
+    # (PYTHONHASHSEED), so it never re-hit this cache across restarts and
+    # re-transcoded every launch.
+    digest = hashlib.md5(src.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{digest}_{stamp}"
 
 
 @server.PromptServer.instance.routes.get("/bat/video/formats")
@@ -1032,9 +1581,15 @@ async def bat_video_formats(request):
     Returns, per format label, the ordered widget definitions (name, type,
     label, options/min/max, default, hidden) plus the `derived` rules. The
     front-end renders one widget per non-hidden entry when that format is
-    selected and mirrors `derived` so a profile change updates a hidden
-    pix_fmt live; the backend re-applies `derived` authoritatively at encode
-    time (see _resolve_widget_values), so the JS copy is only for UX."""
+    selected and mirrors `derived` so a profile or bit-depth change updates a
+    hidden pix_fmt live; the backend re-applies `derived` authoritatively at
+    encode time (see _resolve_widget_values), so the JS copy is only for UX.
+
+    Widget ORDER is load-bearing in both directions: it is the UI order, and
+    it is the order the values serialise into widgets_values, which the JS
+    restores positionally (onConfigure). New widgets must therefore be
+    APPENDED to a format's `widgets` map, never inserted, or every workflow
+    saved with that format restores its codec values one slot out."""
     out = {}
     for label, fmt in _load_formats().items():
         widgets = []
@@ -1064,14 +1619,38 @@ async def bat_video_meta(request):
     bundled with imageio_ffmpeg, so on a bare venv we fall back to parsing
     `ffmpeg -i` (which is always available). Either way returns 200 with the
     best info we have rather than 500-ing the player."""
-    path = _resolve_request_path(request)
-    if path is None:
+    target = _resolve_request_target(request)
+    if target is None:
         return web.json_response({"error": "Not found"}, status=404)
 
+    # A sequence has no container to probe: the frame count is what's on disk
+    # and the rate is whatever the node rendered at, so only the dimensions
+    # need ffmpeg (read off the first frame).
+    if target["kind"] == "sequence":
+        fps = _query_fps(request)
+        n = len(target["frames"])
+        width = height = 0
+        try:
+            probe = await asyncio.to_thread(_ffmpeg_probe, target["frames"][0])
+            width, height = int(probe.get("width") or 0), int(probe.get("height") or 0)
+        except Exception as exc:
+            logger.warning("Bat_VideoCombine: could not probe sequence frame (%s).", exc)
+        return web.json_response({
+            "duration": (n / fps) if fps else 0.0,
+            "fps": fps,
+            "frame_count": n,
+            "width": width,
+            "height": height,
+            "has_audio": False,
+            "is_sequence": True,
+        })
+
+    path = target["path"]
     ffprobe = _ffprobe_bin()
     if ffprobe:
         try:
-            out = subprocess.run(
+            out = await asyncio.to_thread(
+                subprocess.run,
                 [ffprobe, "-v", "quiet", "-print_format", "json",
                  "-show_format", "-show_streams", path],
                 capture_output=True, timeout=10,
@@ -1110,71 +1689,111 @@ async def bat_video_meta(request):
 
     # Fallback: parse `ffmpeg -i` stderr (no ffprobe needed).
     try:
-        return web.json_response(_ffmpeg_probe(path))
+        return web.json_response(await asyncio.to_thread(_ffmpeg_probe, path))
     except Exception as exc:
         return web.json_response({"error": f"probe failed: {exc}"}, status=500)
+
+
+def _transcode_preview(target: dict, fps: float, trc: str,
+                      cached: str, cache_dir: str) -> Optional[dict]:
+    """Blocking H.264/MP4 transcode into `cached`. Returns None on success or
+    an error payload for the route to serialise.
+
+    Runs in a worker thread (asyncio.to_thread), NOT on the event loop:
+    decoding a 4K EXR sequence takes tens of seconds, and inline
+    subprocess.run froze the whole ComfyUI server — every other request,
+    every websocket, the queue — for its whole duration. That was tolerable
+    for a short ProRes and is not for a sequence.
+
+    Encodes to a `.part` sibling and renames on success, so an aborted or
+    failed encode can never leave a truncated mp4 in the cache for the next
+    request to serve as a valid hit."""
+    part = f"{cached}.part"
+    try:
+        subprocess.run([
+            _ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "warning",
+            *_target_input_args(target, fps=fps, trc=trc),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            # All-I so the player's frame-stepping and hover-scrub seek
+            # instantly, matching what the browser-playable formats get
+            # from their `-g 1` encode args.
+            "-g", "1",
+            "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-f", "mp4", part,
+        ], check=True, capture_output=True, timeout=600)
+        os.replace(part, cached)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
+        logger.warning("Bat_VideoCombine: preview transcode failed: %s", stderr[-500:])
+        return {"error": "transcode failed", "stderr": stderr[-2000:]}
+    except Exception as exc:
+        return {"error": str(exc)}
+    finally:
+        if os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+
+    # Trim the cache loosely. Drops the oldest files by mtime once we exceed
+    # _PREVIEW_CACHE_MAX. Cheap to do on every miss.
+    try:
+        entries = sorted(
+            (os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".mp4")),
+            key=os.path.getmtime,
+        )
+        for old in entries[:-_PREVIEW_CACHE_MAX]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return None
 
 
 @server.PromptServer.instance.routes.get("/bat/video/preview")
 async def bat_video_preview(request):
     """On-demand transcode to H.264 MP4 for browser playback.
 
-    Used for ProRes, FFV1, h265, and anything else flagged
+    Used for ProRes, FFV1, h265, EXR/PNG sequences, and anything else flagged
     `browser_playable=false` in its format JSON. The transcoded file is
     cached under temp/bat_video_preview_cache so a node redraw doesn't
-    re-encode every time. Cache key: source mtime + size, so editing the
-    source invalidates the cache automatically.
+    re-encode every time. Cache key: content stamp (see _target_cache_stamp)
+    plus the fps and view transform, so re-rendering the source — or asking
+    for a different EXR view — invalidates the entry automatically.
     """
-    path = _resolve_request_path(request)
-    if path is None:
+    target = _resolve_request_target(request)
+    if target is None:
         return web.Response(status=404)
+
+    fps = _query_fps(request)
+    trc = (request.rel_url.query.get("trc") or "").lower()
+    if trc not in _SEQ_TRC:
+        trc = ""
 
     cache_dir = os.path.join(folder_paths.get_temp_directory(), _PREVIEW_CACHE_DIR_NAME)
     os.makedirs(cache_dir, exist_ok=True)
-    try:
-        st = os.stat(path)
-        # Stable cache key — Python's built-in hash() is salted per process
-        # (PYTHONHASHSEED), so it never re-hit this cache across restarts and
-        # re-transcoded every launch. A hashlib digest is deterministic; the
-        # mtime+size suffix still busts the entry when the source file changes.
-        digest = hashlib.md5(path.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-        key = f"{digest}_{int(st.st_mtime)}_{st.st_size}.mp4"
-    except OSError:
+    stamp = _target_cache_stamp(target)
+    if stamp is None:
         return web.Response(status=404)
-    cached = os.path.join(cache_dir, key)
+    if target["kind"] == "sequence":
+        stamp = f"{stamp}_{fps:.3f}_{trc or 'asis'}"
+    cached = os.path.join(cache_dir, f"{stamp}.mp4")
 
     if not os.path.isfile(cached):
-        try:
-            subprocess.run([
-                _ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "warning",
-                "-i", path,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                cached,
-            ], check=True, capture_output=True, timeout=600)
-        except subprocess.CalledProcessError as exc:
-            stderr = exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-            return web.json_response({"error": "transcode failed", "stderr": stderr[-2000:]}, status=500)
-        except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=500)
-
-        # Trim the cache loosely. Drops the oldest files by mtime once we
-        # exceed _PREVIEW_CACHE_MAX. Cheap to do on every miss.
-        try:
-            entries = sorted(
-                (os.path.join(cache_dir, f) for f in os.listdir(cache_dir) if f.endswith(".mp4")),
-                key=lambda p: os.path.getmtime(p),
-            )
-            for old in entries[:-_PREVIEW_CACHE_MAX]:
-                try:
-                    os.remove(old)
-                except OSError:
-                    pass
-        except Exception:
-            pass
+        # Serialise on the cache entry, then re-check: the loser of the race
+        # wakes up to a populated cache and skips the encode entirely.
+        async with _preview_lock(cached):
+            if not os.path.isfile(cached):
+                err = await asyncio.to_thread(
+                    _transcode_preview, target, fps, trc, cached, cache_dir,
+                )
+                if err is not None:
+                    return web.json_response(err, status=500)
 
     return web.FileResponse(cached, headers={"Content-Type": "video/mp4"})
 
@@ -1184,8 +1803,8 @@ async def bat_video_frame(request):
     """Return a single frame as PNG. Used both for the save-current-frame
     button (frontend re-POSTs to /save_frame to land it under output/) and
     for the hover-scrub thumbnail (frontend asks for many small frames)."""
-    path = _resolve_request_path(request)
-    if path is None:
+    target = _resolve_request_target(request)
+    if target is None:
         return web.Response(status=404)
     try:
         frame = int(request.rel_url.query.get("frame", "0"))
@@ -1193,13 +1812,27 @@ async def bat_video_frame(request):
         return web.Response(status=400)
     frame = max(0, frame)
 
-    # `select=eq(n,N)` jumps to the Nth decoded frame. Add `-vsync 0` so
-    # ffmpeg doesn't pad or drop around the target frame.
+    # A sequence indexes straight into the frame list — no decode-and-select
+    # walk needed, and none possible either: `select=eq(n,N)` counts frames
+    # within one decoded stream, and here each frame IS its own file.
+    if target["kind"] == "sequence":
+        trc = (request.rel_url.query.get("trc") or "").lower()
+        one = {"kind": "file", "path": target["frames"][min(frame, len(target["frames"]) - 1)]}
+        input_args = _target_input_args(one)
+        if _SEQ_TRC.get(trc) and one["path"].lower().endswith(".exr"):
+            input_args = ["-apply_trc", _SEQ_TRC[trc]] + input_args
+        select = "scale=ceil(iw/2)*2:ceil(ih/2)*2"
+    else:
+        input_args = _target_input_args(target)
+        # `select=eq(n,N)` jumps to the Nth decoded frame. Add `-vsync 0` so
+        # ffmpeg doesn't pad or drop around the target frame.
+        select = f"select=eq(n\\,{frame}),scale=ceil(iw/2)*2:ceil(ih/2)*2"
+
     try:
-        out = subprocess.run([
+        out = await asyncio.to_thread(subprocess.run, [
             _ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
-            "-i", path,
-            "-vf", f"select=eq(n\\,{frame}),scale=ceil(iw/2)*2:ceil(ih/2)*2",
+            *input_args,
+            "-vf", select,
             "-vsync", "0", "-frames:v", "1",
             "-f", "image2pipe", "-vcodec", "png", "-",
         ], capture_output=True, check=True, timeout=30)
@@ -1223,11 +1856,6 @@ async def bat_video_save_frame(request):
     except Exception:
         return web.json_response({"error": "invalid json"}, status=400)
 
-    # Reuse _resolve_request_path's logic by smuggling values via a fake
-    # request-like with rel_url.query. Simpler: replicate the small bit.
-    typ = (body.get("type") or "output").strip()
-    subfolder = (body.get("subfolder") or "").strip()
-    filename = (body.get("filename") or "").strip()
     # Guard the cast and clamp negatives: `int("abc")` raised straight out of the
     # handler as a 500 + traceback, and a negative value was interpolated into
     # the ffmpeg filter string as `select=eq(n\,-1)`.
@@ -1236,13 +1864,20 @@ async def bat_video_save_frame(request):
     except (TypeError, ValueError):
         return web.json_response({"error": "frame must be an integer"}, status=400)
     dest_prefix = _safe_name((body.get("dest_prefix") or "framegrab").strip()) or "framegrab"
-    if not filename:
+    if not (body.get("filename") or "").strip():
         return web.json_response({"error": "filename required"}, status=400)
 
-    src_root = (folder_paths.get_output_directory() if typ == "output"
-                else folder_paths.get_temp_directory())
-    src_path = _safe_under(src_root, subfolder, filename) if subfolder else _safe_under(src_root, filename)
-    if src_path is None or not os.path.isfile(src_path):
+    # Same addressing as the GET routes (sequences included) — the body keys
+    # match their query params, so wrap it in the shape _resolve_request_target
+    # reads rather than re-implementing the traversal guard here.
+    target = _resolve_request_target(_FakeQueryRequest({
+        "filename":  (body.get("filename") or "").strip(),
+        "type":      (body.get("type") or "output").strip(),
+        "subfolder": (body.get("subfolder") or "").strip(),
+        "fps":       str(body.get("fps") or ""),
+        "trc":       (body.get("trc") or "").strip(),
+    }))
+    if target is None:
         return web.json_response({"error": "source not found"}, status=404)
 
     out_dir = folder_paths.get_output_directory()
@@ -1253,11 +1888,19 @@ async def bat_video_save_frame(request):
     out_name = f"{base}_{counter:05d}_f{frame:06d}.png"
     out_path = os.path.join(full_dir, out_name)
 
+    if target["kind"] == "sequence":
+        frames = target["frames"]
+        input_args = ["-i", frames[min(frame, len(frames) - 1)]]
+        select = "null"
+    else:
+        input_args = ["-i", target["path"]]
+        select = f"select=eq(n\\,{frame})"
+
     try:
-        subprocess.run([
+        await asyncio.to_thread(subprocess.run, [
             _ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
-            "-i", src_path,
-            "-vf", f"select=eq(n\\,{frame})",
+            *input_args,
+            "-vf", select,
             "-vsync", "0", "-frames:v", "1",
             out_path,
         ], capture_output=True, check=True, timeout=30)

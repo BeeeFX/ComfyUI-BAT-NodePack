@@ -12,10 +12,21 @@
  *   - "Save current frame as PNG" → /bat/video/save_frame endpoint.
  *   - Fullscreen.
  *   - Keyboard shortcuts (focus-scoped): Space, ←/→, ,/., Home/End, F, M, Esc.
+ *   - View-transform dropdown, EXR sequences only (see below).
  *
  * ProRes / FFV1 / h265 outputs come back with browser_playable=false in
  * the onExecuted payload; for those the <video> src points at the
  * /bat/video/preview endpoint (server-side transcode) instead of /view.
+ *
+ * Image sequences (EXR / PNG) come back with is_sequence=true and a printf
+ * pattern (`%05d.exr`) as their filename. They go down the same transcode
+ * route, but a pattern carries no frame rate of its own, so every
+ * /bat/video/* call for a sequence must pass `fps` — otherwise ffmpeg's
+ * image2 demuxer assumes 25 and the preview plays at the wrong speed. EXR
+ * additionally takes `trc`: the node writes the IMAGE tensor into EXR
+ * verbatim, so the 1:1 default matches what an h264 export of the same
+ * frames looks like, while a genuinely scene-linear render needs sRGB or
+ * Rec.709 applied or it reads near-black.
  */
 
 import { app } from "../../scripts/app.js";
@@ -36,8 +47,10 @@ const NODE_TYPE = "Bat_VideoCombine";
 // **format_widget_kwargs — no extra plumbing needed.
 //
 // `derived` widgets (e.g. ProRes pix_fmt) aren't shown; they're recomputed from
-// a visible widget (profile) so the user can't pick an invalid combo. They're
-// still serialised (the backend re-derives authoritatively regardless).
+// one or more visible widgets (profile, bit_depth, alpha) so the user can't pick
+// an invalid combo — a codec's pix_fmt list mixes two independent axes (chroma /
+// alpha layout and bit depth), and only the axes are worth an artist's attention.
+// They're still serialised (the backend re-derives authoritatively regardless).
 
 let _formatSpecsPromise = null;
 function getFormatSpecs() {
@@ -87,8 +100,14 @@ function makeCodecWidget(node, spec, savedValue) {
 
     if (type === "COMBO" || Array.isArray(spec.options)) {
         w.type = "combo";
-        w.options = { values: spec.options || [] };
-        w.value = hasSaved ? savedValue : (spec.default ?? (spec.options || [])[0]);
+        const values = spec.options || [];
+        w.options = { values };
+        // A saved value that the format no longer offers must not stick: an
+        // option list can change shape between versions (EXR's `compression`
+        // listed four names ffmpeg rejects outright), and litegraph would
+        // happily keep drawing the stale one until the encode failed.
+        const savedIsValid = hasSaved && (!values.length || values.includes(savedValue));
+        w.value = savedIsValid ? savedValue : (spec.default ?? values[0]);
     } else if (type === "INT" || type === "FLOAT") {
         w.type = "number";
         w.options = {
@@ -107,7 +126,10 @@ function makeCodecWidget(node, spec, savedValue) {
         };
     } else if (type === "BOOLEAN") {
         w.type = "toggle";
-        w.value = hasSaved ? savedValue : !!spec.default;
+        // inferSourcesFromDerived hands back map-key STRINGS ("true"/"false"),
+        // and a bare `savedValue` would make the string "false" a truthy toggle.
+        w.value = hasSaved ? (savedValue === true || savedValue === "true")
+                           : !!spec.default;
     } else {
         w.type = "text";
         w.value = hasSaved ? savedValue : (spec.default ?? "");
@@ -135,24 +157,231 @@ function makeCodecWidget(node, spec, savedValue) {
     return w;
 }
 
+// ── `derived` rule helpers — mirrors of the same-named ones in
+//    bat_video_combine.py. Keep the two in step: the backend re-derives
+//    authoritatively at encode time, so a divergence shows up as a node whose
+//    UI disagrees with the file it just wrote.
+const DERIVED_SEP = "|";
+
+// A rule's `from` is a bare name for single-source rules ("profile") and an
+// array for composite ones (["layout", "bit_depth"]), whose map keys join the
+// source values with `sep`: "yuv444|12".
+function derivedSources(rule) {
+    const from = rule?.from;
+    if (from == null) return [];
+    return Array.isArray(from) ? from.slice() : [from];
+}
+
+// JSON spells booleans "true"/"false"; the alpha toggles are BOOLEAN widgets,
+// so their map keys have to be spelled the same way on both sides.
+function mapKey(value) {
+    if (typeof value === "boolean") return value ? "true" : "false";
+    return String(value);
+}
+
 // Apply a format's `derived` rules: set each hidden target widget's value from
-// its source widget via the JSON map. Called on build and on source change.
+// its source widget(s) via the JSON map. Called on build and on source change.
 function applyDerived(node, derived) {
     if (!derived) return;
     for (const [target, rule] of Object.entries(derived)) {
-        const src = node.widgets?.find((w) => w.name === rule.from);
         const dst = node.widgets?.find((w) => w.name === target);
         if (!dst) continue;
-        const key = src != null ? String(src.value) : undefined;
+        const sources = derivedSources(rule);
+        const key = sources
+            .map((n) => mapKey(node.widgets?.find((w) => w.name === n)?.value))
+            .join(rule.sep || DERIVED_SEP);
         const mapped = (rule.map && key in rule.map) ? rule.map[key]
                      : (rule.default ?? dst.value);
         dst.value = mapped;
     }
 }
 
+// Back-fill a derived rule's *sources* from a restored *target*. Mirrors
+// _infer_sources() in bat_video_combine.py — see that docstring for the why.
+//
+// Short version: `bit_depth` (and the alpha/layout widgets beside it) were
+// appended to the format JSONs after those formats shipped. A workflow saved
+// before then has only the old visible `pix_fmt` in its widgets_values tail;
+// the new widgets restore as undefined, and re-deriving pix_fmt from their
+// defaults would quietly change a saved deliverable's depth (a 10-bit h265
+// coming back 8-bit). So run the map backwards to recover what produced it.
+function inferSourcesFromDerived(def, savedByName) {
+    if (!savedByName || !def || !def.derived) return;
+    for (const [target, rule] of Object.entries(def.derived)) {
+        const saved = savedByName[target];
+        if (saved === undefined || saved === null) continue;
+        const sources = derivedSources(rule);
+        const missing = sources.filter(
+            (n) => savedByName[n] === undefined || savedByName[n] === null);
+        if (!sources.length || !missing.length) continue;
+        const want = mapKey(saved);
+        const hit = Object.entries(rule.map || {}).find(([, v]) => mapKey(v) === want);
+        if (!hit) continue;
+        const parts = String(hit[0]).split(rule.sep || DERIVED_SEP);
+        if (parts.length !== sources.length) continue;
+        sources.forEach((n, i) => {
+            if (missing.includes(n)) savedByName[n] = parts[i];
+        });
+    }
+}
+
+// ─── Legacy static-widget layout migration ───────────────────────────────────
+//
+// ComfyUI restores widgets_values POSITIONALLY — the Nth saved value goes to
+// the Nth serialisable widget and the names are never consulted. So dropping a
+// static widget silently shifts every value after it onto the wrong widget in
+// every workflow saved before the change. `loop_count` and `pingpong` went on
+// 2026-08-06 (both features were retired), which is exactly two such holes:
+//
+//   saved by Stable: [24.0, 0, "shot_a", "video/prores-mov", false, true, …codec]
+//   restored into:   [frame_rate,  filename_prefix,  format,      save_output,  …codec]
+//                     24.0 ✓       0 ✗               "shot_a" ✗   "video/…" ✗
+//
+// filename_prefix comes back as "0", format falls back to its default (the
+// saved prefix is not a valid combo option), save_output is a truthy string,
+// and the codec tail is read two slots early so crf/preset/bit_depth land on
+// each other. That is the "widgets have the value of the widget above them"
+// report from artists opening Stable-era workflows on Beta.
+//
+// The fix is to work out which historical layout wrote the saved array and
+// rewrite it into the current one — matched by NAME, not position — before
+// LiteGraph deals it out (see the configure() patch in beforeRegisterNodeDef).
+// Codec widgets need no equivalent: every format JSON has only ever had knobs
+// *appended*, so their tail still lines up (and the entries added later are
+// recovered by inferSourcesFromDerived above).
+//
+// Layouts are newest-first. Each entry is the exact ordered list of
+// serialisable static widgets that version of the node had. Whenever a static
+// widget is added, removed or reordered, push the new order on the front and
+// LEAVE the old entries — otherwise this bug comes straight back.
+const STATIC_LAYOUTS = [
+    // Current.
+    ["frame_rate", "filename_prefix", "format", "save_output"],
+    // Pre-2026-08-06. Still what the Stable and Farm releases ship, so this is
+    // the layout nearly every old workflow on disk was written by.
+    ["frame_rate", "loop_count", "filename_prefix", "format", "pingpong", "save_output"],
+];
+
+// `typeof` each static value as it serialises. This is what tells the layouts
+// apart, and it is unambiguous by construction: they differ at index 1
+// (`loop_count` is a number, `filename_prefix` is a string), so at most one can
+// type-check against any given array. Deliberately not length-based — the array
+// also carries a per-format codec tail whose length varies with the format.
+const STATIC_TYPES = {
+    frame_rate:      "number",
+    loop_count:      "number",
+    filename_prefix: "string",
+    format:          "string",
+    pingpong:        "boolean",
+    save_output:     "boolean",
+};
+
+// Identify which STATIC_LAYOUTS entry wrote a saved widgets_values array.
+// Returns null when nothing fits, so the caller can leave the positional
+// restore untouched rather than scramble an array it doesn't understand.
+//
+// `formatLabels` (the format COMBO's current options) is a tie-breaker only,
+// never a requirement: a workflow may legitimately name a format we have since
+// dropped (`video/av1-webm` did go), and that must not veto a clean type match.
+function matchStaticLayout(savedVals, formatLabels) {
+    const fits = STATIC_LAYOUTS.filter(
+        (layout) => layout.length <= savedVals.length
+            && layout.every((name, i) => typeof savedVals[i] === STATIC_TYPES[name]));
+    if (!fits.length) return null;
+    return fits.find((l) => formatLabels?.includes(savedVals[l.indexOf("format")]))
+        || fits[0];
+}
+
+// What the Python INPUT_TYPES declares for each static widget: its options (a
+// COMBO's choices) and its default. Read off nodeData at registration rather
+// than hardcoded here, so the JS can't quietly disagree with the node the day a
+// default or a format list moves.
+function declaredStatics(nodeData) {
+    const out = {};
+    for (const [name, spec] of Object.entries(nodeData?.input?.required || {})) {
+        if (!Array.isArray(spec)) continue;
+        const [type, opts] = spec;
+        out[name] = {
+            options: Array.isArray(type) ? type : null,
+            default: (opts && typeof opts === "object") ? opts.default : undefined,
+        };
+    }
+    return out;
+}
+
+// Rewrite a saved widgets_values array from whatever layout wrote it into the
+// current one, IN PLACE, so LiteGraph's positional deal lands on the right
+// widgets in the first place. Silently does nothing when the array's layout
+// isn't recognised — loading a workflow as-saved is a much better failure than
+// shuffling an array we don't understand.
+function migrateWidgetsValues(info, declared) {
+    const saved = info?.widgets_values;
+    // Some frontend versions serialise an object keyed by widget name. That
+    // form is immune to reordering by construction, so there is nothing to do.
+    if (!Array.isArray(saved)) return;
+
+    const current = STATIC_LAYOUTS[0];
+    const layout = matchStaticLayout(saved, declared.format?.options);
+    if (!layout) {
+        console.warn("[Bat_VideoCombine] widgets_values matches no known static layout",
+                     "— loading it as saved:", saved);
+        return;
+    }
+
+    const byName = {};
+    layout.forEach((name, i) => { byName[name] = saved[i]; });
+
+    const prefix = current.map((name) => {
+        const spec = declared[name] || {};
+        let v = byName[name];
+        // A static widget added since this workflow was saved has no value in
+        // it, so its declared default is the only honest answer.
+        if (v === undefined) return spec.default;
+        // A COMBO value that is no longer on offer must not survive: formats do
+        // get retired (`video/av1-webm` went), and litegraph draws the stale
+        // string quite happily right up until the encode fails.
+        if (spec.options?.length && !spec.options.includes(v)) {
+            const fallback = spec.options.includes(spec.default)
+                ? spec.default : spec.options[0];
+            console.warn("[Bat_VideoCombine] saved", name, "=", v,
+                         "is no longer offered — falling back to", fallback);
+            v = fallback;
+        }
+        return v;
+    });
+
+    // The codec tail rides along untouched: every format JSON has only ever had
+    // widgets APPENDED, so the saved entries still line up with the current
+    // JSON order and onConfigure recovers the ones added since.
+    info.widgets_values = prefix.concat(saved.slice(layout.length));
+
+    if (layout !== current) {
+        console.info("[Bat_VideoCombine] migrated a workflow saved with the",
+                     layout.join("/"), "widget layout");
+    }
+}
+
+// Rank a bit_depth option so we can pick the deepest one a format offers.
+// Options are strings: "8" / "10" / "12" / "16", and EXR's "16f" / "32f".
+// Ranking on the leading digits sorts both families correctly (within one
+// format's list, which is the only place they are ever compared).
+function depthRank(option) {
+    const m = String(option).match(/\d+/);
+    return m ? Number(m[0]) : 0;
+}
+
+function highestDepth(spec) {
+    const opts = (spec && spec.options) || [];
+    if (!opts.length) return undefined;
+    return opts.reduce((best, o) => (depthRank(o) > depthRank(best) ? o : best), opts[0]);
+}
+
 // Rebuild the codec widgets for the node's currently-selected format.
 // `savedValues` (name→value) lets us restore values after a workflow load.
-async function rebuildCodecWidgets(node, formatLabel, savedValues) {
+// `opts.preferMaxBitDepth` picks the deepest bit_depth the new format offers
+// instead of its JSON default — used when the artist switches format by hand,
+// NOT on workflow load (where the saved value must win).
+async function rebuildCodecWidgets(node, formatLabel, savedValues, opts) {
     const specs = await getFormatSpecs();
     const def = specs[formatLabel];
     removeCodecWidgets(node);
@@ -183,14 +412,37 @@ async function rebuildCodecWidgets(node, formatLabel, savedValues) {
     // (The DOM player is serialize:false, so the serialiser skips it anyway.)
     const playerIndex = () => node.widgets.findIndex((w) => w.name === "bat_video_player");
     const derived = def.derived || {};
+    const preferMax = !!(opts && opts.preferMaxBitDepth);
     for (const spec of def.widgets || []) {
-        const saved = savedValues ? savedValues[spec.name] : undefined;
+        let saved = savedValues ? savedValues[spec.name] : undefined;
+        // Hand-switching format: land on the deepest depth this codec can
+        // write rather than its JSON default, so going 8-bit -> ProRes doesn't
+        // quietly stay at the shallow end. Never on workflow load — a saved
+        // value is the artist's choice and must survive.
+        if (preferMax && spec.name === "bit_depth" && saved === undefined) {
+            saved = highestDepth(spec);
+        }
         const plain = makeCodecWidget(node, spec, saved);
+        const intended = plain.value;
         // addCustomWidget returns the concrete instance; fall back to the plain
         // object on any older build that lacks the method.
         const w = (typeof node.addCustomWidget === "function")
             ? node.addCustomWidget(plain)
             : (node.widgets.push(plain), plain);
+        // Force the value through the setter, which writes into the frontend's
+        // widget-value store.
+        //
+        // That store is keyed by (graph, node, widget NAME) and survives the
+        // widget itself: LGraphNode.removeWidget splices the widget off the
+        // node but never unregisters its state. registerWidget then bails out
+        // early — `let n = getWidget(id); if (n && n.type === state.type)
+        // return n` — so a rebuilt widget with the same name AND type adopts
+        // the *previous* format's value and throws away the one we just
+        // computed. That is why switching 16-bit FFV1 -> h264 left bit_depth
+        // reading "16" until you reopened the dropdown (and why crf/preset
+        // carried across format switches too). Assigning here is the only
+        // public-API way to make the intended value stick.
+        if (w.value !== intended) w.value = intended;
         // Carry the marker onto the concrete instance (toClass copies own
         // props, but be explicit so removeCodecWidgets always finds it).
         w[CODEC_WIDGET_FLAG] = true;
@@ -215,7 +467,8 @@ async function rebuildCodecWidgets(node, formatLabel, savedValues) {
             }
         }
         // When a source of a derived rule changes, recompute the target.
-        const drivesDerived = Object.values(derived).some((r) => r.from === spec.name);
+        const drivesDerived = Object.values(derived)
+            .some((r) => derivedSources(r).includes(spec.name));
         if (drivesDerived) {
             const prev = w.callback;
             w.callback = function (v) {
@@ -286,8 +539,12 @@ function wireFormatWidget(node, attempt) {
     const prevCb = formatWidget.callback;
     formatWidget.callback = function (value, ...rest) {
         if (typeof prevCb === "function") prevCb.call(this, value, ...rest);
-        rebuildCodecWidgets(node, value);
+        // Hand-picked format change: take the new codec's deepest bit depth.
+        rebuildCodecWidgets(node, value, undefined, { preferMaxBitDepth: true });
     };
+    // Initial build for a freshly-dropped node keeps the format's curated JSON
+    // default (h264 at 8-bit, the sane review-copy setting) — "deepest" only
+    // applies once the artist deliberately switches to another codec.
     rebuildCodecWidgets(node, formatWidget.value);
 }
 
@@ -337,15 +594,66 @@ function _vcLoadPreview(node) {
     } catch (_) { return null; }
 }
 
-function buildPreviewUrl(preview) {
-    // Non-browser-playable formats go through the on-demand transcoder.
-    const route = preview.browser_playable === false ? "/bat/video/preview" : "/view";
+// A sequence preview is one of these: the payload says so, or (for an entry
+// restored from an older localStorage write, which has no is_sequence flag)
+// the filename still carries its printf token.
+function _vcIsSequence(preview) {
+    return !!preview && (preview.is_sequence === true || /%%?\d*d/.test(preview.filename || ""));
+}
+
+function _vcIsExr(preview) {
+    if (!preview) return false;
+    if (typeof preview.is_exr === "boolean") return preview.is_exr;
+    return /\.exr$/i.test(preview.filename || "");
+}
+
+// Query params every /bat/video/* route accepts for this preview. `fps` and
+// `trc` only mean anything for a sequence (see the module header) but are
+// harmless elsewhere, so they're sent unconditionally rather than branched on.
+function buildPreviewParams(preview, viewTrc) {
     const params = new URLSearchParams({
         filename: preview.filename,
         type:     preview.type || "output",
         subfolder: preview.subfolder || "",
     });
-    return api.apiURL(`${route}?${params.toString()}`);
+    if (preview.frame_rate) params.set("fps", String(preview.frame_rate));
+    if (viewTrc) params.set("trc", viewTrc);
+    return params;
+}
+
+function buildPreviewUrl(preview, viewTrc) {
+    // Non-browser-playable formats — ProRes, FFV1, h265, image sequences —
+    // go through the on-demand transcoder.
+    const route = preview.browser_playable === false || _vcIsSequence(preview)
+        ? "/bat/video/preview" : "/view";
+    return api.apiURL(`${route}?${buildPreviewParams(preview, viewTrc).toString()}`);
+}
+
+// ── EXR view transform ────────────────────────────────────────────────────
+// Kept OUT of the node's widgets on purpose: the codec widgets serialise
+// positionally into widgets_values (see the /bat/video/formats docstring), so
+// adding one would shift every workflow already saved with an EXR format.
+// This is a preview-only display setting, so it lives on the player and
+// persists per node in localStorage instead.
+const VC_VIEWS = [
+    ["",       "1:1",     "Read EXR values straight (matches an h264 export of the same frames)"],
+    ["srgb",   "sRGB",    "Apply the sRGB curve — for scene-linear renders"],
+    ["rec709", "Rec.709", "Apply the Rec.709 curve — for scene-linear renders"],
+];
+
+function _vcViewCacheKey(node) {
+    return batNodeCacheKey(app, "bat_vc_view", node);
+}
+
+function _vcLoadView(node) {
+    try {
+        const v = localStorage.getItem(_vcViewCacheKey(node)) || "";
+        return VC_VIEWS.some(([id]) => id === v) ? v : "";
+    } catch (_) { return ""; }
+}
+
+function _vcSaveView(node, view) {
+    try { localStorage.setItem(_vcViewCacheKey(node), view || ""); } catch (_) {}
 }
 
 function buildPlayer(node) {
@@ -479,6 +787,16 @@ function buildPlayer(node) {
     timeLabel.style.cssText = "flex:1; text-align:center; font-family:monospace; color:#9ab;";
     timeLabel.textContent = "0:00.00 · frame 0 / 0";
 
+    // EXR-only; hidden for every other format (see VC_VIEWS).
+    const viewSel = document.createElement("select");
+    viewSel.title = "EXR view transform (preview only — does not change the saved frames)";
+    viewSel.style.cssText = "background:#1a1d22; color:#cdd; border:1px solid #2a2f37; border-radius:3px; font-size:11px; padding:1px 2px; display:none;";
+    for (const [id, label, title] of VC_VIEWS) {
+        const o = document.createElement("option");
+        o.value = id; o.textContent = label; o.title = title;
+        viewSel.appendChild(o);
+    }
+
     const saveFrameBtn = btn("📷", "Save current frame as PNG");
     const fullscreenBtn = btn("⛶", "Fullscreen (F)");
 
@@ -487,7 +805,7 @@ function buildPlayer(node) {
     // · time · 📷 ⛶
     controls.append(
         stepBack10, stepBack, playBtn, stepFwd, stepFwd10,
-        speedSel, muteBtn, volSlider, timeLabel, saveFrameBtn, fullscreenBtn,
+        speedSel, viewSel, muteBtn, volSlider, timeLabel, saveFrameBtn, fullscreenBtn,
     );
     root.appendChild(controls);
 
@@ -503,6 +821,8 @@ function buildPlayer(node) {
         fps: 24,           // from /bat/video/meta or preview.frame_rate
         frameCount: 0,
         hasAudio: false,
+        viewTrc: _vcLoadView(node),   // "" | "srgb" | "rec709", EXR only
+        isSequence: false,
         loopIn: null,      // seconds, or null
         loopOut: null,
         // Hover-thumb coalescing — only the latest requested time gets
@@ -595,10 +915,25 @@ function buildPlayer(node) {
         const f = Math.floor(_displayedTime() * state.fps + 1e-6);
         return Math.max(0, Math.min((state.frameCount || 1) - 1, f));
     };
+    // Every seek goes through this. The player is `loop = true`, so landing on
+    // (or past) `duration` fires `ended` and the element immediately wraps to 0
+    // — which is what made the playhead flick between the last frame and the
+    // first while the artist was still holding the handle at the end of the
+    // timeline: the wrap repainted at frame 1, the drag pushed it back to the
+    // end, repeat. The mid-frame target for the last frame, (frameCount - 0.5) /
+    // fps, sits past `duration` whenever the container's duration is a hair
+    // shorter than frameCount / fps (rounded fps, 29.97 vs 30, a short final
+    // frame), so this is reachable on ordinary footage. Stop a millisecond
+    // short: still well inside the final frame, never on the wrap point.
+    const safeSeekTime = (t) => {
+        const d = videoEl.duration;
+        const capped = (Number.isFinite(d) && d > 0) ? Math.min(t, d - 1e-3) : t;
+        return Math.max(0, capped);
+    };
     const snapToFrame = (frame) => {
         if (!state.fps) return;
         const f = Math.max(0, Math.min(state.frameCount - 1, frame));
-        videoEl.currentTime = (f + 0.5) / state.fps;   // mid-frame for accuracy
+        videoEl.currentTime = safeSeekTime((f + 0.5) / state.fps);   // mid-frame for accuracy
     };
     const updateTimeLabel = () => {
         const f = currentFrame();
@@ -665,7 +1000,7 @@ function buildPlayer(node) {
         newFrame = Math.max(0, Math.min(maxFrame, newFrame));
         state.pendingTarget = newFrame;
         state.displayedMediaTime = newFrame / fps;
-        const target = (newFrame + 0.5) / fps;
+        const target = safeSeekTime((newFrame + 0.5) / fps);
         _paintPlayhead(target);
         updateTimeLabel();
         videoEl.currentTime = target;
@@ -700,6 +1035,28 @@ function buildPlayer(node) {
             videoEl.muted = false;
             muteBtn.textContent = "🔊";
         }
+    };
+
+    // Changing the view re-transcodes server-side (a different cache entry),
+    // so we reload the src and land back on the frame the artist was looking
+    // at rather than snapping to zero.
+    viewSel.onchange = () => {
+        state.viewTrc = viewSel.value;
+        _vcSaveView(node, state.viewTrc);
+        if (!state.preview) return;
+        const wasPaused = videoEl.paused;
+        const at = _displayedTime();
+        const url = buildPreviewUrl(state.preview, state.viewTrc);
+        const restore = () => {
+            videoEl.removeEventListener("loadeddata", restore);
+            try { videoEl.currentTime = at; } catch (_) {}
+            if (!wasPaused) videoEl.play().catch(() => {});
+        };
+        videoEl.addEventListener("loadeddata", restore);
+        videoEl.src = url;
+        videoEl.load();
+        thumbVideo.src = url;
+        thumbVideo.load();
     };
 
     fullscreenBtn.onclick = () => {
@@ -773,6 +1130,9 @@ function buildPlayer(node) {
     };
 
     let dragging = null;   // null | "scrub" | "in" | "out"
+    // Was the player running when this scrub started? Playback is suspended for
+    // the duration of the drag and restored on release.
+    let resumeAfterScrub = false;
     timeline.addEventListener("pointerdown", (e) => {
         if (e.button === 2) return;
         if (e.target === inPin)       dragging = "in";
@@ -783,6 +1143,24 @@ function buildPlayer(node) {
             // mid-seek — otherwise the next stepBack/Fwd would anchor
             // on the pre-scrub target and either skip or fail to move.
             state.pendingTarget = null;
+            // Take `loop` off for the length of the drag, and put playback on
+            // hold with it.
+            //
+            // Dragging to (or past — the position clamps) the right-hand end
+            // asks for a seek at the very end of the media. On a `loop = true`
+            // element that puts it into its ended state, and the browser wraps
+            // the position to 0 — this does NOT require playback to be running,
+            // which is why pausing alone didn't fix it. The wrap fires the
+            // `seeked` handler, which repaints the playhead at 0 while the mouse
+            // is still holding the right-hand end; the next pointermove paints
+            // it back at 100%, and it flickers between the two ends.
+            //
+            // Looping at the end of PLAYBACK is the point of the player and is
+            // deliberately preserved — `loop` is restored on release.
+            state.scrubPrevLoop = videoEl.loop;
+            videoEl.loop = false;
+            resumeAfterScrub = !videoEl.paused;
+            if (resumeAfterScrub) videoEl.pause();
         }
         timeline.setPointerCapture(e.pointerId);
         handleTimelineMove(e);
@@ -791,6 +1169,20 @@ function buildPlayer(node) {
         if (dragging) handleTimelineMove(e);
         else          handleTimelineHover(e);
     });
+
+    // Restore whatever the scrub borrowed: `loop` first, then playback, so the
+    // element never resumes with looping still disabled.
+    function _endScrub() {
+        if (state.scrubPrevLoop != null) {
+            videoEl.loop = state.scrubPrevLoop;
+            state.scrubPrevLoop = null;
+        }
+        if (resumeAfterScrub) {
+            resumeAfterScrub = false;
+            videoEl.play().catch(() => {});
+        }
+    }
+
     timeline.addEventListener("pointerup", (e) => {
         const wasScrub = (dragging === "scrub");
         dragging = null;
@@ -805,8 +1197,12 @@ function buildPlayer(node) {
             state.scrubPendingFrame = null;
             _seekToFrame(f);
         }
+        _endScrub();
     });
-    timeline.addEventListener("pointercancel", () => { dragging = null; });
+    timeline.addEventListener("pointercancel", () => {
+        dragging = null;
+        _endScrub();
+    });
     timeline.addEventListener("pointerleave", () => {
         hoverThumb.style.display = "none";
     });
@@ -862,10 +1258,11 @@ function buildPlayer(node) {
             // long-GOP encodes it's an approximation that resolves
             // far quicker than currentTime=. We snap to exact frame on
             // pointerup (see below) for the final position.
+            const target = safeSeekTime((f + 0.5) / state.fps);
             if (typeof videoEl.fastSeek === "function") {
-                videoEl.fastSeek((f + 0.5) / state.fps);
+                videoEl.fastSeek(target);
             } else {
-                videoEl.currentTime = (f + 0.5) / state.fps;
+                videoEl.currentTime = target;
             }
         } catch (_) {
             state.scrubSeeking = false;
@@ -998,7 +1395,7 @@ function buildPlayer(node) {
         }
         // Firefox fallback for the playhead update — when rVFC isn't
         // available we depend on timeupdate's ~4 Hz cadence.
-        if (!videoEl.requestVideoFrameCallback) {
+        if (!videoEl.requestVideoFrameCallback && dragging !== "scrub") {
             _paintPlayhead(videoEl.currentTime);
             updateTimeLabel();
         }
@@ -1006,9 +1403,15 @@ function buildPlayer(node) {
     videoEl.addEventListener("seeked", () => {
         // After any seek (drag-scrub, frame step, in/out enforcement),
         // make sure the playhead reflects where the video actually
-        // landed. _paintPlayhead is idempotent, so calling it during
-        // drag-scrub on top of the drag handler's call is harmless.
-        _paintPlayhead(videoEl.currentTime);
+        // landed — EXCEPT under an active scrub, where the mouse is the
+        // authority and the decoder is chasing it. Repainting from
+        // videoEl.currentTime there fights the drag: any seek that resolves
+        // somewhere other than the requested position (an approximate
+        // fastSeek landing, a clamp at the end of the media) yanks the
+        // playhead away from the cursor until the next pointermove puts it
+        // back. The drag handler already paints every move, and pointerup
+        // does a final exact snap.
+        if (dragging !== "scrub") _paintPlayhead(videoEl.currentTime);
         // If a scrub coalesced another target while this seek was in
         // flight, kick off the next one. Done BEFORE the pendingTarget
         // reconcile below so the in-flight chain stays alive.
@@ -1072,8 +1475,14 @@ function buildPlayer(node) {
                 // is what we want to keep showing until the real seek
                 // catches up.
             }
-            _paintPlayhead(videoEl.currentTime);
-            updateTimeLabel();
+            // Under an active scrub the mouse owns the playhead — see the
+            // note on the `seeked` handler. This tick fires once per
+            // composited frame, so it's the loudest of the async repaints
+            // and the one that visibly drags the handle off the cursor.
+            if (dragging !== "scrub") {
+                _paintPlayhead(videoEl.currentTime);
+                updateTimeLabel();
+            }
             // The callback fires once per displayed frame; re-arm it on
             // EVERY tick (even while paused) so a manual seek or a frame
             // step still gets its repaint. The browser only schedules the
@@ -1097,14 +1506,18 @@ function buildPlayer(node) {
         state.fps = preview.frame_rate || 24;
         state.frameCount = preview.frame_count || 0;
         state.hasAudio = false;
+        state.isSequence = _vcIsSequence(preview);
         state.thumbPendingTime = null;
         state.thumbSeeking = false;
         muteBtn.style.display = volSlider.style.display = "none";
+        // Only EXR carries a linear/display ambiguity worth a control.
+        viewSel.style.display = _vcIsExr(preview) ? "inline-block" : "none";
+        viewSel.value = state.viewTrc;
         // Drop any thumb from the previous file so the first hover on
         // the new file doesn't flash an unrelated frame.
         hoverThumb.removeAttribute("src");
 
-        const url = buildPreviewUrl(preview);
+        const url = buildPreviewUrl(preview, state.viewTrc);
         videoEl.src = url;
         videoEl.load();
         // Autoplay only for a fresh encode. On a restore we load the first frame
@@ -1116,19 +1529,20 @@ function buildPlayer(node) {
         thumbVideo.src = url;
         thumbVideo.load();
 
-        const playableNote = preview.browser_playable === false
+        const playableNote = (preview.browser_playable === false || state.isSequence)
             ? "(transcoded preview)"  : "";
-        statusRow.textContent = `${preview.filename}  ·  ${preview.format || ""}  ${playableNote}`;
+        // A sequence's filename is a printf pattern, which reads as nothing on
+        // its own — show the directory it lives in as well.
+        const label = state.isSequence
+            ? `${preview.subfolder || ""}/${preview.filename}`
+            : preview.filename;
+        statusRow.textContent = `${label}  ·  ${preview.format || ""}  ${playableNote}`;
 
         // Now probe the actual file — ffprobe is the source of truth for
-        // fps + frame count (the encode payload guesses based on pingpong
-        // arithmetic, but doesn't see what the codec actually wrote).
+        // fps + frame count (the encode payload reports the input batch size,
+        // but doesn't see what the codec actually wrote).
         try {
-            const params = new URLSearchParams({
-                filename: preview.filename,
-                type:     preview.type || "output",
-                subfolder: preview.subfolder || "",
-            });
+            const params = buildPreviewParams(preview, state.viewTrc);
             const resp = await api.fetchApi(`/bat/video/meta?${params.toString()}`);
             if (resp.ok) {
                 const meta = await resp.json();
@@ -1156,11 +1570,7 @@ function buildPlayer(node) {
         const cached = _vcLoadPreview(node);
         if (!cached) return;
         try {
-            const params = new URLSearchParams({
-                filename: cached.filename,
-                type:     cached.type || "output",
-                subfolder: cached.subfolder || "",
-            });
+            const params = buildPreviewParams(cached, state.viewTrc);
             const resp = await api.fetchApi(`/bat/video/meta?${params.toString()}`);
             if (!resp.ok) { _vcSavePreview(node, null); return; }
         } catch (_) {
@@ -1188,6 +1598,32 @@ app.registerExtension({
     name: "Bat_VideoCombine",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+
+        // Rewrite pre-2026-08-06 saved data before LiteGraph applies it. This
+        // sits on configure() rather than onConfigure() because by the time
+        // that callback fires the values have already been dealt out to the
+        // wrong widgets — and every load path (opening a workflow, dropping a
+        // rendered MOV on the canvas, pasting, undo, a subgraph definition)
+        // comes through here. Same shape as the Volt Loader's VRI migration,
+        // see ComfyUI-Volt_Loader/web/volt_vri.js.
+        //
+        // `configure` is inherited, so this reads it off the prototype chain.
+        // Guard the migration: dropping the real configure() would leave every
+        // loaded node blank, a far worse failure than not migrating.
+        const declared = declaredStatics(nodeData);
+        const origConfigure = nodeType.prototype.configure;
+        if (!nodeType.prototype._batVCLegacyConfigure) {
+            nodeType.prototype.configure = function (info) {
+                try {
+                    migrateWidgetsValues(info, declared);
+                } catch (e) {
+                    console.warn("[Bat_VideoCombine] legacy migration failed;",
+                                 "loading as saved:", e);
+                }
+                return origConfigure?.apply(this, arguments);
+            };
+            nodeType.prototype._batVCLegacyConfigure = true;
+        }
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
@@ -1236,7 +1672,9 @@ app.registerExtension({
 
             // Static (serialised) widgets currently present — codec widgets
             // aren't built yet, so this count is exactly the static prefix
-            // length in the saved widgets_values array.
+            // length in the saved widgets_values array. (Workflows saved by an
+            // older layout were already rewritten into the current one by the
+            // configure() patch below, so this holds for those too.)
             const savedVals = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
             const staticCount = this.widgets.filter(
                 (w) => w.name && w.options?.serialize !== false
@@ -1253,6 +1691,12 @@ app.registerExtension({
                     (def.widgets || []).forEach((spec, i) => {
                         if (i < tail.length) savedByName[spec.name] = tail[i];
                     });
+                    // Widgets appended to a format AFTER this workflow was
+                    // saved have no entry in the tail. Where one of them drives
+                    // a derived value the tail *does* carry (bit_depth ->
+                    // pix_fmt), recover it by inverting the map rather than
+                    // letting its default silently re-derive the pixel format.
+                    inferSourcesFromDerived(def, savedByName);
                 }
                 rebuildCodecWidgets(this, formatWidget.value, savedByName);
             });

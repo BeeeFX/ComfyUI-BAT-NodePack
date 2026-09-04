@@ -9,7 +9,22 @@
     ],
     "audio_args": null,
     "widgets": {
-        "pix_fmt": {"type": "COMBO", "default": "rgb48be", "label": "Pixel format",
-                    "options": ["rgb48be", "rgba64be", "rgb24", "rgba"]}
+        "pix_fmt": {"type": "COMBO", "default": "rgb48be", "label": "Pixel format", "hidden": true,
+                    "options": ["rgb24", "rgba", "rgb48be", "rgba64be"]},
+        "alpha":   {"type": "BOOLEAN", "default": false, "label": "Alpha channel"},
+        "bit_depth": {"type": "COMBO", "default": "16", "label": "Bit depth",
+                    "options": ["8", "16"]}
+    },
+    "derived": {
+        "pix_fmt": {
+            "from": ["alpha", "bit_depth"],
+            "default": "rgb48be",
+            "map": {
+                "false|8":  "rgb24",
+                "false|16": "rgb48be",
+                "true|8":   "rgba",
+                "true|16":  "rgba64be"
+            }
+        }
     }
 }

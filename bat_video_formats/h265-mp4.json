@@ -20,8 +20,22 @@
     "audio_args": ["-c:a", "aac"],
     "widgets": {
         "crf":     {"type": "INT",   "default": 22, "min": 0, "max": 51, "label": "Quality (CRF, lower=better)"},
-        "pix_fmt": {"type": "COMBO", "default": "yuv420p10le", "label": "Pixel format", "options": ["yuv420p10le", "yuv420p"]},
+        "pix_fmt": {"type": "COMBO", "default": "yuv420p10le", "label": "Pixel format", "hidden": true,
+                    "options": ["yuv420p", "yuv420p10le", "yuv420p12le"]},
         "preset":  {"type": "COMBO", "default": "medium", "label": "Encode preset",
-                    "options": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]}
+                    "options": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]},
+        "bit_depth": {"type": "COMBO", "default": "10", "label": "Bit depth",
+                    "options": ["8", "10", "12"]}
+    },
+    "derived": {
+        "pix_fmt": {
+            "from": "bit_depth",
+            "default": "yuv420p10le",
+            "map": {
+                "8":  "yuv420p",
+                "10": "yuv420p10le",
+                "12": "yuv420p12le"
+            }
+        }
     }
 }

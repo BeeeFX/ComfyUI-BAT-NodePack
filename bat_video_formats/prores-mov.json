@@ -20,19 +20,21 @@
         "profile": {"type": "COMBO", "default": "hq", "label": "ProRes profile",
                     "options": ["proxy", "lt", "standard", "hq", "4444", "4444xq"]},
         "pix_fmt": {"type": "COMBO", "default": "yuv422p10le", "hidden": true,
-                    "options": ["yuv422p10le", "yuv444p10le", "yuva444p10le"]}
+                    "options": ["yuv422p10le", "yuv444p10le", "yuva444p10le"]},
+        "bit_depth": {"type": "COMBO", "default": "10", "label": "Bit depth (ProRes is 10-bit in ffmpeg)",
+                    "options": ["10"]}
     },
     "derived": {
         "pix_fmt": {
-            "from": "profile",
+            "from": ["profile", "bit_depth"],
             "default": "yuv422p10le",
             "map": {
-                "proxy":  "yuv422p10le",
-                "lt":     "yuv422p10le",
-                "standard": "yuv422p10le",
-                "hq":     "yuv422p10le",
-                "4444":   "yuva444p10le",
-                "4444xq": "yuva444p10le"
+                "proxy|10":    "yuv422p10le",
+                "lt|10":       "yuv422p10le",
+                "standard|10": "yuv422p10le",
+                "hq|10":       "yuv422p10le",
+                "4444|10":     "yuva444p10le",
+                "4444xq|10":   "yuva444p10le"
             }
         }
     }

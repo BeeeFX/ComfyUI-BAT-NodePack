@@ -2,16 +2,64 @@
     "label": "image/exr-sequence",
     "extension": "%05d.exr",
     "browser_playable": false,
+    "input_color_depth": "32f",
+    "writer": "oiio",
+    "metadata": "oiio_attribs",
     "video_args": [
         "-c:v", "exr",
         "-pix_fmt", "{pix_fmt}",
-        "-compression", "{compression}"
+        "-format", "{pixel_type}",
+        "-compression", "{ffmpeg_compression}"
     ],
     "audio_args": null,
     "widgets": {
-        "pix_fmt": {"type": "COMBO", "default": "gbrpf32le", "label": "Pixel format",
+        "pix_fmt": {"type": "COMBO", "default": "gbrpf32le", "label": "Pixel format", "hidden": true,
                     "options": ["gbrpf32le", "gbrapf32le"]},
         "compression": {"type": "COMBO", "default": "zip", "label": "Compression",
-                    "options": ["none", "rle", "zip1", "zip", "piz", "pxr24"]}
+                    "options": ["none", "rle", "zips", "zip", "piz", "pxr24",
+                                "b44", "b44a", "dwaa", "dwab"]},
+        "alpha":   {"type": "BOOLEAN", "default": false, "label": "Alpha channel"},
+        "bit_depth": {"type": "COMBO", "default": "16f", "label": "Bit depth (float)",
+                    "options": ["16f", "32f"]},
+        "pixel_type": {"type": "COMBO", "default": "half", "hidden": true,
+                    "options": ["half", "float"]},
+        "dwa_level": {"type": "INT", "default": 45, "min": 0, "max": 2047,
+                    "label": "DWA level (DWAA/DWAB only, higher = smaller + lossier)"},
+        "ffmpeg_compression": {"type": "COMBO", "default": "zip16", "hidden": true,
+                    "options": ["none", "rle", "zip1", "zip16"]}
+    },
+    "derived": {
+        "pix_fmt": {
+            "from": "alpha",
+            "default": "gbrpf32le",
+            "map": {
+                "false": "gbrpf32le",
+                "true":  "gbrapf32le"
+            }
+        },
+        "pixel_type": {
+            "from": "bit_depth",
+            "default": "half",
+            "map": {
+                "16f": "half",
+                "32f": "float"
+            }
+        },
+        "ffmpeg_compression": {
+            "from": "compression",
+            "default": "zip16",
+            "map": {
+                "none":  "none",
+                "rle":   "rle",
+                "zips":  "zip1",
+                "zip":   "zip16",
+                "piz":   "zip16",
+                "pxr24": "zip16",
+                "b44":   "zip16",
+                "b44a":  "zip16",
+                "dwaa":  "zip16",
+                "dwab":  "zip16"
+            }
+        }
     }
 }

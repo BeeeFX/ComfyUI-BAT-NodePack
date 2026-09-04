@@ -17,9 +17,44 @@
     "widgets": {
         "slices":  {"type": "COMBO", "default": "16", "label": "Slices",
                     "options": ["4", "6", "9", "12", "16", "20", "24", "30"]},
-        "pix_fmt": {"type": "COMBO", "default": "rgba64le", "label": "Pixel format",
-                    "options": ["rgba64le", "bgra", "yuv420p", "yuv422p", "yuv444p",
-                                "yuva420p", "yuva422p", "yuva444p",
-                                "yuv420p10le", "yuv422p10le", "yuv444p10le"]}
+        "pix_fmt": {"type": "COMBO", "default": "rgba64le", "label": "Pixel format", "hidden": true,
+                    "options": ["bgr0", "bgra", "rgb48le", "rgba64le",
+                                "gbrp10le", "gbrp12le", "gbrap10le", "gbrap12le",
+                                "yuv420p", "yuv422p", "yuv444p",
+                                "yuv420p10le", "yuv422p10le", "yuv444p10le",
+                                "yuv420p12le", "yuv422p12le", "yuv444p12le",
+                                "yuv420p16le", "yuv422p16le", "yuv444p16le"]},
+        "layout":  {"type": "COMBO", "default": "rgba", "label": "Colour layout",
+                    "options": ["rgb", "rgba", "yuv444", "yuv422", "yuv420"]},
+        "bit_depth": {"type": "COMBO", "default": "16", "label": "Bit depth",
+                    "options": ["8", "10", "12", "16"]}
+    },
+    "derived": {
+        "pix_fmt": {
+            "from": ["layout", "bit_depth"],
+            "default": "rgba64le",
+            "map": {
+                "rgb|8":     "bgr0",
+                "rgb|10":    "gbrp10le",
+                "rgb|12":    "gbrp12le",
+                "rgb|16":    "rgb48le",
+                "rgba|8":    "bgra",
+                "rgba|10":   "gbrap10le",
+                "rgba|12":   "gbrap12le",
+                "rgba|16":   "rgba64le",
+                "yuv444|8":  "yuv444p",
+                "yuv444|10": "yuv444p10le",
+                "yuv444|12": "yuv444p12le",
+                "yuv444|16": "yuv444p16le",
+                "yuv422|8":  "yuv422p",
+                "yuv422|10": "yuv422p10le",
+                "yuv422|12": "yuv422p12le",
+                "yuv422|16": "yuv422p16le",
+                "yuv420|8":  "yuv420p",
+                "yuv420|10": "yuv420p10le",
+                "yuv420|12": "yuv420p12le",
+                "yuv420|16": "yuv420p16le"
+            }
+        }
     }
 }
