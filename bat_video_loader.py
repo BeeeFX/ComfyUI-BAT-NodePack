@@ -249,7 +249,7 @@ class VideoLoader:
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("images",)
-    CATEGORY = "BAT/video"
+    CATEGORY = "BAT/Video"
     DESCRIPTION = (
         "Load a trimmed range of frames from a video file. Type a path (with "
         "directory autocomplete) and set the range with a dual-handle trim "

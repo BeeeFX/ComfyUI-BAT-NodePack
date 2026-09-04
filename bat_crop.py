@@ -293,7 +293,7 @@ class BatCrop:
     # canvas (the previous behaviour of the single `mask` output).
     RETURN_TYPES = ("IMAGE", "BAT_CROP_INFO", "MASK", "MASK")
     RETURN_NAMES = ("image", "crop_info", "mask", "rect_mask")
-    CATEGORY = "BAT/image"
+    CATEGORY = "BAT/Transform"
     DESCRIPTION = (
         "Interactive crop with an on-node canvas: drag the rect, 8 sizing "
         "handles, rotation, aspect lock and snap. Outputs the cropped image "

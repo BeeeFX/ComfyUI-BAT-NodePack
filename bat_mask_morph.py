@@ -194,7 +194,7 @@ class BatGrowMask:
     RETURN_TYPES = ("MASK",)
     RETURN_NAMES = ("mask",)
     FUNCTION = "run"
-    CATEGORY = "BAT/mask"
+    CATEGORY = "BAT/Mask"
     DESCRIPTION = (
         "Grow (dilate) a mask outward by `amount` pixels. `disc` gives a "
         "rounded edge, `square` a boxy one. `feather` softens the result. "
@@ -222,7 +222,7 @@ class BatErodeMask:
     RETURN_TYPES = ("MASK",)
     RETURN_NAMES = ("mask",)
     FUNCTION = "run"
-    CATEGORY = "BAT/mask"
+    CATEGORY = "BAT/Mask"
     DESCRIPTION = (
         "Erode (shrink) a mask inward by `amount` pixels. `disc` gives a "
         "rounded edge, `square` a boxy one. `feather` softens the result. "

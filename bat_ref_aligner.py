@@ -107,7 +107,7 @@ class RefAligner:
 
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("image", "mask")
-    CATEGORY = "BAT/wan"
+    CATEGORY = "BAT/WAN"
     DESCRIPTION = (
         "Align a reference image onto a plate-sized canvas with a "
         "Photoshop-style transform (translate / scale / rotate). Built for "

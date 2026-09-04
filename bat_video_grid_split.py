@@ -19,7 +19,7 @@ class VideoGridSplit:
     RETURN_TYPES = ("IMAGE",)
     OUTPUT_IS_LIST = (True,) 
     FUNCTION = "split_video"
-    CATEGORY = "BAT/video"
+    CATEGORY = "BAT/Video"
     DESCRIPTION = "Split a video frame batch into a grid of sub-clips with optional overlap. Useful for tiled rendering where one input video maps to N output regions."
 
     def split_video(self, images, columns, rows, overlap, start_index, end_index):

@@ -210,7 +210,7 @@ class BatFramePicker:
 
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
-    CATEGORY = "BAT/io"
+    CATEGORY = "BAT/Utility"
     DESCRIPTION = (
         "Browse any video or frame sequence as a contact-sheet grid on the "
         "node and output the selected frame. Path-driven: type a path to a "

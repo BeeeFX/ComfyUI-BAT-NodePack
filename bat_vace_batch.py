@@ -74,7 +74,7 @@ class VaceBatchTool:
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("images", "masks")
     FUNCTION = "build"
-    CATEGORY = "BAT/vace"
+    CATEGORY = "BAT/WAN"
     DESCRIPTION = "Batch builder for VACE (Video Authoring Compositor) workflows. Composes per-frame image / mask / control inputs into a single stacked batch with optional fill colour and premultiplication."
 
     def build(self, num_frames, premultiply, fill_color, **kwargs):

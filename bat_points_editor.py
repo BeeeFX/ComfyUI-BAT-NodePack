@@ -44,7 +44,7 @@ class BatPointsEditor:
     RETURN_TYPES = ("STRING", "STRING", "BBOX", "MASK", "IMAGE")
     RETURN_NAMES = ("positive_coords", "negative_coords", "bbox", "bbox_mask", "cropped_image")
     FUNCTION = "pointdata"
-    CATEGORY = "BAT/editors"
+    CATEGORY = "BAT/Utility"
     DESCRIPTION = """
 ## Graphical editor to create coordinates
 

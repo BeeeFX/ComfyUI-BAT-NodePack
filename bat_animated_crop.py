@@ -163,7 +163,7 @@ class BatAnimatedCrop:
     # the downstream code already knows what to do with the outputs.
     RETURN_TYPES = ("IMAGE", "BAT_CROP_INFO", "MASK", "MASK")
     RETURN_NAMES = ("image", "crop_info", "mask", "rect_mask")
-    CATEGORY = "BAT/image"
+    CATEGORY = "BAT/Transform"
     DESCRIPTION = (
         "Interactive crop whose rectangle is KEYFRAMED across the input batch "
         "— scrub the timeline, move/resize/rotate the rect, and it records a "

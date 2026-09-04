@@ -138,7 +138,7 @@ class BatUncrop:
 
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("image", "mask")
-    CATEGORY = "BAT/image"
+    CATEGORY = "BAT/Transform"
     DESCRIPTION = (
         "Paste a processed crop back onto its original plate using the "
         "BAT_CROP_INFO from Bat_Crop or Bat_AnimatedCrop. Handles rotated "
