@@ -80,7 +80,12 @@ function buildEditor(node) {
     root.appendChild(canvasWrap);
 
     const canvas = document.createElement("canvas");
-    canvas.style.cssText = "width:100%; height:100%; display:block; touch-action:none;";
+    // Out of flow on purpose — see the note in bat_roto.js. In flow, its
+    // `height:100%` degrades to the canvas's intrinsic width:height ratio
+    // whenever the parent height is indefinite, which is exactly the state
+    // Nodes 2.0 creates while measuring a node's minimum height. The node then
+    // gets locked to that ratio and grows taller as it's widened.
+    canvas.style.cssText = "position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none;";
     canvasWrap.appendChild(canvas);
 
     const hint = document.createElement("div");
@@ -789,13 +794,29 @@ function buildEditor(node) {
         render();
     }
 
+    // Playback is held for the duration of a scrub and restored on release.
+    // Without this the play interval keeps ticking under the drag and wraps
+    // end→start, so holding the handle at the last frame flicks between the end
+    // and the start of the loop range. Looping at the end of playback is
+    // deliberate and unchanged — it just shouldn't fire while the artist is
+    // dragging the playhead.
+    let resumeAfterScrub = false;
+    const endScrub = () => {
+        if (!resumeAfterScrub) return;
+        resumeAfterScrub = false;
+        if (!state.playing) togglePlay();
+    };
     timelineWrap.addEventListener("pointerdown", (e) => {
+        resumeAfterScrub = state.playing;
+        if (state.playing) togglePlay();
         timelineWrap.setPointerCapture(e.pointerId);
         seekFromMouse(e);
     });
     timelineWrap.addEventListener("pointermove", (e) => {
         if (e.buttons & 1) seekFromMouse(e);
     });
+    timelineWrap.addEventListener("pointerup", endScrub);
+    timelineWrap.addEventListener("pointercancel", endScrub);
     function seekFromMouse(e) {
         const r = timelineWrap.getBoundingClientRect();
         setFrame(Math.round(pxToFrame(e.clientX - r.left, r.width)));

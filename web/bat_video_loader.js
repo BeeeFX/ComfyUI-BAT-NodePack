@@ -1025,7 +1025,13 @@ function makePreviewWidget() {
         const t = clamp((clientX - rect.left) / rect.width, 0, 1);
         const sStart = frameToSec(state.startFrame);
         const sEnd   = frameToSec(state.endFrame + 1);
-        video.currentTime = sStart + t * (sEnd - sStart);
+        // sEnd is the EXCLUSIVE end of the trim range — the start of the frame
+        // after the last one — so dragging the knob fully right used to seek a
+        // frame past the range (and past `duration` on an untrimmed clip, where
+        // the browser clamps to whatever it has). Land mid-last-frame instead,
+        // which is the frame the artist is asking to see.
+        const last = frameToSec(state.endFrame) + 0.5 / Math.max(0.001, state.fps);
+        video.currentTime = Math.min(sStart + t * (sEnd - sStart), last);
     }
     scrubber.addEventListener("pointerdown", (e) => {
         e.stopPropagation();

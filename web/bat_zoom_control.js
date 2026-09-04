@@ -30,7 +30,18 @@
  * Zoom range is 0.2×–4×. Below 1× you see letterboxed space around the
  * image (what you want for out-of-frame crop/roto); above 1× you zoom in.
  * Middle-mouse drag pans; the wheel zooms toward the cursor.
+ *
+ * A middle-click inside an on-node DOM widget would otherwise paste the user's
+ * clipboard nodes onto the graph on Linux/X11; this control marks its canvas and
+ * arms the shared guard in bat_paste_guard.js, which handles the rest. The
+ * returned `destroy()` is a no-op kept for callers' convenience.
+ *
+ * `state.imgW` / `state.imgH` are REQUIRED, not optional: zoomTo() reads them
+ * to anchor zoom-toward-cursor. A host that tracks its image size under other
+ * names still has to mirror it onto these two, or the wheel will drift.
  */
+
+import { armBatPasteGuard, markBatWidget } from "./bat_paste_guard.js";
 
 const MIN_ZOOM = 0.2;
 const MAX_ZOOM = 4.0;
@@ -55,6 +66,12 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
     }
     if (typeof state.panX !== "number" || !isFinite(state.panX)) state.panX = 0;
     if (typeof state.panY !== "number" || !isFinite(state.panY)) state.panY = 0;
+
+    // A middle-drag here is a deliberate pan, so mark the canvas explicitly
+    // rather than relying on an ancestor having been marked. Hosts that route
+    // through addBatDOMWidget already are, but the control is also usable on an
+    // element that isn't. See bat_paste_guard.js.
+    markBatWidget(canvas);
 
     const pos = {
         tl: "left:8px; top:6px;",
@@ -91,7 +108,13 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
     readout.title = "Display zoom — click to reset view (double-click canvas also resets). "
                   + "Middle-mouse drag to pan.";
     const inBtn = mkBtn("+", "Zoom in (scroll up)");
-    box.append(outBtn, readout, inBtn);
+    // Explicit reset. The percentage readout has always been click-to-reset and
+    // the canvas has always been double-click-to-reset, but neither is
+    // discoverable — nothing about a number suggests it is a button. A visible
+    // control costs 18 pixels and saves the guess.
+    const resetBtn = mkBtn("⤾", "Reset view — back to fit, centred (100%).\n"
+                                + "Also: click the percentage, or double-click the image.");
+    box.append(outBtn, readout, inBtn, resetBtn);
     wrap.appendChild(box);
 
     function refresh() {
@@ -172,6 +195,7 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
         zoomTo(state.dispZoom * STEP, cx, cy);
     };
     readout.onclick = (e) => { e.stopPropagation(); resetView(); };
+    resetBtn.onclick = (e) => { e.stopPropagation(); resetView(); };
 
     // Scroll-wheel zooms toward the cursor (and swallows the event so the
     // LiteGraph canvas underneath doesn't also zoom the whole graph).
@@ -181,6 +205,7 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
         const c = cursorCanvas(e);
         zoomTo(e.deltaY < 0 ? state.dispZoom * STEP : state.dispZoom / STEP, c.x, c.y);
     }, { passive: false });
+
 
     // ── Middle-mouse pan ─────────────────────────────────────────────
     // Captured in the CAPTURE phase so it runs before the editor's own
@@ -202,6 +227,7 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
             prevCursor: canvas.style.cursor,
         };
         canvas.style.cursor = "grabbing";
+        armBatPasteGuard();
         try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
     }, true);
     canvas.addEventListener("pointermove", (e) => {
@@ -215,6 +241,8 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
     const endPan = (e) => {
         if (!pan) return;
         e.stopPropagation();
+        // Re-arm: the paste arrives on release, not on press.
+        armBatPasteGuard();
         try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
         canvas.style.cursor = pan.prevCursor || "";
         pan = null;
@@ -227,6 +255,7 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
         if (e.button === 1) { e.preventDefault(); e.stopPropagation(); }
     }, true);
 
+
     // Double-click empty canvas → reset view (zoom + pan). Resetting the
     // view doesn't disturb the crop/roto data, only the display.
     canvas.addEventListener("dblclick", (e) => {
@@ -236,5 +265,20 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
     });
 
     refresh();
-    return { setZoom, getZoom: () => state.dispZoom, resetView, refresh };
+
+    /**
+     * Nothing to tear down.
+     *
+     * Every listener this module installs is on `canvas` or on its own buttons,
+     * all of which die with the widget's DOM. The X11 paste guard used to live
+     * here and did need releasing; it now lives in bat_paste_guard.js as a
+     * page-wide singleton, precisely because the editors that predate any
+     * teardown (Crop, Animated Crop, Roto) would never have released it.
+     *
+     * Kept as a no-op so hosts can call it unconditionally, and so this stays
+     * the obvious place to hang a real teardown if one is ever needed.
+     */
+    function destroy() {}
+
+    return { setZoom, getZoom: () => state.dispZoom, resetView, refresh, destroy };
 }

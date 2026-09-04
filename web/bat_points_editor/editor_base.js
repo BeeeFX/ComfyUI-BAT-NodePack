@@ -9,6 +9,7 @@
 
 import { addMiddleClickPan, captureVideoFrame, chainCallback, makeUUID, watchImageInputs } from './utility.js';
 
+import { markBatWidget } from "../bat_paste_guard.js";
 export function createEditorStylesheet(id, className) {
   let styleTag = document.head.querySelector(`#${id}`)
   if (!styleTag) {
@@ -506,6 +507,14 @@ export class BaseEditorCanvas {
     element.id = `${className}-${node.uuid}`;
     node.previewMediaType = 'image';
 
+    // This editor bypasses addBatDOMWidget, so it has to mark itself: a
+
+    // middle-click inside an unmarked DOM widget pastes the user's clipboard
+
+    // nodes onto the graph on Linux/X11. See web/bat_paste_guard.js.
+
+    markBatWidget(element);
+
     node[editorKey] = node.addDOMWidget(nodeData.name, `${editorClass.name}Widget`, element, {
       serialize: false, hideOnZoom: false,
       getMinHeight: () => node[heightKey] || 550,
@@ -573,8 +582,35 @@ export class BaseEditorCanvas {
     };
     buttonRow.appendChild(makeRowBtn("Reset canvas", () => {
       try {
+        // Reset clears the PICKS and the canvas geometry. It must not throw
+        // away the background — the artist still wants to see what they're
+        // picking on.
+        //
+        // `new editorClass(node, true)` starts from a blank editor, so the
+        // plate has to be put back. imgData-backed plates (paste / drag /
+        // "Load Image") come back through _reloadBgImage. A plate that was set
+        // PROGRAMMATICALLY has no imgData — Bat_SecSegmenter drives its own
+        // background off the connected clip via handleImageLoad and never
+        // writes imgData — so carry the live image and its coord space across
+        // by hand. Without this, Reset on a SeC node blanked the canvas.
+        const prev = node.editor && node.editor.bgImage
+          ? { img: node.editor.bgImage,
+              width: node.editor.coordWidth,
+              height: node.editor.coordHeight }
+          : null;
         node.editor = new editorClass(node, true);
-        _reloadBgImage(false);
+        if (node.properties?.imgData) {
+          _reloadBgImage(false);
+        } else if (prev) {
+          // Same dims as before, so handleImageLoad's coord-space-resized
+          // hook stays quiet and only the canvas is repainted.
+          node.editor.handleImageLoad(prev.img, prev.img,
+                                      { width: prev.width, height: prev.height });
+        } else {
+          // Nothing cached and nothing live — give the node a chance to
+          // re-source its own plate (Bat_SecSegmenter refetches from the clip).
+          node.onEditorReset?.();
+        }
       } catch (error) { console.error(`Error creating ${editorClass.name}:`, error); }
     }));
     buttonRow.appendChild(makeRowBtn("Align to image", () => {

@@ -37,7 +37,10 @@ app.registerExtension({
   }
 });
 
-class BatPointsEditor extends BaseEditorCanvas {
+// Exported so bat_sec_segmenter.js can reuse the identical canvas rather than
+// fork 300 lines of hit-testing. It subclasses this to swap the editorKey /
+// stylesheet class and to drive the background off its frame-select widget.
+export class BatPointsEditor extends BaseEditorCanvas {
   constructor(context, reset = false) {
     super(context, reset);
     this.initEditorPreamble('pointsEditor', 'bat-points-editor');
@@ -94,7 +97,9 @@ class BatPointsEditor extends BaseEditorCanvas {
       this.bboxStoreWidget.value = JSON.stringify(this.bbox);
     }
 
-    this.initEditor('pointsEditor', 'pointsEditorHeight', 310);
+    // Getter, not a field: subclasses need to override it and instance fields
+    // in a subclass constructor body only run AFTER super() has finished.
+    this.initEditor('pointsEditor', 'pointsEditorHeight', this.editorHeightOffset);
     // Display-only multiplier for point-handle size (persisted).
     this.handleScale = parseFloat(localStorage.getItem('bat-pe-handle-scale')) || 1;
     this._addHandleScaleSlider();
@@ -127,6 +132,10 @@ class BatPointsEditor extends BaseEditorCanvas {
     wrap.append(document.createTextNode('handles'), slider);
     parent.appendChild(wrap);
   }
+
+  // Vertical space this node's non-canvas widgets need, below the canvas.
+  // Overridden by Bat_SecSegmenter, which shows far fewer widgets.
+  get editorHeightOffset() { return 310; }
 
   onDataChanged() { this.updateData(); }
 

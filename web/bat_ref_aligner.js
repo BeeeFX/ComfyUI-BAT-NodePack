@@ -24,7 +24,12 @@ function makeEditor(node) {
     const root = document.createElement("div");
     root.style.cssText = "position:relative;width:100%;height:100%;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;overflow:hidden;";
     const canvas = document.createElement("canvas");
-    canvas.style.cssText = "width:100%;height:100%;display:block;touch-action:none;";
+    // Out of flow on purpose — see the note in bat_roto.js. In flow, its
+    // `height:100%` degrades to the canvas's intrinsic width:height ratio
+    // whenever the parent height is indefinite, which is exactly the state
+    // Nodes 2.0 creates while measuring a node's minimum height. The node then
+    // gets locked to that ratio and grows taller as it's widened.
+    canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none;";
     const hint = document.createElement("div");
     hint.style.cssText = "position:absolute;left:8px;bottom:6px;font:11px monospace;color:#9aa;pointer-events:none;text-shadow:0 1px 2px #000;";
     hint.textContent = "Run once to load plate + reference";

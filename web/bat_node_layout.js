@@ -40,9 +40,15 @@
  *       growable: true,       // canvas editors: absorb extra node height
  *   });
  *   clampNodeSize(node, 640, 540);   // no-op under Nodes 2.0
+ *
+ * Side effect worth knowing about: addBatDOMWidget() also marks the element for
+ * bat_paste_guard.js, so a middle-click inside any BAT DOM widget cannot paste
+ * clipboard nodes onto the graph. Editors that call addDOMWidget directly miss
+ * that and have to mark themselves.
  */
 
 import { app } from "../../scripts/app.js";
+import { markBatWidget } from "./bat_paste_guard.js";
 
 /**
  * Is the Vue (Nodes 2.0) renderer active?
@@ -76,7 +82,11 @@ export function vueNodesEnabled() {
  *                                 false → pin min===max (avoids the grey
  *                                         overflow rectangle; use for content
  *                                         whose height is exactly known)
- *   maxHeight {number}            optional cap when growable
+ *   maxHeight {number|Function}   optional cap when growable. A function is
+ *                                 re-read on every layout pass, so a
+ *                                 collapsible editor can return its collapsed
+ *                                 height (min === max pins it) and null when
+ *                                 open (falls back to the GROW_FACTOR ceiling)
  *   onResize  {Function}          (w, h) called on every DOM box change —
  *                                 replaces the Nodes-1.0-only `onResize` node
  *                                 hook, and fires in BOTH renderers.
@@ -89,6 +99,41 @@ export function vueNodesEnabled() {
  * expand it there on its own. Pass an explicit `maxHeight` to override.
  */
 const GROW_FACTOR = 3;
+
+/**
+ * Stop anything stamping a fixed pixel width onto a widget.
+ *
+ * The frontend sizes a canvas-rendered DOM widget as
+ * `(widget.width ?? node.width) - margin * 2` (DomWidgets.vue), and
+ * `widget.width` is meant to be unset for our editors so it falls through to the
+ * node's own width. But `WidgetLegacy.vue` assigns `widgetInstance.width = <its
+ * container width>` on every draw, and the right-side parameters panel
+ * (WidgetItem.vue) routes ANY widget type it doesn't recognise to that legacy
+ * component — with no DOM-widget check, unlike the node renderer. So opening a
+ * BAT node in the parameters panel once brands the widget with the PANEL's
+ * width, and from then on the editor renders at that width on the graph: pinned
+ * to the left edge of the node with dead space to its right, immune to resizing
+ * the node. Measured on a 640-wide Roto node: widget.width 490, slot 470.
+ *
+ * A getter that always reports "unset" fixes it in both directions — the layout
+ * falls back to the node width, and the legacy component's write becomes a
+ * harmless no-op (it passes the width it measured straight into draw(), it never
+ * reads the property back). Hit-testing (`widget.width || nodeWidth`) also wants
+ * exactly this fallback.
+ */
+export function unpinWidgetWidth(w) {
+    if (!w) return w;
+    try {
+        Object.defineProperty(w, "width", {
+            configurable: true,
+            get() { return undefined; },
+            set(_v) { /* ignore — the node's width is the truth */ },
+        });
+    } catch (e) {
+        console.error("[BAT.layout] could not unpin widget width:", e);
+    }
+    return w;
+}
 
 export function addBatDOMWidget(node, name, type, el, opts = {}) {
     const {
@@ -114,10 +159,14 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
     // Default to a multiple of the design height instead: the node opens at its
     // design size, the artist can still drag it taller, and it never self-expands
     // to fill the canvas. An explicit maxHeight still wins.
+    // `maxHeight` is resolved per call, not captured, so a collapsible editor
+    // can hand back a different ceiling once it has been collapsed.
+    const capOf = typeof maxHeight === "function" ? maxHeight : () => maxHeight;
     const getMax = growable
-        ? () => (maxHeight != null
-            ? Math.round(maxHeight)
-            : Math.round(getMin() * GROW_FACTOR))
+        ? () => {
+            const cap = capOf();
+            return cap != null ? Math.round(cap) : Math.round(getMin() * GROW_FACTOR);
+        }
         : getMin;                       // pinned: min === max
 
     let w = null;
@@ -137,6 +186,16 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
         return null;
     }
 
+    // The editor spans the node, always — see unpinWidgetWidth().
+    unpinWidgetWidth(w);
+
+    // Mark the element so a middle-click inside it cannot paste the user's
+    // clipboard nodes onto the graph. Done here rather than in each editor
+    // because every BAT DOM widget goes through this function, so one line
+    // covers the whole pack — including editors written after this one.
+    // See bat_paste_guard.js for why the guard has to live on the document.
+    markBatWidget(el);
+
     // Set computeLayoutSize explicitly so we never depend on the DOMWidgetImpl
     // default happening to consult our options. This mirrors what the frontend's
     // own video widget does.
@@ -145,27 +204,40 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
         // reports the same real ceiling as the option callbacks above. Returning
         // `undefined` here previously left the 2.0 layout with no ceiling at all,
         // which is the other half of the runaway-height bug.
-        w.computeLayoutSize = () => ({
-            minHeight: getMin(),
-            maxHeight: getMax(),
-            minWidth,
-        });
+        w.computeLayoutSize = () => {
+            // Mirror the frontend DOMWidgetImpl's own first line. Overriding
+            // computeLayoutSize replaces that check, so without it a widget
+            // hidden by setBatWidgetHidden() would still claim its full height
+            // from any layout pass that asks the widget directly.
+            if (w.type === "hidden") return { minHeight: 0, maxHeight: 0, minWidth: 0 };
+            return { minHeight: getMin(), maxHeight: getMax(), minWidth };
+        };
     } catch (_) { /* frozen widget object on some builds — options still apply */ }
 
     // Publish the CSS-var fallback the frontend reads when no getMinHeight /
     // getMaxHeight is supplied. Also gives the root an intrinsic height, which
     // is what the `height:100%`-only editors were missing.
-    try {
-        el.style.setProperty("--comfy-widget-min-height", `${getMin()}px`);
-        // Publish the ceiling too. Previously only the pinned case set this, so a
-        // growable editor gave the frontend a floor and no ceiling — the CSS-var
-        // half of the runaway-height bug.
-        // (getMax() === getMin() in the pinned case, so this covers both.)
-        el.style.setProperty("--comfy-widget-max-height", `${getMax()}px`);
-        // A plain min-height so the element has a height source in ANY flex
-        // context — this alone stops bat_crop / bat_ref_aligner collapsing.
-        if (!el.style.minHeight) el.style.minHeight = `${getMin()}px`;
-    } catch (_) {}
+    //
+    // Re-runnable, so an editor whose height changes (a collapse) can republish
+    // — refreshBatLayout() calls this. `force` is the difference between the
+    // two callers: on the FIRST publish we must not stomp a min-height the
+    // editor set in its own cssText (roto / animated_crop rely on theirs),
+    // whereas on a re-measure the widget's contract is the newer truth.
+    const publishVars = (force) => {
+        try {
+            // The ceiling is published too. Previously only the pinned case set
+            // it, so a growable editor gave the frontend a floor and no ceiling
+            // — the CSS-var half of the runaway-height bug. (getMax() ===
+            // getMin() in the pinned case, so this covers both.)
+            el.style.setProperty("--comfy-widget-min-height", `${getMin()}px`);
+            el.style.setProperty("--comfy-widget-max-height", `${getMax()}px`);
+            // A plain min-height so the element has a height source in ANY flex
+            // context — this alone stops bat_crop / bat_ref_aligner collapsing.
+            if (force || !el.style.minHeight) el.style.minHeight = `${getMin()}px`;
+        } catch (_) {}
+    };
+    if (w) { try { w._batPublishVars = () => publishVars(true); } catch (_) {} }
+    publishVars(false);
 
     // Replaces the Nodes-1.0-only `onResize` node callback (which never fires
     // under 2.0). Measuring the element works in both renderers and needs none
@@ -182,6 +254,73 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
     }
 
     return w;
+}
+
+/**
+ * Re-measure a BAT DOM widget after its height changed (a collapse, or content
+ * that grew), in both renderers.
+ *
+ * The recipe is the frontend's own — `LGraphNode.toggleAdvanced()` does exactly
+ * this when it shows or hides widget rows at runtime:
+ *
+ *   graph.incrementVersion()   → the Vue layer's reactivity trigger; without it
+ *                                Nodes 2.0 keeps the height it last derived.
+ *   expandToFitContent()       → grows node.size to the new content...
+ *   setDirtyCanvas(true, true) → ...and repaints.
+ *
+ * with one addition: `expandToFitContent` only ever GROWS (it is a pair of
+ * Math.max), so collapsing needs an explicit shrink to `computeSize()`. The
+ * node.size writes are gated on Nodes 1.0 — under 2.0 they are ignored and the
+ * derived height is already right.
+ *
+ * @param {object} node
+ * @param {object} widget  the widget whose height changed (optional)
+ * @param {object} opts    { shrink: true } to let the node get smaller
+ */
+export function refreshBatLayout(node, widget, opts = {}) {
+    if (!node) return;
+    try { widget?._batPublishVars?.(); } catch (_) {}
+    try { node.graph?.incrementVersion?.(); } catch (_) {}
+    if (!vueNodesEnabled()) {
+        try {
+            const natural = node.computeSize?.() || node.size;
+            const h = opts.shrink ? natural[1] : Math.max(node.size[1], natural[1]);
+            const w = Math.max(node.size[0], natural[0]);
+            if (typeof node.setSize === "function") node.setSize([w, h]);
+            else node.size = [w, h];
+        } catch (e) {
+            console.error("[BAT.layout] refreshBatLayout resize failed:", e);
+        }
+    }
+    node.setDirtyCanvas?.(true, true);
+}
+
+/**
+ * Hide or show a BAT DOM widget outright, the way the frontend hides a widget
+ * row: `hidden` is what litegraph's getLayoutWidgets() / isWidgetVisible() and
+ * the canvas DOM-overlay's updateWidgets() both filter on, and `type =
+ * "hidden"` is what the Nodes 2.0 DOMWidgetImpl keys its zero-size rule on.
+ * Neither alone is enough — see the same three-way hide applied to ordinary
+ * widgets in bat_video_combine.js.
+ *
+ * If you want to keep a visible header when collapsed, don't use this — give
+ * the widget a `height` function that returns the header height instead, which
+ * is what bat_framehold.js does.
+ */
+export function setBatWidgetHidden(node, widget, hidden) {
+    if (!widget) return;
+    if (hidden) {
+        if (widget._batOpenType == null) widget._batOpenType = widget.type;
+        widget.type = "hidden";
+        widget.hidden = true;
+        widget.computeSize = () => [0, -4];
+    } else {
+        widget.type = widget._batOpenType ?? widget.type;
+        widget.hidden = false;
+        delete widget.computeSize;
+    }
+    if (widget.element) widget.element.style.display = hidden ? "none" : "";
+    refreshBatLayout(node, widget, { shrink: hidden });
 }
 
 /**
