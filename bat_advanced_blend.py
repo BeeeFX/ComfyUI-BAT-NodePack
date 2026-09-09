@@ -139,6 +139,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from . import bat_interrupt as _interrupt
 from .bat_hdr_preview import hdr_tile
 
 logger = logging.getLogger("[Bat_AdvancedBlend]")
@@ -415,6 +416,32 @@ def _blend(base: torch.Tensor, top: torch.Tensor, mode: str) -> torch.Tensor:
 # .py use, so the JS side's decode path is shared)
 # ---------------------------------------------------------------------------
 
+def _consumed_slots(prompt, unique_id):
+    """Which of this node's output slots anything downstream reads.
+
+    Returns None when it cannot tell, and every caller treats that as "all of
+    them" — so a failure costs memory rather than correctness. The API prompt
+    is {id: {"inputs": {name: value | [src_id, slot]}}}, so a consumer of our
+    slot N shows up as the pair [our_id, N].
+    """
+    if not prompt or unique_id is None:
+        return None
+    try:
+        me = str(unique_id)
+        used = set()
+        for node in prompt.values():
+            if not isinstance(node, dict):
+                continue
+            for v in (node.get("inputs") or {}).values():
+                if (isinstance(v, (list, tuple)) and len(v) == 2
+                        and str(v[0]) == me and isinstance(v[1], int)):
+                    used.add(v[1])
+        return used
+    except Exception as exc:
+        logger.debug("could not read the prompt for output pruning (%s)", exc)
+        return None
+
+
 def _b64_jpeg(arr_hwc: np.ndarray, max_dim: int = 384, quality: int = 82) -> str:
     im = Image.fromarray(arr_hwc, "RGB")
     if max(im.size) > max_dim:
@@ -618,7 +645,10 @@ class BatAdvancedBlend:
             # Hidden inputs are not widgets, so this cannot disturb any saved
             # workflow's widgets_values. It is how the full-resolution preview
             # endpoint knows which cached frame belongs to which node.
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            # PROMPT lets the node see which of its three outputs anything
+            # downstream reads, so it can skip allocating the rest. At 100
+            # frames of 2K that is 2.8 GB per output not paid for.
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE")
@@ -788,7 +818,7 @@ class BatAdvancedBlend:
     def blend(self, image_a, image_b, blend_mode, mix, resize_mode, resize_filter,
               frequency_separation, split_radius, detail_mode, low_mix, high_mix,
               detail_gain, detail_limit, soften_a, soften_b, clamp_output,
-              preview_frame=0, mask=None, unique_id=None):
+              preview_frame=0, mask=None, unique_id=None, prompt=None):
 
         a = image_a.to(torch.float32)
         b = image_b.to(torch.float32)
@@ -845,26 +875,41 @@ class BatAdvancedBlend:
         idx = max(0, min(int(preview_frame), n - 1))
         pv_a = pv_b = None
 
-        outs, details, diffs = [], [], []
+        # Which outputs anything downstream actually reads. None = unknown, so
+        # compute all three; a failure here costs memory, never correctness.
+        used = _consumed_slots(prompt, unique_id)
+        want = [used is None or k in used for k in range(3)]
+
+        # Preallocated and written by slice, NOT accumulated into lists and
+        # torch.cat'ed. The old version held every chunk AND the concatenated
+        # copy at the same time — a full-size tensor of chunks plus a full-size
+        # result, for each of three outputs, so the cat alone roughly doubled
+        # peak. Measured 6.11 GB on a 25-frame 2K pair.
+        shape = (n, out_h, out_w, 3)
+        stub = torch.zeros((1, 1, 1, 3), dtype=a.dtype, device=a.device)
+        out    = torch.empty(shape, dtype=a.dtype, device=a.device) if want[0] else stub
+        detail = torch.empty(shape, dtype=a.dtype, device=a.device) if want[1] else stub
+        diff   = torch.empty(shape, dtype=a.dtype, device=a.device) if want[2] else stub
+
         for i in range(0, n, CHUNK_FRAMES):
+            # Once per chunk: a flag read, and the difference between Cancel
+            # working and the artist waiting out the whole clip.
+            _interrupt.check()
             j = min(i + CHUNK_FRAMES, n)
             ac = _resize(a[i:j], out_h, out_w, resize_filter)
             bc = _resize(b[i:j], out_h, out_w, resize_filter)
             p["mask_chunk"] = self._mask_chunk(
                 None if m is None else m[i:j], out_h, out_w)
             o, d, df = self._core(ac, bc, p)
-            outs.append(o)
-            details.append(d)
-            diffs.append(df)
+            if want[0]: out[i:j] = o
+            if want[1]: detail[i:j] = d
+            if want[2]: diff[i:j] = df
+            del o, d, df
             if pv_a is None and i <= idx < j:
                 # .clone(), not a view: a view keeps the whole chunk alive, and
                 # a chunk of 8 conformed 4K frames is 800MB.
                 pv_a = ac[idx - i:idx - i + 1].clone()
                 pv_b = bc[idx - i:idx - i + 1].clone()
-
-        out = torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
-        detail = torch.cat(details, dim=0) if len(details) > 1 else details[0]
-        diff = torch.cat(diffs, dim=0) if len(diffs) > 1 else diffs[0]
 
         ui = self._preview_payload(pv_a, pv_b, m, idx, out_w, out_h, n, unique_id)
         return {"ui": ui, "result": (out, detail, diff)}
