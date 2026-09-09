@@ -1,7 +1,19 @@
 # ComfyUI-BAT-NodePack
 #
 # Most nodes in this pack need nothing beyond what ComfyUI already installs
-# (torch, numpy, pillow, opencv). The entries below are for the SeC segmenter
+# (torch, numpy, pillow, opencv, imageio-ffmpeg).
+#
+# Optional, for 🦇 Video Loader and 🦇 Frame Picker:
+#
+#   decord        faster seeking to an arbitrary frame in a long clip. Without
+#                 it the loader falls back to OpenCV, which is fine but seeks
+#                 by walking the clip. `pip install decord`
+#
+# There is nothing to install for high-bit-depth (ProRes/FFV1) or alpha
+# sources, or for audio: those go through the ffmpeg binary that
+# imageio-ffmpeg already ships.
+#
+# The entries below are for the SeC segmenter
 # (bat_sec_segmenter.py + the vendored stack in bat_sec/) ONLY.
 #
 # They are imported lazily, so a machine without them still loads the pack and

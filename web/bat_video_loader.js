@@ -15,148 +15,14 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { addBatDOMWidget, clampNodeSize, vueNodesEnabled } from "./bat_node_layout.js";
+import { addBatDOMWidget, clampNodeSize, vueNodesEnabled, unpinWidgetWidth } from "./bat_node_layout.js";
+import { makeBatPathWidget } from "./bat_path_widget.js";
 
 const NODE_TYPE = "Bat_VideoLoader";
 const PATH_ROUTE   = "/bat/getpath";
 const INFO_ROUTE   = "/bat/video-info";
 const FRAME_ROUTE  = "/bat/video-frame";
 const STREAM_ROUTE = "/bat/video-stream";
-
-// ─── Path autocomplete popup (port of VOLTPATH searchBox) ───────────────────
-
-function pathStem(p) {
-    const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
-    return i >= 0 ? [p.slice(0, i + 1), p.slice(i + 1)] : ["", p];
-}
-
-function openPathSearch(event, widget) {
-    if (widget._prompt) return true;
-    widget._prompt = true;
-
-    const dialog = document.createElement("div");
-    dialog.className = "litegraph litesearchbox graphdialog rounded";
-    dialog.innerHTML =
-        '<span class="name">Video Path</span>' +
-        '<input autofocus type="text" class="value">' +
-        '<button class="rounded">OK</button>' +
-        '<div class="helper"></div>';
-    dialog.close = () => { dialog.remove(); widget._prompt = false; };
-    document.body.append(dialog);
-    if (app.canvas.ds.scale > 1) dialog.style.transform = `scale(${app.canvas.ds.scale})`;
-
-    const input = dialog.querySelector(".value");
-    const opts = dialog.querySelector(".helper");
-    input.value = widget.value || "";
-
-    let timer = null;
-    let lastDir = null;
-    let options = [];
-    const extensions = widget.options.bat_path_extensions;
-
-    function commit(v) {
-        widget.value = v;
-        widget.callback?.(v);
-        dialog.close();
-    }
-
-    input.addEventListener("keydown", (e) => {
-        if (e.keyCode === 27) dialog.close();
-        else if (e.keyCode === 13) commit(input.value);
-        else if (e.keyCode === 9) {
-            if (opts.firstChild) {
-                input.value = lastDir + opts.firstChild.innerText;
-                e.preventDefault(); e.stopPropagation();
-                refresh();
-            }
-        } else {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(refresh, 10);
-            return;
-        }
-        e.preventDefault(); e.stopPropagation();
-    });
-
-    dialog.querySelector("button").onclick = () => commit(input.value);
-
-    const rect = app.canvas.canvas.getBoundingClientRect();
-    if (event) {
-        dialog.style.left = (event.clientX - 20 - rect.left) + "px";
-        dialog.style.top = (event.clientY - 20 - rect.top) + "px";
-    }
-
-    async function refresh() {
-        timer = null;
-        const [dir, rem] = pathStem(input.value);
-        if (lastDir !== dir) {
-            const params = new URLSearchParams({ path: dir });
-            if (extensions) params.set("extensions", extensions);
-            try {
-                const r = await fetch(api.apiURL(`${PATH_ROUTE}?${params}`));
-                options = await r.json();
-            } catch { options = []; }
-            lastDir = dir;
-        }
-        opts.innerHTML = "";
-        for (const name of options) {
-            if (!name.toLowerCase().startsWith(rem.toLowerCase())) continue;
-            const el = document.createElement("div");
-            el.innerText = name;
-            const isDir = name.endsWith("/");
-            el.className = "litegraph lite-search-item" + (isDir ? " is-dir" : "");
-            el.onclick = () => {
-                if (isDir) { input.value = lastDir + name; refresh(); input.focus(); }
-                else      { commit(lastDir + name); }
-            };
-            opts.appendChild(el);
-        }
-    }
-
-    setTimeout(() => { input.focus(); refresh(); }, 10);
-    return true;
-}
-
-function drawPathWidget(ctx, node, w, y, H) {
-    const m = 15;
-    const showText = app.canvas.ds.scale >= 0.5;
-    ctx.textAlign = "left";
-    ctx.strokeStyle = LiteGraph.WIDGET_OUTLINE_COLOR;
-    ctx.fillStyle = LiteGraph.WIDGET_BGCOLOR;
-    ctx.beginPath();
-    ctx.roundRect(m, y, w - m * 2, H, [H * 0.5]);
-    ctx.fill();
-    if (showText) {
-        ctx.stroke();
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(m, y, w - m * 2, H);
-        ctx.clip();
-        ctx.fillStyle = LiteGraph.WIDGET_SECONDARY_TEXT_COLOR;
-        ctx.fillText(this.name, m * 2 + 5, y + H * 0.7);
-        ctx.textAlign = "right";
-        ctx.fillStyle = this.value ? LiteGraph.WIDGET_TEXT_COLOR : "#777";
-        let val = String(this.value || "");
-        if (val.length > 35) val = "…" + val.slice(-32);
-        ctx.fillText(val, w - m * 2 - 5, y + H * 0.7);
-        ctx.restore();
-    }
-}
-
-function makePathWidget(name, defaultValue, options) {
-    const w = {
-        name,
-        type: "BAT.PATH",
-        value: defaultValue || "",
-        options: options || {},
-        draw: drawPathWidget,
-        mouse(event, pos, node) {
-            if (event.type !== "pointerdown") return false;
-            return openPathSearch(event, this);
-        },
-        computeSize() { return [200, LiteGraph.NODE_WIDGET_HEIGHT]; },
-    };
-    return w;
-}
 
 // ─── Trim-range widget (NLE-style scrubber) ─────────────────────────────────
 
@@ -264,6 +130,9 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             fps: 0,
             width: 0,
             height: 0,
+            bitDepth: 8,
+            hasAlpha: false,
+            hasAudio: false,
             startImg: null,
             endImg: null,
             startImgFrame: -1,
@@ -462,6 +331,12 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             if (st.fps > 0) parts.push(`${secs.toFixed(2)}s`);
             if (st.fps > 0) parts.push(`${st.fps.toFixed(2)}fps`);
             if (st.width && st.height) parts.push(`${st.width}×${st.height}`);
+            // What the load will actually yield. Worth the pixels: whether a
+            // .mov is 8- or 10-bit, and whether it has alpha or audio, decides
+            // which outputs are worth wiring up, and it is invisible otherwise.
+            if (st.bitDepth > 8) parts.push(`${st.bitDepth}-bit`);
+            if (st.hasAlpha) parts.push("alpha");
+            if (st.hasAudio) parts.push("audio");
             ctx.fillStyle = "#aab";
             ctx.font = "11px sans-serif";
             ctx.textAlign = "right";
@@ -777,6 +652,9 @@ async function fetchVideoInfo(node) {
         st.fps = info.fps || 0;
         st.width = info.width | 0;
         st.height = info.height | 0;
+        st.bitDepth = info.bit_depth | 0 || 8;
+        st.hasAlpha = !!info.has_alpha;
+        st.hasAudio = !!info.has_audio;
         // Clamp existing start/end into the new range. If the stored end
         // is -1 (default sentinel: "play to the last frame"), snap it to
         // the last frame so the slider reflects the actual range used at
@@ -1159,7 +1037,10 @@ app.registerExtension({
                 const orig = this.widgets[pathIdx];
                 const config = nodeData.input?.required?.path;
                 const opts = (config && config[1]) || {};
-                const path = makePathWidget("path", orig.value || "", opts);
+                const path = makeBatPathWidget({
+                    name: "path", value: orig.value || "", options: opts,
+                    route: PATH_ROUTE, title: "Video Path",
+                });
                 path.callback = () => fetchVideoInfo(this);
                 this.widgets[pathIdx] = path;
             }
@@ -1203,7 +1084,10 @@ app.registerExtension({
             // Append the trim widget after the INT widgets so the
             // text inputs appear above the scrubber.
             if (startInt && endInt) {
-                const trim = makeTrimWidget(this, startInt, endInt);
+                // unpin: the trim widget hit-tests against the width it
+                // was last drawn at, so a stamped widget.width puts every
+                // handle and step button beside where it appears.
+                const trim = unpinWidgetWidth(makeTrimWidget(this, startInt, endInt));
                 this.widgets.push(trim);
             }
 
