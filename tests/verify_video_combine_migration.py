@@ -23,6 +23,9 @@ import sys
 
 import quickjs
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import auto_stub_js
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
 JS = os.path.join(PACK, "web", "bat_video_combine.js")
@@ -194,7 +197,12 @@ def build_context():
     stubs = STUBS.replace("__SPECS", json.dumps(SPECS))
 
     ctx = quickjs.Context()
-    ctx.eval(stubs + "\n" + body + "\n" + harness)
+    # Auto-stubs first, curated `stubs` second (which therefore wins). Without
+    # this, an import the harness has not heard of throws inside
+    # beforeRegisterNodeDef, the migration's onConfigure is never installed,
+    # and this test reports the unmigrated values — indistinguishable from the
+    # retro-compat bug it exists to catch. See _harness.py.
+    ctx.eval(auto_stub_js(src) + "\n" + stubs + "\n" + body + "\n" + harness)
     return ctx
 
 

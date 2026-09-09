@@ -54,6 +54,9 @@ import re
 import sys
 import types
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import auto_stub_js, strip_modules
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
 
@@ -81,10 +84,12 @@ def _load(name):
     return mod
 
 
+def _raw(name):
+    return open(os.path.join(PACK, "web", name), encoding="utf-8").read()
+
+
 def _plain(name):
-    src = open(os.path.join(PACK, "web", name), encoding="utf-8").read()
-    src = re.sub(r"^import .*?;\s*$", "", src, flags=re.M)
-    return re.sub(r"^export ", "", src, flags=re.M)
+    return strip_modules(_raw(name))
 
 
 DRIVER = """
@@ -211,6 +216,8 @@ def extension_parses():
     import quickjs
     src = _plain("bat_layered_images.js").replace("import.meta.url", '"file:///bat/"')
     ctx = quickjs.Context()
+    # First, so the curated stubs below win — see tests/_harness.py.
+    ctx.eval(auto_stub_js(_raw("bat_layered_images.js")))
     ctx.eval("""
     var __registered = null;
     var app = {

@@ -50,6 +50,9 @@ import re
 import sys
 import types
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import auto_stub_js
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
 JS_EXT = os.path.join(PACK, "web", "bat_exposure_bracket.js")
@@ -89,8 +92,15 @@ def _load(name):
 
 
 def _strip_modules(src):
-    """Turn an ES module into a plain script quickjs can evaluate."""
-    src = re.sub(r"^import .*?;\s*$", "", src, flags=re.M)
+    """Turn an ES module into a plain script quickjs can evaluate.
+
+    `re.S` matters: an import spanning several lines (which
+    bat_exposure_bracket.js's lifecycle import became when it grew a fifth
+    name) is invisible to a line-anchored pattern, and the survivor reaches
+    quickjs as `SyntaxError: expecting '('` — a parse error a long way from
+    the cause.
+    """
+    src = re.sub(r"^import .*?;\s*$", "", src, flags=re.M | re.S)
     src = re.sub(r"^export ", "", src, flags=re.M)
     return src
 
@@ -163,9 +173,12 @@ def js_parses_whole_file():
     """Evaluate the entire extension, imports stubbed, and drive registration."""
     import quickjs
     ctx = quickjs.Context()
+    _ext = open(JS_EXT, encoding="utf-8").read()
+    _xfer = open(JS_TRANSFER, encoding="utf-8").read()
+    ctx.eval(auto_stub_js(_ext, _xfer))      # first, so STUBS wins — see _harness.py
     ctx.eval(STUBS)
-    ctx.eval(_strip_modules(open(JS_TRANSFER, encoding="utf-8").read()))
-    ctx.eval(_strip_modules(open(JS_EXT, encoding="utf-8").read()))
+    ctx.eval(_strip_modules(_xfer))
+    ctx.eval(_strip_modules(_ext))
     ctx.eval("if (!__registered) throw new Error('extension did not register');")
     for name in ("Bat_ExposureBracket", "Bat_ExposureMerge"):
         ctx.eval("""
@@ -183,9 +196,12 @@ def js_parses_whole_file():
 def make_ctx():
     import quickjs
     ctx = quickjs.Context()
+    _ext = open(JS_EXT, encoding="utf-8").read()
+    _xfer = open(JS_TRANSFER, encoding="utf-8").read()
+    ctx.eval(auto_stub_js(_ext, _xfer))      # first, so STUBS wins — see _harness.py
     ctx.eval(STUBS)
-    ctx.eval(_strip_modules(open(JS_TRANSFER, encoding="utf-8").read()))
-    ctx.eval(_strip_modules(open(JS_EXT, encoding="utf-8").read()))
+    ctx.eval(_strip_modules(_xfer))
+    ctx.eval(_strip_modules(_ext))
     ctx.eval(DRIVER)
     return ctx
 

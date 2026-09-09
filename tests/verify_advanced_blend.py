@@ -36,6 +36,9 @@ import re
 import sys
 import types
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import auto_stub_js, strip_modules
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
 JS_PATH = os.path.join(PACK, "web", "bat_advanced_blend.js")
@@ -108,9 +111,8 @@ def js_parses_whole_file():
     enough to catch anything the parser or top-level scope can catch.
     """
     import quickjs
-    src = open(JS_PATH, encoding="utf-8").read()
-    src = re.sub(r"^import .*?;\s*$", "", src, flags=re.M)
-    src = re.sub(r"^export ", "", src, flags=re.M)
+    raw = open(JS_PATH, encoding="utf-8").read()
+    src = strip_modules(raw)
     # `import.meta.url` is how the extension locates the worker beside itself,
     # and it is valid in the browser because ComfyUI serves extensions as ES
     # modules. quickjs evaluates this as a plain script, where it is a syntax
@@ -147,7 +149,10 @@ def js_parses_whole_file():
     function Worker() { throw new Error("no workers in this harness"); }
     """
     ctx = quickjs.Context()
-    ctx.eval(stubs + "\n" + src)
+    # Auto-stubs FIRST so the curated ones above win — see _harness.py for why
+    # a helper the editor imports but this harness has never heard of must
+    # still exist (it is what silently broke four suites at once).
+    ctx.eval(auto_stub_js(raw) + "\n" + stubs + "\n" + src)
     ctx.eval("if (!__registered || __registered.name !== 'Bat_AdvancedBlend') "
              "throw new Error('extension did not register');")
     # Exercise the registration path the frontend takes, so a typo inside
@@ -519,11 +524,10 @@ def zoom_control_smoke():
 def repair_smoke():
     """Reproduce the copy/paste value shift and prove the repair undoes it."""
     import quickjs
-    src = open(os.path.join(PACK, "web", "bat_advanced_blend.js"), encoding="utf-8").read()
-    src = re.sub(r"^import .*?;\s*$", "", src, flags=re.M)
-    src = re.sub(r"^export ", "", src, flags=re.M)
-    src = src.replace("import.meta.url", '"file:///bat/"')   # script scope, see above
+    raw = open(os.path.join(PACK, "web", "bat_advanced_blend.js"), encoding="utf-8").read()
+    src = strip_modules(raw).replace("import.meta.url", '"file:///bat/"')
     ctx = quickjs.Context()
+    ctx.eval(auto_stub_js(raw))      # first, so the curated stubs below win
     ctx.eval(STUB_DOM)
     ctx.eval(REPAIR_SMOKE)
     ctx.eval(src)
