@@ -10,6 +10,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { makeBatPathWidget } from "./bat_path_widget.js";
 import { batTrack } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 
@@ -21,140 +22,6 @@ const FRAME_ROUTE = "/bat/frame-picker/frame";
 function debounce(fn, ms) {
     let t = null;
     return (...a) => { if (t) clearTimeout(t); t = setTimeout(() => { t = null; fn(...a); }, ms); };
-}
-
-// ─── Path autocomplete popup (port of the loaders' VOLTPATH/BAT.PATH) ────────
-
-function pathStem(p) {
-    const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
-    return i >= 0 ? [p.slice(0, i + 1), p.slice(i + 1)] : ["", p];
-}
-
-function openPathSearch(event, widget) {
-    if (widget._prompt) return true;
-    widget._prompt = true;
-
-    const dialog = document.createElement("div");
-    dialog.className = "litegraph litesearchbox graphdialog rounded";
-    dialog.innerHTML =
-        '<span class="name">Frame Source</span>' +
-        '<input autofocus type="text" class="value">' +
-        '<button class="rounded">OK</button>' +
-        '<div class="helper"></div>';
-    dialog.close = () => { dialog.remove(); widget._prompt = false; };
-    document.body.append(dialog);
-    if (app.canvas.ds.scale > 1) dialog.style.transform = `scale(${app.canvas.ds.scale})`;
-
-    const input = dialog.querySelector(".value");
-    const opts = dialog.querySelector(".helper");
-    input.value = widget.value || "";
-
-    let timer = null;
-    let lastDir = null;
-    let options = [];
-    const extensions = widget.options.bat_path_extensions;
-
-    function commit(v) {
-        widget.value = v;
-        widget.callback?.(v);
-        dialog.close();
-    }
-
-    input.addEventListener("keydown", (e) => {
-        if (e.keyCode === 27) dialog.close();
-        else if (e.keyCode === 13) commit(input.value);
-        else if (e.keyCode === 9) {
-            if (opts.firstChild) {
-                input.value = lastDir + opts.firstChild.innerText;
-                e.preventDefault(); e.stopPropagation();
-                refresh();
-            }
-        } else {
-            if (timer) clearTimeout(timer);
-            timer = setTimeout(refresh, 10);
-            return;
-        }
-        e.preventDefault(); e.stopPropagation();
-    });
-
-    dialog.querySelector("button").onclick = () => commit(input.value);
-
-    const rect = app.canvas.canvas.getBoundingClientRect();
-    if (event) {
-        dialog.style.left = (event.clientX - 20 - rect.left) + "px";
-        dialog.style.top = (event.clientY - 20 - rect.top) + "px";
-    }
-
-    async function refresh() {
-        timer = null;
-        const [dir, rem] = pathStem(input.value);
-        if (lastDir !== dir) {
-            const params = new URLSearchParams({ path: dir });
-            if (extensions) params.set("extensions", extensions);
-            try {
-                const r = await fetch(api.apiURL(`${PATH_ROUTE}?${params}`));
-                options = await r.json();
-            } catch { options = []; }
-            lastDir = dir;
-        }
-        opts.innerHTML = "";
-        for (const name of options) {
-            if (!name.toLowerCase().startsWith(rem.toLowerCase())) continue;
-            const el = document.createElement("div");
-            el.innerText = name;
-            const isDir = name.endsWith("/");
-            el.className = "litegraph lite-search-item" + (isDir ? " is-dir" : "");
-            el.onclick = () => {
-                if (isDir) { input.value = lastDir + name; refresh(); input.focus(); }
-                else      { commit(lastDir + name); }
-            };
-            opts.appendChild(el);
-        }
-    }
-
-    setTimeout(() => { input.focus(); refresh(); }, 10);
-    return true;
-}
-
-function drawPathWidget(ctx, node, w, y, H) {
-    const m = 15;
-    const showText = app.canvas.ds.scale >= 0.5;
-    ctx.textAlign = "left";
-    ctx.strokeStyle = LiteGraph.WIDGET_OUTLINE_COLOR;
-    ctx.fillStyle = LiteGraph.WIDGET_BGCOLOR;
-    ctx.beginPath();
-    ctx.roundRect(m, y, w - m * 2, H, [H * 0.5]);
-    ctx.fill();
-    if (showText) {
-        ctx.stroke();
-        ctx.save();
-        ctx.beginPath();
-        ctx.rect(m, y, w - m * 2, H);
-        ctx.clip();
-        ctx.fillStyle = LiteGraph.WIDGET_SECONDARY_TEXT_COLOR;
-        ctx.fillText(this.name, m * 2 + 5, y + H * 0.7);
-        ctx.textAlign = "right";
-        ctx.fillStyle = this.value ? LiteGraph.WIDGET_TEXT_COLOR : "#777";
-        let val = String(this.value || "");
-        if (val.length > 35) val = "…" + val.slice(-32);
-        ctx.fillText(val, w - m * 2 - 5, y + H * 0.7);
-        ctx.restore();
-    }
-}
-
-function makePathWidget(name, defaultValue, options) {
-    return {
-        name,
-        type: "BAT.PATH",
-        value: defaultValue || "",
-        options: options || {},
-        draw: drawPathWidget,
-        mouse(event) {
-            if (event.type !== "pointerdown") return false;
-            return openPathSearch(event, this);
-        },
-        computeSize() { return [200, LiteGraph.NODE_WIDGET_HEIGHT]; },
-    };
 }
 
 // ─── Contact-sheet grid ───────────────────────────────────────────────────────
@@ -301,7 +168,10 @@ app.registerExtension({
             const orig = this.widgets[pathIdx];
             const config = nodeData.input?.required?.path;
             const opts = (config && config[1]) || {};
-            const pathW = makePathWidget("path", orig.value || "", opts);
+            const pathW = makeBatPathWidget({
+                name: "path", value: orig.value || "", options: opts,
+                route: PATH_ROUTE, title: "Frame Source",
+            });
             this.widgets[pathIdx] = pathW;
 
             const preview = makeGridWidget();
