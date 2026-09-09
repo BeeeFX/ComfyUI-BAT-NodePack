@@ -16,6 +16,10 @@
  * Auto-key OFF → edits modify the nearest keyframe ≤ current frame
  *                (or the only existing keyframe).
  *
+ * ◆✕ (clear all) collapses the whole map to a single key at frame 0
+ * holding the rect the playhead is showing — the animation goes, the
+ * crop stays. Two-click confirm; Ctrl+Z restores the old map.
+ *
  * Rect interaction matches Bat_Crop's: 8 sizing handles, rotation
  * handle, rotation-aware resize math, aspect-ratio lock. The drag math
  * is lifted from bat_crop.js — only the "where do we write the
@@ -146,6 +150,30 @@ function buildEditor(node) {
     const nextBtn   = btn("▶|", "Next frame (→)");
     const addKeyBtn = btn("◆+", "Add keyframe at current frame (K)");
     const delKeyBtn = btn("◆-", "Delete keyframe at current frame");
+    // Destructive, so it arms on the first click and commits on the second
+    // (or self-disarms after 3s / on any other click in the editor). It
+    // collapses to ONE key at frame 0 holding whatever the playhead shows,
+    // rather than emptying the map — an artist clearing a botched animation
+    // wants the look they can see, not the node's cold defaults.
+    const CLEAR_TIP = "Clear all keyframes — keeps the current rect as one static key at frame 0";
+    const clearKeysBtn = btn("◆✕", CLEAR_TIP);
+    let clearArmed = null;
+    const clearIdle = () => {
+        clearArmed = null;
+        clearKeysBtn.textContent = "◆✕";
+        clearKeysBtn.title = CLEAR_TIP;
+        clearKeysBtn.style.borderColor = "#2a2f37";
+        clearKeysBtn.style.color = "#cdd";
+        clearKeysBtn.style.background = "none";
+    };
+    const disarmClear = () => { if (clearArmed) { clearTimeout(clearArmed); clearIdle(); } };
+    // Own hover handlers — btn()'s would repaint the armed red back to blue.
+    clearKeysBtn.onmouseover = () => {
+        clearKeysBtn.style.background = clearArmed ? "rgba(200,80,80,0.30)" : "rgba(76,158,255,0.15)";
+    };
+    clearKeysBtn.onmouseout = () => {
+        clearKeysBtn.style.background = clearArmed ? "rgba(200,80,80,0.18)" : "none";
+    };
 
     const autoKeyToggle = document.createElement("label");
     autoKeyToggle.style.cssText = "display:flex; gap:4px; align-items:center; cursor:pointer; padding:0 4px;";
@@ -207,7 +235,12 @@ function buildEditor(node) {
 
     // Timeline first (full width), then the controls beneath it.
     controlsRow.append(prevBtn, playBtn, nextBtn, addKeyBtn, delKeyBtn,
-                       autoKeyToggle, frameLabel);
+                       clearKeysBtn, autoKeyToggle, frameLabel);
+
+    // Any click that isn't the clear button itself cancels a pending confirm.
+    root.addEventListener("pointerdown", (ev) => {
+        if (ev.target !== clearKeysBtn) disarmClear();
+    }, true);
     transport.append(timelineStack, controlsRow);
 
     // ── state ────────────────────────────────────────────────────────
@@ -798,6 +831,27 @@ function buildEditor(node) {
     };
     delKeyBtn.onclick = () => {
         delete state.doc.keyframes[String(state.currentFrame)];
+        persist(); renderTimelineKeyframes(); render();
+    };
+    clearKeysBtn.onclick = () => {
+        const kfs = state.doc.keyframes || {};
+        const n = Object.keys(kfs).length;
+        if (!n) return;                     // nothing to clear — don't arm
+        if (!clearArmed) {
+            clearKeysBtn.textContent = "Sure?";
+            clearKeysBtn.title = `Delete all ${n} keyframe${n === 1 ? "" : "s"} `
+                + `and keep the current rect at frame 0 — click again to confirm`;
+            clearKeysBtn.style.borderColor = "#c0504d";
+            clearKeysBtn.style.color = "#ffb3b0";
+            clearKeysBtn.style.background = "rgba(200,80,80,0.18)";
+            clearArmed = setTimeout(clearIdle, 3000);
+            return;
+        }
+        clearTimeout(clearArmed); clearIdle();
+        // Snapshot BEFORE clearing — the resolver reads state.doc.keyframes.
+        const keep = rectAtCurrent();
+        state.doc.keyframes = { "0": keep };
+        state.kfSelection = new Set();
         persist(); renderTimelineKeyframes(); render();
     };
     autoKeyInput.onchange = () => { state.autoKey = autoKeyInput.checked; };
