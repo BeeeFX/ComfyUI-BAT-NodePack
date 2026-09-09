@@ -72,6 +72,7 @@ import torch
 from PIL import Image
 
 from .bat_hdr_preview import hdr_tile
+from . import bat_interrupt as _interrupt
 from .bat_hdr_tonal_composite import (
     _EPS, _K_MIN, _K_MAX, _encode_from_linear, _luminance, _to_linear,
 )
@@ -286,7 +287,10 @@ class BatExposureBracket:
         stops = build_stops(count, spacing, direction, custom_stops)
         plate_lin = _to_linear(plate, str(plate_gamma_mode))
 
-        images = [_expose_to_sdr(plate_lin, ev, str(plate_gamma_mode)) for ev in stops]
+        images = []
+        for ev in stops:
+            _interrupt.check()      # each stop is a full-size exposure
+            images.append(_expose_to_sdr(plate_lin, ev, str(plate_gamma_mode)))
 
         pipe = {
             "version": 1,
@@ -592,6 +596,7 @@ class BatExposureMerge:
         out = torch.empty((b, h, w, 3), dtype=torch.float32,
                           device=got[0][1].device)
         for s in range(0, b, per_chunk):
+            _interrupt.check()
             e = min(s + per_chunk, b)
             acc = torch.zeros((e - s, h, w, 3), dtype=torch.float32,
                               device=out.device)
