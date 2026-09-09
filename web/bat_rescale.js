@@ -221,6 +221,9 @@ function buildViewer(node) {
         frames: 1,
         srcW: 0, srcH: 0,
         liveBatch: false,
+        // Which frame the cached thumbnail is a picture of — i.e. the frame
+        // Python shipped on the last run. `null` until we know.
+        anchorFrame: null,
         thumb: null,              // <img> whole-frame JPEG, the cold-start draft
 
         // View — display only, none of it reaches the render.
@@ -510,11 +513,13 @@ function buildViewer(node) {
     }
 
     function scheduleView() {
-        // A view change moves the region, so the picture on screen no longer
-        // fits where it is drawn — unlike a parameter or frame change, there is
-        // nothing honest to hold. Fall back to the whole-frame thumbnail draft
-        // until the truth lands.
-        dropPair();
+        // The held render is KEPT and re-projected — see pairTransform(). It
+        // used to be dropped here on the reasoning that a moved region has
+        // nothing honest to hold, which was wrong twice over: the render knows
+        // which source rectangle it covers, so it can be drawn in its true new
+        // position, and what it fell back to was a thumbnail of whichever frame
+        // Python last shipped — so zooming or panning after moving
+        // `preview_frame` put the old frame back on screen every time.
         state.stale = false;
         draw();
         requestTruth(true);
@@ -663,6 +668,51 @@ function buildViewer(node) {
         });
     }
 
+    /**
+     * Where a held render's source rectangle lands in the current view, in
+     * canvas device pixels.
+     *
+     * This is what lets a pan or a zoom keep showing the picture it already
+     * has, moved and scaled to the right place, instead of dropping back to the
+     * draft. Source coordinates are the common language between the two: the
+     * held render knows which source rectangle it covers (the server tells us,
+     * snapped), and the view knows which one it is showing, so one linear map
+     * relates them.
+     */
+    function pairTransform(roi, v) {
+        const k = v.outW / Math.max(1e-6, v.roi[2]);      // device px per source px
+        return {
+            x: v.drawX + (roi[0] - v.roi[0]) * k,
+            y: v.drawY + (roi[1] - v.roi[1]) * k,
+            w: roi[2] * k,
+            h: roi[3] * k,
+            k,
+        };
+    }
+
+    /** Is a held render already exactly where it is being drawn? */
+    function transformIsExact(xf, v) {
+        // 1.5px: the server snaps the region outward to whole source pixels, so
+        // an exact match is never bit-exact in the request's own numbers.
+        return !!xf && Math.abs(xf.x - v.drawX) < 1.5 && Math.abs(xf.y - v.drawY) < 1.5
+                    && Math.abs(xf.w - v.outW) < 1.5 && Math.abs(xf.h - v.outH) < 1.5;
+    }
+
+    /**
+     * Is the cached thumbnail a legitimate stand-in right now?
+     *
+     * Only if it is a picture of the frame being asked for. It is a whole-frame
+     * JPEG of the frame PYTHON shipped, so once `preview_frame` has moved past
+     * that, drawing it puts a DIFFERENT FRAME on screen — which is what made
+     * the old frame reappear every time you zoomed or panned, since a view
+     * change dropped the held render and this was what remained. A wrong frame
+     * is worse than no picture: nothing tells you it is wrong.
+     */
+    function thumbUsable() {
+        return !!state.thumb
+            && (state.anchorFrame === null || state.anchorFrame === currentFrame());
+    }
+
     function paint() {
         const v = computeView();
         if (canvas.width !== v.panelW || canvas.height !== v.panelH) {
@@ -674,54 +724,64 @@ function buildViewer(node) {
         ctx.fillRect(0, 0, v.panelW, v.panelH);
 
         const planned = plannedSize();
-        // A render that arrived for a different region than the one now on
-        // screen (the panel was resized mid-flight, say) would be drawn over the
-        // wrong part of the picture. Same rule as a pan: fall back to the draft
-        // rather than lie about where you are. Tolerance is 1.5px because the
-        // server snaps the region outward to whole source pixels.
         const p = state.pair;
-        const fits = p && p.roi && Math.abs(p.roi[0] - v.roi[0]) < 1.5
-                                && Math.abs(p.roi[1] - v.roi[1]) < 1.5
-                                && Math.abs(p.roi[2] - v.roi[2]) < 1.5
-                                && Math.abs(p.roi[3] - v.roi[3]) < 1.5;
-        const haveSource = !!(fits || state.thumb);
-        hint.style.display = haveSource ? "none" : "flex";
-        if (!haveSource) { paintStatus(v, planned); return; }
+        const xf = p && p.roi ? pairTransform(p.roi, v) : null;
+        const exact = transformIsExact(xf, v);
+        const usingThumb = !xf && thumbUsable();
+
+        hint.style.display = (xf || usingThumb) ? "none" : "flex";
+        if (!xf && !usingThumb) { paintStatus(v, planned); return; }
 
         const showOriginal = state.holdOriginal || state.compare === "original";
         const wipeX = state.compare === "wipe" && !showOriginal
             ? Math.round(v.drawX + v.outW * state.wipe) : null;
 
-        if (fits) {
-            // Truth. Both halves are already at the screen box and framed from
-            // one region, so this is a straight blit with a clip.
-            ctx.imageSmoothingEnabled = false;
-            if (showOriginal) {
-                ctx.drawImage(p.orig, v.drawX, v.drawY, v.outW, v.outH);
-            } else if (wipeX === null) {
-                ctx.drawImage(p.scaled, v.drawX, v.drawY, v.outW, v.outH);
-            } else {
-                ctx.save();
-                ctx.beginPath();
-                ctx.rect(v.drawX, v.drawY, wipeX - v.drawX, v.outH);
-                ctx.clip();
-                ctx.drawImage(p.orig, v.drawX, v.drawY, v.outW, v.outH);
-                ctx.restore();
-                ctx.save();
-                ctx.beginPath();
-                ctx.rect(wipeX, v.drawY, v.drawX + v.outW - wipeX, v.outH);
-                ctx.clip();
-                ctx.drawImage(p.scaled, v.drawX, v.drawY, v.outW, v.outH);
-                ctx.restore();
-            }
-        } else if (state.thumb) {
-            // Cold start / view change: the whole-frame thumbnail, cropped to
-            // the region. Soft, and honest about being a draft.
-            drawDraftFromThumb(v, showOriginal, wipeX, planned);
-        }
+        if (xf) drawPair(v, xf, exact, showOriginal, wipeX);
+        else drawDraftFromThumb(v, showOriginal, wipeX, planned);
 
         if (wipeX !== null) drawDivider(v);
         paintStatus(v, planned);
+    }
+
+    /**
+     * Blit the held render. `exact` means it was rendered for this exact view,
+     * which is the case that must stay pixel-perfect — smoothing off, no
+     * resampling by the browser. Anything else is a view that has moved since,
+     * drawn in its true position while the replacement is in flight: the right
+     * frame and the right content, stretched, which is what a map does with its
+     * old tiles and is the only honest stand-in available.
+     */
+    function drawPair(v, xf, exact, showOriginal, wipeX) {
+        ctx.save();
+        // Never spill outside the picture box into the letterbox, however far
+        // the view has moved from what was rendered.
+        ctx.beginPath();
+        ctx.rect(v.drawX, v.drawY, v.outW, v.outH);
+        ctx.clip();
+        ctx.imageSmoothingEnabled = exact ? false : state.magnify !== "pixels";
+        ctx.imageSmoothingQuality = "high";
+
+        const blit = (bmp) => ctx.drawImage(bmp, xf.x, xf.y, xf.w, xf.h);
+        const p = state.pair;
+        if (showOriginal) {
+            blit(p.orig);
+        } else if (wipeX === null) {
+            blit(p.scaled);
+        } else {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(v.drawX, v.drawY, wipeX - v.drawX, v.outH);
+            ctx.clip();
+            blit(p.orig);
+            ctx.restore();
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(wipeX, v.drawY, v.drawX + v.outW - wipeX, v.outH);
+            ctx.clip();
+            blit(p.scaled);
+            ctx.restore();
+        }
+        ctx.restore();
     }
 
     /**
@@ -910,18 +970,24 @@ function buildViewer(node) {
             + "at full resolution is the one Python shipped — what you are "
             + "looking at is that frame, not this one. Re-run to move.";
 
-        // A held picture of another frame is the one case where saying
-        // "refreshing" is not enough: the number in the stepper has already
-        // moved, so the badge has to name what the pixels actually are.
+        // Three different kinds of "not the truth" and the artist needs to tell
+        // them apart, because each one means something different about what is
+        // on screen: the wrong FRAME, the right frame in the wrong PLACE
+        // (a view that has moved since it was rendered), or the right frame in
+        // the right place at an out-of-date SCALE.
+        const vNow = computeView();
         const shown = state.pair ? state.pair.frame : null;
         const wrongFrame = shown !== null && shown !== currentFrame();
+        const projected = !!state.pair
+            && !transformIsExact(pairTransform(state.pair.roi, vNow), vNow);
 
         let text = "", colour = "#8c8";
         if (state.error) { text = state.error; colour = "#d88"; }
         else if (!state.token) { text = "run once"; colour = "#cc8"; }
         else if (wrongFrame) { text = `frame ${shown} → ${currentFrame()}…`; colour = "#cc8"; }
+        else if (projected) { text = "view draft"; colour = "#cc8"; }
         else if (state.inflight) { text = state.pair ? "refreshing" : "rendering"; colour = "#cc8"; }
-        else if (!state.pair) { text = "draft"; colour = "#cc8"; }
+        else if (!state.pair) { text = thumbUsable() ? "draft" : "loading"; colour = "#cc8"; }
         else if (state.stale) { text = "stale"; colour = "#cc8"; }
         else { text = "1:1 truth"; colour = "#8c8"; }
         badge.textContent = text;
@@ -929,7 +995,10 @@ function buildViewer(node) {
         badge.style.display = text ? "block" : "none";
 
         hint.textContent = state.error && !state.pair && !state.thumb
-            ? state.error : "Run once to load a frame.";
+            ? state.error
+            : (state.thumb && !thumbUsable()
+                ? `Loading frame ${currentFrame()}…`
+                : "Run once to load a frame.");
         void v;
     }
 
@@ -1001,7 +1070,8 @@ function buildViewer(node) {
         const dy = (ev.clientY - drag.y) * toDevice / drag.zoom;
         state.cx = drag.cx - dx;
         state.cy = drag.cy - dy;
-        dropPair();             // the region moved; the old render no longer fits
+        // The render is kept and re-projected as the pointer moves, so a pan
+        // shows continuous content rather than flicking to a draft.
         draw();
     });
 
@@ -1149,6 +1219,8 @@ function buildViewer(node) {
         state.srcW = Number(one(msg.src_w)) || state.srcW;
         state.srcH = Number(one(msg.src_h)) || state.srcH;
         state.liveBatch = true;      // fresh run: the batch is in Comfy's cache
+        const anchor = Number(one(msg.preview_frame));
+        state.anchorFrame = Number.isFinite(anchor) ? anchor : null;
         state.error = null;
         const thumb = one(msg.thumb);
         if (thumb) {
@@ -1160,6 +1232,7 @@ function buildViewer(node) {
             saveJson(cacheKey(node), {
                 thumb, token: state.token, frames: state.frames,
                 src_w: state.srcW, src_h: state.srcH,
+                anchor: state.anchorFrame,
             });
         }
         dropPair();
@@ -1178,6 +1251,8 @@ function buildViewer(node) {
         state.frames = Number(cached.frames) || 1;
         state.srcW = Number(cached.src_w) || 0;
         state.srcH = Number(cached.src_h) || 0;
+        state.anchorFrame = Number.isFinite(Number(cached.anchor))
+            ? Number(cached.anchor) : null;
         try { await loadThumb(cached.thumb); } catch (_) {}
         paintChrome();
         draw();
@@ -1194,6 +1269,7 @@ function buildViewer(node) {
             state.srcW = Number(j.src_w) || state.srcW;
             state.srcH = Number(j.src_h) || state.srcH;
             state.liveBatch = !!j.live_batch;
+            if (Number.isFinite(Number(j.frame))) state.anchorFrame = Number(j.frame);
             paintChrome();
             requestTruth(true);
         } catch (_) { /* server restarted: the draft is what we have */ }

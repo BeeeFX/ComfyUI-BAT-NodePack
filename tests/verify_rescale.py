@@ -58,6 +58,9 @@ PACK = os.path.dirname(HERE)
 # minimum: load the blend module under the package name the import expects.
 import types
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _harness import auto_stub_js
+
 pkg = types.ModuleType("batpack")
 pkg.__path__ = [PACK]
 sys.modules["batpack"] = pkg
@@ -232,6 +235,25 @@ def _js_context():
 
     ctx = quickjs.Context()
     ctx.eval(STUBS)
+
+    # Anything the viewer imports that STUBS does not already provide gets a
+    # no-op. Without this the test breaks every time the editor picks up another
+    # shared helper — which is a failure about the test, not about the code, and
+    # the sort that gets a real suite switched off. The helpers whose BEHAVIOUR
+    # matters are stubbed explicitly above; these are the ones that only have to
+    # exist. (`batPreviewWillReplay` returning a falsy no-op is also the right
+    # answer here: it models a fresh page load with nothing to replay.)
+    raw = open(path, encoding="utf-8").read()
+    braces = "".join(re.findall(r"^import\s*{[^}]*}", raw, flags=re.M | re.S))
+    # Every identifier inside the braces — a comma-consuming pattern silently
+    # skipped every other name, which is how `clampNodeSize` and
+    # `batReplayLastExecution` were both missed at once.
+    imported = {n for n in re.findall(r"[A-Za-z_$][\w$]*", braces)
+                if n not in ("import", "from", "as")}
+    for name in sorted(imported):
+        if not ctx.eval(f"typeof {name} !== 'undefined'"):
+            ctx.eval(f"function {name}() {{}}")
+
     ctx.eval(src)
     return ctx
 
