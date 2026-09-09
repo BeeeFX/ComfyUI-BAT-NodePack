@@ -18,6 +18,19 @@ reference the legacy ``Volt_*`` class names trigger ETC_Core's
 were merged into the single ``Bat_BatchFormat`` ("🦇 Batch Format"),
 which covers every model's frame-count grid rather than one each.
 Both old keys migrate via the same popup.
+
+2026-09-07: ``Bat_BypassSwitch`` ("🦇 Bypass Switch") joins the pack as its
+first *graph-management* node — it has no data path at all and never executes.
+It carries named toggles that bypass saved selections of nodes, subgraphs and
+backdrops, for making a template someone else can drive. Everything happens in
+``web/bat_bypass_switch.js``; the Python is a stub whose only job is to declare
+the widget the state serialises into.
+
+2026-09-08: ``web/bat_canvas_zoom.js`` unlocks zooming further out on the graph
+canvas. No node and no Python at all — it lowers litegraph's
+``canvas.ds.min_scale`` floor from 10% to 5% (adjustable, *Settings → 🦇 BAT →
+Canvas*), which is the single field every zoom gesture in the frontend clamps
+against.
 """
 
 from .bat_video_grid_split import VideoGridSplit
@@ -46,6 +59,20 @@ from .bat_mask_morph import BatGrowMask, BatErodeMask
 from .bat_framehold import BatFramehold
 from .bat_sec_segmenter import BatSecSegmenter
 from .bat_sec_advanced import BatSecAdvancedParams
+from .bat_bypass_switch import BatBypassSwitch
+
+# ─── Execution profiler ──────────────────────────────────────────────
+# Not a node: a sidebar panel that instruments *every* node in the graph
+# (not just BAT's) with per-node time / RAM / VRAM / payload / disk-I/O,
+# so you can see which node is eating the box. It wraps two module-level
+# functions in ComfyUI's execution.py; see bat_profiler.py for why those
+# two and what the measurements do and do not mean. It is on by default
+# so an unattended OOM is captured without having to reproduce it, and
+# every probe is failure-isolated — a profiler fault disables profiling,
+# it never fails a prompt.
+from . import bat_profiler
+
+bat_profiler.install()
 
 # class_type keys — bumped from Volt_* to Bat_* with the rename. The
 # in-UI migration tool (ETC_Core) detects the old keys on workflow
@@ -81,6 +108,7 @@ NODE_CLASS_MAPPINGS = {
     "Bat_Framehold":            BatFramehold,
     "Bat_SecSegmenter":         BatSecSegmenter,
     "Bat_SecAdvancedParams":    BatSecAdvancedParams,
+    "Bat_BypassSwitch":         BatBypassSwitch,
 }
 
 # Display names — bat emoji prefix so the nodes stand out as
@@ -115,6 +143,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_Framehold":            "🦇 Framehold",
     "Bat_SecSegmenter":         "🦇 SeC Segmenter",
     "Bat_SecAdvancedParams":    "🦇 SeC Advanced Params",
+    "Bat_BypassSwitch":         "🦇 Bypass Switch",
 }
 
 WEB_DIRECTORY = "./web"
