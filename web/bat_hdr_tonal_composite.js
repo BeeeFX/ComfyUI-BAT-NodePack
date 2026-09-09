@@ -42,6 +42,12 @@ import { batReplayLastExecution } from "./bat_lifecycle.js";
 const NODE_TYPE = "Bat_HDRTonalComposite";
 const MAX_HDR_VERSIONS = 8;   // must match MAX_HDR_VERSIONS in the .py
 const ADD_BTN = "+ HDR version";
+const RESET_BTN = "Reset to defaults";
+const RESET_ARM = "Sure? \u2014 click again";
+// How long the armed state lasts before it disarms itself. Long enough to be a
+// deliberate second click, short enough that a stray click minutes later can
+// never land on a primed button.
+const RESET_ARM_MS = 4000;
 const RM_BTN = "\u2212 HDR version";
 
 /**
@@ -76,6 +82,83 @@ function syncVersions(node) {
         node.removeOutput(node.outputs.length - 1);
     }
     node.setDirtyCanvas?.(true, true);
+}
+
+/**
+ * Widget name -> default, read from the node definition the server sent.
+ *
+ * Taken from `nodeData` rather than hardcoded, so the button cannot drift out
+ * of step with the Python: change a default in INPUT_TYPES and this follows on
+ * the next reload. Combos without an explicit default fall back to their first
+ * option, which is what the frontend itself does when it builds the widget.
+ */
+function collectDefaults(nodeData) {
+    const out = {};
+    for (const group of ["required", "optional"]) {
+        const spec = nodeData?.input?.[group];
+        if (!spec) continue;
+        for (const [name, entry] of Object.entries(spec)) {
+            const [type, opts] = Array.isArray(entry) ? entry : [entry, undefined];
+            if (opts && Object.prototype.hasOwnProperty.call(opts, "default")) {
+                out[name] = opts.default;
+            } else if (Array.isArray(type) && type.length) {
+                out[name] = type[0];
+            }
+        }
+    }
+    return out;
+}
+
+/**
+ * Restore every widget that has a known default.
+ *
+ * Goes through each widget's own callback rather than assigning `.value`
+ * directly — that is what repaints the live canvas and what any other
+ * extension hooked onto the widget expects. Slot COUNT is deliberately left
+ * alone: how many hdr_ai inputs are wired is graph structure, not a value, and
+ * silently dropping someone's connections is not what "reset the widgets"
+ * means.
+ */
+function resetToDefaults(node, defaults) {
+    let n = 0;
+    for (const w of node.widgets || []) {
+        if (!(w.name in defaults)) continue;      // buttons, the DOM canvas
+        const v = defaults[w.name];
+        if (w.value === v) continue;
+        w.value = v;
+        try { w.callback?.call(w, v); } catch (e) {
+            console.warn(`[Bat_HDRTonalComposite] reset of ${w.name} threw:`, e);
+        }
+        n++;
+    }
+    node.setDirtyCanvas?.(true, true);
+    return n;
+}
+
+function addResetButton(node, defaults) {
+    let armed = 0, timer = null;
+    const disarm = (btn) => {
+        armed = 0;
+        if (timer) { clearTimeout(timer); timer = null; }
+        btn.name = RESET_BTN;
+        node.setDirtyCanvas?.(true, true);
+    };
+    const btn = node.addWidget("button", RESET_BTN, null, () => {
+        if (!armed) {
+            // First click only arms it. Resetting two dozen tuned widgets is
+            // not something to do on a mis-click.
+            armed = 1;
+            btn.name = RESET_ARM;
+            node.setDirtyCanvas?.(true, true);
+            timer = setTimeout(() => disarm(btn), RESET_ARM_MS);
+            return;
+        }
+        const n = resetToDefaults(node, defaults);
+        disarm(btn);
+        console.log(`[Bat_HDRTonalComposite] reset ${n} widget(s) to defaults`);
+    });
+    btn.serialize = false;
+    return btn;
 }
 
 function addVersionButtons(node) {
@@ -802,6 +885,7 @@ app.registerExtension({
     name: "Bat_HDRTonalComposite",
     async beforeRegisterNodeDef(nodeType, nodeData, _app) {
         if (nodeData.name !== NODE_TYPE) return;
+        const DEFAULTS = collectDefaults(nodeData);
 
         // A graph reload (Ctrl+Z is one) destroys and rebuilds every node, so
         // replay the last run's preview payload into the new instance.
@@ -814,6 +898,7 @@ app.registerExtension({
             if (typeof this.properties.hdr_versions !== "number")
                 this.properties.hdr_versions = 1;
             addVersionButtons(this);
+            addResetButton(this, DEFAULTS);
             setTimeout(() => syncVersions(this), 0);
             const el = buildPreview(this);
             addBatDOMWidget(this, "bat_hdrcomp_preview", "bat_hdrcomp_preview", el, {

@@ -188,6 +188,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from . import bat_interrupt as _interrupt
 from .bat_hdr_preview import hdr_tile
 
 logger = logging.getLogger("[Bat_HDRTonalComposite]")
@@ -468,7 +469,12 @@ _K_MIN, _K_MAX = 1.0 / 64.0, 64.0
 # the whole-batch exposure match accumulates its sums per chunk. Both land
 # around 1e-7 relative. With detail_radius = 0 and the match off, chunking
 # IS bit-exact.
-_CHUNK_BYTES = 128 << 20
+# Measured, not guessed: at 2048x1152 this works out at one frame per chunk,
+# which is both LEANER and FASTER than the 128 MB it used to be (4.56 GB / 7.6 s
+# vs 5.88 GB / 10.0 s on a 25-frame two-version run). Bigger chunks lose on
+# cache locality in the separable blurs, so there is no tradeoff to balance
+# here — smaller simply won.
+_CHUNK_BYTES = 32 << 20
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +767,22 @@ def _tonal_ramps_union(y_key: torch.Tensor, p: dict) -> torch.Tensor:
     return torch.maximum(w_sh, w_hi)
 
 
+def _sanitise_hdr(chunk: torch.Tensor) -> torch.Tensor:
+    """Scrub NaN/Inf and bound one chunk of hdr_ai.
+
+    Chunk-sized rather than whole-tensor: LTX already clamps its output to
+    [0, 1e4], so this is a guard against something else in the chain, and
+    paying 2.8 GB of resident copies for a guard is not a trade worth making.
+
+    `nan_to_num` returns a fresh tensor, so the `clamp_` after it is safe in
+    place — but note that `chunk.float()` on an already-float32 tensor returns
+    a VIEW of the caller's input, which is exactly why the in-place op has to
+    come after nan_to_num and never before it.
+    """
+    return torch.nan_to_num(chunk.float(), nan=0.0, posinf=1e4,
+                            neginf=0.0).clamp_(min=0.0, max=1e4)
+
+
 def _composite_chunk(plate: torch.Tensor, hdr: torch.Tensor, k: float,
                      p: dict) -> torch.Tensor:
     """One chunk of frames -> merged scene-linear RGB.
@@ -898,6 +920,10 @@ class BatHDRTonalComposite:
     @classmethod
     def INPUT_TYPES(cls):
         return {
+            # PROMPT + UNIQUE_ID let the node see which of its outputs anything
+            # downstream actually consumes, so it can skip allocating the rest.
+            # On a 100-frame 2K clip each skipped output is 2.8 GB.
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
             "required": {
                 "plate_sdr": ("IMAGE", {
                     "tooltip": "The original / AI-edited SDR plate. This is the "
@@ -970,11 +996,14 @@ class BatHDRTonalComposite:
                                                                  "highlight_headroom has given it somewhere to "
                                                                  "go — the two work as a pair, and this one "
                                                                  "alone makes things worse."}),
-                "detail_transfer": ("FLOAT", {"default": 1.00, "min": 0.0, "max": 1.0, "step": 0.01,
+                "detail_transfer": ("FLOAT", {"default": 0.00, "min": 0.0, "max": 1.0, "step": 0.01,
                                               "tooltip": "How far the LOCAL CONTRAST moves toward the HDR, "
                                                          "without disturbing the level. This is the "
-                                                         "'more detail, same tone' control — leave it at 1 "
-                                                         "and pull tone_transfer down."}),
+                                                         "'more detail, same tone' control. Off by default "
+                                                         "because it is a frequency separation and costs two "
+                                                         "blurs per chunk; turn it up (and pull "
+                                                         "tone_transfer down) when you want texture from the "
+                                                         "HDR rather than level."}),
                 "detail_radius": ("INT", {"default": 16, "min": 0, "max": 256, "step": 1,
                                           "tooltip": "Frequency split, in pixels: structure finer than this "
                                                      "counts as detail, coarser counts as tone. Scales with "
@@ -1118,14 +1147,14 @@ class BatHDRTonalComposite:
                   shadow_start=0.12, shadow_full=0.03, shadow_strength=1.0,
                   highlight_start=0.75, highlight_full=0.98, highlight_strength=1.0,
                   shadow_tone_transfer=1.00, highlight_tone_transfer=0.50,
-                  detail_transfer=1.00, detail_radius=16,
+                  detail_transfer=0.00, detail_radius=16,
                   preserve_plate_chroma=0.85, hdr_rgb_mix=0.25,
                   max_detail_gain=4.0, hdr_ceiling=0.0, blur_radius=0,
                   output_gamma_mode="match_plate", linear_out_primaries="rec709",
                   preview_tonemap="soft_rolloff", highlight_headroom=2.0,
                   preview_exposure=0.0, preview_frame=0,
                   preview_resolution="512", preview_ocio_view="(off)",
-                  **hdr_versions):
+                  prompt=None, unique_id=None, **hdr_versions):
 
         p = {
             "plate_gamma_mode": str(plate_gamma_mode),
@@ -1159,6 +1188,7 @@ class BatHDRTonalComposite:
         for i in range(2, MAX_HDR_VERSIONS + 1):
             versions.append((f"hdr_ai_{i}", hdr_versions.get(f"hdr_ai_{i}")))
 
+        used = self._consumed_slots(prompt, unique_id)
         results = []
         first_plate = first_hdr = None
         k_first = 1.0
@@ -1172,8 +1202,12 @@ class BatHDRTonalComposite:
                 # Name the offending input: with eight of them, "resolution
                 # mismatch" on its own is not enough to find the bad wire.
                 raise ValueError(f"{name}: {exc}") from None
-            out, lin, k = self._run_one(pl, hd, p, bool(auto_match_mids),
-                                        str(match_scope), str(linear_out_primaries))
+            slot = len(results) * 2
+            out, lin, k = self._run_one(
+                pl, hd, p, bool(auto_match_mids), str(match_scope),
+                str(linear_out_primaries),
+                want_display=(used is None or slot in used),
+                want_linear=(used is None or (slot + 1) in used))
             results.append((out, lin))
             if first_plate is None:
                 first_plate, first_hdr, k_first = pl, hd, k
@@ -1205,7 +1239,36 @@ class BatHDRTonalComposite:
         return {"ui": ui, "result": tuple(flat)}
 
     # ------------------------------------------------------------------
-    def _run_one(self, plate, hdr, p, auto_match_mids, match_scope, primaries):
+    @staticmethod
+    def _consumed_slots(prompt, unique_id):
+        """Which of this node's output slots anything downstream reads.
+
+        Returns None when it cannot tell — no prompt, an unexpected shape, our
+        own id missing — and every caller treats None as "all of them", so a
+        failure here costs memory rather than correctness.
+
+        The API prompt is {id: {"inputs": {name: value | [src_id, slot]}}}, so a
+        consumer of our slot N appears as the pair [our_id, N].
+        """
+        if not prompt or unique_id is None:
+            return None
+        try:
+            me = str(unique_id)
+            used = set()
+            for node in prompt.values():
+                if not isinstance(node, dict):
+                    continue
+                for v in (node.get("inputs") or {}).values():
+                    if (isinstance(v, (list, tuple)) and len(v) == 2
+                            and str(v[0]) == me and isinstance(v[1], int)):
+                        used.add(v[1])
+            return used
+        except Exception as exc:
+            logger.debug("could not read the prompt for output pruning (%s)", exc)
+            return None
+
+    def _run_one(self, plate, hdr, p, auto_match_mids, match_scope, primaries,
+                 want_display=True, want_linear=True):
         """One plate + one HDR reconstruction -> (image_out, linear_out, k).
 
         Split out of `composite` so several hdr_ai inputs share one set of
@@ -1222,8 +1285,9 @@ class BatHDRTonalComposite:
         if auto_match_mids and match_scope == "whole_batch":
             num = den = 0.0
             for s in range(0, b, per_chunk):
+                _interrupt.check()
                 pl = _to_linear(plate[s:s + per_chunk].float(), p["plate_gamma_mode"])
-                hd = hdr[s:s + per_chunk].float()
+                hd = _sanitise_hdr(hdr[s:s + per_chunk])
                 m = _mid_mask(_key_luma(pl, p["plate_gamma_mode"]),
                               p["mid_low"], p["mid_high"])
                 num += float((_luminance(pl) * m).sum())
@@ -1232,15 +1296,24 @@ class BatHDRTonalComposite:
 
         # Not empty_like: `plate` may be an expand()ed view with zero strides
         # after single-frame broadcasting, and preserve_format would inherit them.
-        out = torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
-        lin = torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
+        # Only allocate what something downstream will read. A 1x1 stand-in
+        # keeps the return arity right for the executor's index mapping without
+        # paying for a full-size buffer nobody asked for.
+        stub = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=plate.device)
+        out = (torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
+               if want_display else stub)
+        lin = (torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
+               if want_linear else stub)
         # Resolved once, outside the chunk loop — an OCIO config lookup per
         # chunk would be absurd, and the cache makes it once per process anyway.
         pm = _primaries_matrix(primaries, plate.device, torch.float32)
         for s in range(0, b, per_chunk):
+            # Once per chunk. At one frame per chunk on a 2K clip this is a
+            # flag read per frame — free, and it is what makes Cancel work.
+            _interrupt.check()
             e = min(s + per_chunk, b)
             pl_raw = plate[s:e].float()
-            hd = hdr[s:e].float()
+            hd = _sanitise_hdr(hdr[s:e])
 
             if not auto_match_mids:
                 k = 1.0
@@ -1256,15 +1329,17 @@ class BatHDRTonalComposite:
             merged = _composite_chunk(pl_raw, hd, k, p)
             # image_out first: it must stay in the plate's primaries, so it is
             # derived before any gamut conversion.
-            out[s:e] = _display(merged, p)
+            if want_display:
+                out[s:e] = _display(merged, p)
             # linear_out is the merge itself: no exposure, no tonemap, no clamp
             # at the top. preview_exposure is a look control on the preview and
             # has no business baking itself into a linear deliverable.
-            if pm is None:
-                lin[s:e] = merged
-            else:
-                # (B,H,W,3) @ Mt -> row vectors through the matrix.
-                lin[s:e] = torch.matmul(merged, pm.transpose(0, 1))
+            if want_linear:
+                if pm is None:
+                    lin[s:e] = merged
+                else:
+                    # (B,H,W,3) @ Mt -> row vectors through the matrix.
+                    lin[s:e] = torch.matmul(merged, pm.transpose(0, 1))
         return out, lin, k_batch
 
     # ------------------------------------------------------------------
@@ -1316,7 +1391,6 @@ class BatHDRTonalComposite:
 
         # LTX clamps its HDR to [0, 1e4] but nothing guarantees a clean tensor
         # arrives here if something else is in the chain.
-        hdr = torch.nan_to_num(hdr, nan=0.0, posinf=1e4, neginf=0.0).clamp(min=0.0, max=1e4)
 
         # LTXVHDRDecodePostprocess has two outputs and they sit next to each
         # other: 'tonemapped' (sRGB, [0,1]) and 'hdr_linear' (scene-linear).
@@ -1325,6 +1399,10 @@ class BatHDRTonalComposite:
         # point, because there is no above-white data left to recover. A dim
         # linear HDR can also legitimately peak below 1.0, so this warns
         # rather than raising.
+        # NOTE: hdr is returned UNSANITISED. nan_to_num + clamp on the whole
+        # tensor allocated two full-size copies (2.8 GB each on a 100-frame 2K
+        # clip) that stayed resident for the entire run; the chunk loop does it
+        # per chunk instead, for a few MB. See _sanitise_hdr.
         if float(hdr.max()) <= 1.0:
             logger.warning(
                 "hdr_ai peaks at %.3f — nothing above white. If this came from "
@@ -1345,7 +1423,10 @@ class BatHDRTonalComposite:
         """
         idx = max(0, min(int(preview_frame), plate.shape[0] - 1))
         pf = plate[idx].float()
-        hf = hdr[idx].float()
+        # hdr arrives unsanitised now that the scrub moved into the chunk loop,
+        # so a NaN would reach hdr_tile's uint16 cast and pack garbage. One
+        # frame, so doing it here costs nothing.
+        hf = _sanitise_hdr(hdr[idx])
 
         u8 = (pf.clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
         ui = {
