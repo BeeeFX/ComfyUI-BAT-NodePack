@@ -354,12 +354,18 @@ function heartbeat() {
 }
 
 // Claim runs for the submitting tab. Wrapped once, at module load.
+//
+// Forward with rest args, never a fixed arity. `queuePrompt`'s third
+// argument carries `partialExecutionTargets` (the per-node play button)
+// and `previewMethod`; a `(number, prompt)` wrapper silently dropped it,
+// so every single-node run queued the WHOLE graph — including API nodes.
+// Anything the core signature grows next has to survive this seam too.
 (function patchQueuePrompt() {
   if (!api.queuePrompt || api.queuePrompt.__batProfiler) return;
   const orig = api.queuePrompt.bind(api);
-  const wrapped = async function (number, prompt) {
+  const wrapped = async function (...args) {
     const wf = currentKey();
-    const res = await orig(number, prompt);
+    const res = await orig(...args);
     try {
       const promptId = res?.prompt_id;
       if (promptId) {

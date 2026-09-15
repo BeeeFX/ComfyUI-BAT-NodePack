@@ -375,6 +375,72 @@ def t_frontend():
 t_frontend()
 
 # ─────────────────────────────────────────────────────────────────────
+print("\n[5b] queuePrompt passthrough")
+
+
+def t_queue_passthrough():
+    """The profiler wraps `api.queuePrompt`, which every queue on the box
+    goes through — so the wrapper must be transparent.
+
+    It was not. Declared `(number, prompt)`, it dropped the third
+    argument, which is where the frontend puts `partialExecutionTargets`
+    (the per-node play button) and `previewMethod`. The backend then saw
+    a plain full queue and cooked the WHOLE graph — API nodes included —
+    on every single-node run, for anyone who merely had the pack in
+    custom_nodes. Reported from the wild 2026-09-15.
+
+    So this runs the shipped IIFE verbatim against a recording stub and
+    asserts every argument survives. Arity is the thing under test: a
+    fixed-arity wrapper must fail here, and so must the next core
+    signature that grows a parameter."""
+    try:
+        import quickjs
+    except Exception as e:
+        check("quickjs available", False, f"{e!r}")
+        return
+
+    src = open(os.path.join(PACK, "web", "bat_profiler.js")).read()
+
+    # Pull the wrapper out of the shipped file rather than restating it,
+    # so the test cannot drift away from what actually ships.
+    start = src.index("(function patchQueuePrompt() {")
+    end = src.index("})();", start) + len("})();")
+    iife = src[start:end]
+
+    ctx = quickjs.Context()
+    ctx.eval("""
+      var seen = null;
+      var api = {
+        queuePrompt: function () {
+          seen = Array.prototype.slice.call(arguments);
+          return Promise.resolve({prompt_id: "p1"});
+        },
+        fetchApi: function () { return Promise.resolve({}); }
+      };
+      var pendingClaims = new Map();
+      function currentKey() { return "wf/x.json"; }
+    """)
+    ctx.eval(iife)
+    # quickjs has no event loop, but the stub's promise is already
+    # resolved, so the await resumes on the first job-queue drain.
+    ctx.eval("""
+      api.queuePrompt(0, {output:{}, workflow:{}},
+                      {partialExecutionTargets:["7"], previewMethod:"latent2rgb"});
+    """)
+
+    n = ctx.eval("seen === null ? -1 : seen.length")
+    check("all three arguments forwarded", n == 3, f"got {n}")
+    targets = ctx.eval("seen === null ? 'null' : JSON.stringify(seen[2])")
+    check("partialExecutionTargets survives the wrapper",
+          targets == '{"partialExecutionTargets":["7"],"previewMethod":"latent2rgb"}',
+          f"got {targets}")
+    check("wrapper marks itself, so it installs once",
+          ctx.eval("api.queuePrompt.__batProfiler === true"))
+
+
+t_queue_passthrough()
+
+# ─────────────────────────────────────────────────────────────────────
 print("\n[6] crash report")
 
 
