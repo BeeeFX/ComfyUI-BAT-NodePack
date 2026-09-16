@@ -113,6 +113,10 @@ const state = {
   // comes back still recording.
   config: { enabled: false, sync_cuda: true, reset_peak: true },
   wantArmed: false,
+  // Per-chart axis mode: "ceiling" (against the machine's limit) or
+  // "fit" (against the data). Ceiling is right almost always; fit is
+  // for a trace so far below the limit it has no visible shape.
+  chartScale: { ram: "ceiling", vram: "ceiling" },
   attached: false,   // has the sidebar actually mounted our root yet?
   sized: false,      // have we redrawn once real dimensions existed?
   poll: null,
@@ -127,6 +131,7 @@ function loadPrefs() {
     if (typeof p.desc === "boolean") state.desc = p.desc;
     if (typeof p.hideCached === "boolean") state.hideCached = p.hideCached;
     if (typeof p.armed === "boolean") state.wantArmed = p.armed;
+    if (p.chartScale) Object.assign(state.chartScale, p.chartScale);
   } catch (e) { /* first run */ }
 }
 
@@ -135,6 +140,7 @@ function savePrefs() {
     localStorage.setItem(PREF_KEY, JSON.stringify({
       sort: state.sort, desc: state.desc, hideCached: state.hideCached,
       armed: !!state.config.enabled,
+      chartScale: state.chartScale,
     }));
   } catch (e) { /* quota — prefs are not worth pruning for */ }
 }
@@ -665,20 +671,127 @@ function buildPower() {
 }
 
 // ── charts ──────────────────────────────────────────────────────────
+//
+// Sized for a sidebar, which is the whole constraint: ~260px wide and a
+// few dozen tall. Everything below exists to make a chart that small
+// actually readable — a gutter so value labels never sit on the curve,
+// round gridline values a human recognises, and a hover readout,
+// because at this size no amount of grid lets you read an exact number
+// off the pixels.
+
+const CHART_H = 78;
+const PAD_L = 42, PAD_R = 5, PAD_T = 5, PAD_B = 13;
+
+const CHART_SPECS = [
+  {
+    id: "ram",
+    label: "System RAM",
+    series: [
+      { key: "sys", color: "#5b8dd6", fill: true, label: "system" },
+      { key: "ram", color: "#9ecbff", fill: false, label: "ComfyUI" },
+    ],
+    totalKey: "sys_total",
+    baseKey: "sys",
+  },
+  {
+    id: "vram",
+    label: "VRAM",
+    series: [
+      { key: "vram", color: "#d68a3c", fill: true, label: "allocated" },
+      { key: "res", color: "#f0c48a", fill: false, label: "reserved" },
+    ],
+    totalKey: "dev_total",
+    baseKey: "vram",
+  },
+];
+
+// Which chart the cursor is over, and where. Module-level rather than
+// in `state` because it changes on every mousemove and must never
+// trigger a DOM rebuild — only a canvas redraw.
+let hover = { id: null, px: 0 };
+
+/**
+ * Gridline values at numbers a human recognises.
+ *
+ * The steps are computed in the unit the labels will be written in, so
+ * a 125 GB axis gets lines at 25/50/75/100 GB rather than at some exact
+ * fraction that renders as "34.36 GB". Targeting five divisions rather
+ * than four is deliberate: it is what turns 125 into a 25 step instead
+ * of a 50 step, which is the difference between four gridlines and two.
+ */
+function niceTicks(max) {
+  if (!(max > 0)) return [];
+  const units = [1, 1024, 1024 ** 2, 1024 ** 3, 1024 ** 4];
+  let ui = 0;
+  while (ui < units.length - 1 && max / units[ui + 1] >= 1) ui++;
+  const unit = units[ui];
+  const maxU = max / unit;
+  const rough = maxU / 5;
+  const pow = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough / pow;
+  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * pow;
+  const out = [];
+  for (let v = step; v < maxU * 0.999; v += step) out.push(v * unit);
+  return out;
+}
+
+/**
+ * Format a gridline value.
+ *
+ * Ticks are round by construction, so the decimal fmtBytes keeps below
+ * 10 is pure noise here — "5.0 GB" reads worse than "5 GB" and costs
+ * two characters of a very narrow gutter. Measured values keep their
+ * decimal; only axis labels lose it.
+ */
+function fmtTick(v) {
+  return fmtBytes(v).replace(/\.0(?= )/, "");
+}
+
+/** Vertical gridlines on round durations, not arbitrary fractions. */
+function niceTimeStep(span) {
+  const steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200];
+  // Five divisions, not six: at sidebar width the labels start to
+  // collide past that.
+  for (const s of steps) if (span / s <= 5) return s;
+  return 14400;
+}
+
+function shortTime(s) {
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return s % 60 < 1 ? `${m}m` : `${m}m${String(Math.round(s % 60)).padStart(2, "0")}`;
+  return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}`;
+}
+
 function buildCharts() {
   const wrap = el("div", "bat-prof-charts");
-  for (const spec of [
-    { id: "ram", label: "System RAM" },
-    { id: "vram", label: "VRAM" },
-  ]) {
+  for (const spec of CHART_SPECS) {
     if (spec.id === "vram" && state.capabilities.cuda === false) continue;
     const box = el("div", "bat-prof-chart");
+
     const head = el("div", "bat-prof-chart-head");
     head.appendChild(el("span", "bat-prof-chart-label", spec.label));
-    head.appendChild(el("span", `bat-prof-chart-val bat-prof-chart-val-${spec.id}`, ""));
+    const val = el("span", `bat-prof-chart-val bat-prof-chart-val-${spec.id}`, "");
+    // Clicking the readout swaps the axis between the machine's ceiling
+    // and the data's own range. Needed because a 288 MB trace on a
+    // 24 GB axis is a flat line pinned to the floor — true, and useless.
+    val.title = "Click to switch this axis between the machine's ceiling and a fitted range";
+    val.onclick = () => {
+      state.chartScale[spec.id] = state.chartScale[spec.id] === "fit" ? "ceiling" : "fit";
+      savePrefs();
+      drawCharts();
+    };
+    head.appendChild(val);
     box.appendChild(head);
+
     const cv = el("canvas", `bat-prof-canvas bat-prof-canvas-${spec.id}`);
-    cv.height = 56;
+    cv.height = CHART_H;
+    cv.onmousemove = (e) => {
+      const r = cv.getBoundingClientRect();
+      hover = { id: spec.id, px: e.clientX - r.left };
+      scheduleChart();
+    };
+    cv.onmouseleave = () => { hover = { id: null, px: 0 }; scheduleChart(); };
     box.appendChild(cv);
     wrap.appendChild(box);
   }
@@ -686,10 +799,12 @@ function buildCharts() {
 }
 
 /**
- * Both charts plot against the machine's real ceiling (total RAM /
- * total VRAM) rather than auto-scaling to the data. Auto-scaling makes
- * every run look equally alarming; a fixed ceiling tells you at a
- * glance how much headroom you actually had.
+ * Both charts plot against the machine's real ceiling by default rather
+ * than auto-scaling to the data: auto-scaling makes every run look
+ * equally alarming, while a fixed ceiling tells you at a glance how
+ * much headroom you actually had. The per-chart "fit" toggle exists for
+ * the opposite case — a trace so far below the ceiling that it has no
+ * visible shape at all.
  */
 function drawCharts() {
   const run = activeRun();
@@ -697,99 +812,238 @@ function drawCharts() {
   const root = state.root;
   if (!root) return;
 
-  const specs = [
-    {
-      id: "ram",
-      series: [
-        { key: "sys", color: "#5b8dd6", fill: true, label: "system" },
-        { key: "ram", color: "#9ecbff", fill: false, label: "ComfyUI" },
-      ],
-      totalKey: "sys_total",
-      baseTotal: run?.baseline?.sys_total,
-    },
-    {
-      id: "vram",
-      series: [
-        { key: "vram", color: "#d68a3c", fill: true, label: "allocated" },
-        { key: "res", color: "#f0c48a", fill: false, label: "reserved" },
-      ],
-      totalKey: "dev_total",
-      baseTotal: run?.baseline?.dev_total,
-    },
-  ];
+  const css = getComputedStyle(root);
+  const dim = (css.getPropertyValue("--descrip-text") || "#888").trim() || "#888";
+  const border = (css.getPropertyValue("--border-color") || "#444").trim() || "#444";
 
-  for (const spec of specs) {
+  for (const spec of CHART_SPECS) {
     const cv = root.querySelector(`.bat-prof-canvas-${spec.id}`);
     if (!cv) continue;
+
     const dpr = window.devicePixelRatio || 1;
     const w = cv.clientWidth || 260;
-    const h = 56;
-    if (cv.width !== Math.round(w * dpr)) {
+    const h = CHART_H;
+    if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
       cv.width = Math.round(w * dpr);
       cv.height = Math.round(h * dpr);
     }
     const ctx = cv.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
+    ctx.font = "9px system-ui, sans-serif";
+    ctx.textBaseline = "middle";
 
-    const css = getComputedStyle(root);
-    ctx.strokeStyle = css.getPropertyValue("--border-color") || "#444";
-    ctx.globalAlpha = 0.35;
-    ctx.beginPath();
-    ctx.moveTo(0, h - 0.5);
-    ctx.lineTo(w, h - 0.5);
-    ctx.stroke();
-    ctx.globalAlpha = 1;
+    const x0 = PAD_L, x1 = w - PAD_R;
+    const y0 = PAD_T, y1 = h - PAD_B;
+    const plotW = Math.max(1, x1 - x0), plotH = Math.max(1, y1 - y0);
 
-    let total = spec.baseTotal || 0;
+    // ── ranges ────────────────────────────────────────────────────
+    let total = run?.baseline?.[spec.totalKey] || 0;
     for (const s of samples) if (s[spec.totalKey]) total = Math.max(total, s[spec.totalKey]);
     let peak = 0;
     for (const s of samples) for (const ser of spec.series) peak = Math.max(peak, s[ser.key] || 0);
-    // If we never learned the ceiling, fall back to headroom over the
-    // observed peak so the curve is still readable.
-    const max = total > 0 ? total : peak * 1.25 || 1;
+
+    const fitted = state.chartScale[spec.id] === "fit";
+    const max = fitted
+      ? (peak * 1.15 || 1)
+      : (total > 0 ? total : peak * 1.25 || 1);
 
     const label = root.querySelector(`.bat-prof-chart-val-${spec.id}`);
     if (label) {
+      const span = samples.length > 1 ? samples[samples.length - 1].t - samples[0].t : 0;
       label.textContent = samples.length
-        ? `${fmtBytes(peak)} peak${total ? ` / ${fmtBytes(total)}` : ""}`
+        ? `${fmtBytes(peak)} peak${total ? ` / ${fmtBytes(total)}` : ""}` +
+          `${fitted ? " · fitted" : ""}${span > 1 ? ` · ${shortTime(span)}` : ""}`
         : "no samples";
+      label.classList.toggle("bat-prof-chart-val-fit", fitted);
     }
 
+    const y = (v) => y1 - Math.min(1, Math.max(0, (v || 0) / max)) * plotH;
+
+    // ── horizontal grid ───────────────────────────────────────────
+    ctx.lineWidth = 1;
+    for (const tick of niceTicks(max)) {
+      const py = Math.round(y(tick)) + 0.5;
+      ctx.strokeStyle = border;
+      ctx.globalAlpha = 0.45;
+      ctx.beginPath();
+      ctx.moveTo(x0, py);
+      ctx.lineTo(x1, py);
+      ctx.stroke();
+      ctx.globalAlpha = 0.75;
+      ctx.fillStyle = dim;
+      ctx.textAlign = "right";
+      ctx.fillText(fmtTick(tick), x0 - 4, py);
+    }
+    ctx.globalAlpha = 1;
+
+    // Axis frame: floor, and the ceiling only when it is the real one.
+    ctx.strokeStyle = border;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(x0, y1 + 0.5);
+    ctx.lineTo(x1, y1 + 0.5);
+    ctx.stroke();
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = dim;
+    ctx.textAlign = "right";
+    ctx.fillText("0", x0 - 4, y1);
+    if (!fitted && total > 0) {
+      // The ceiling is the line that matters most — it is the one you
+      // die at — so it gets a colour rather than the neutral grey.
+      ctx.strokeStyle = "#a05050";
+      ctx.globalAlpha = 0.7;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x0, y0 + 0.5);
+      ctx.lineTo(x1, y0 + 0.5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#c08080";
+      ctx.fillText(fmtTick(total), x0 - 4, y0 + 1);
+    }
+    ctx.globalAlpha = 1;
+
     if (samples.length < 2) {
-      ctx.globalAlpha = 0.4;
-      ctx.fillStyle = css.getPropertyValue("--descrip-text") || "#888";
-      ctx.font = "11px sans-serif";
-      ctx.fillText("waiting for a run…", 6, h / 2 + 4);
+      ctx.globalAlpha = 0.45;
+      ctx.fillStyle = dim;
+      ctx.textAlign = "left";
+      ctx.font = "10px system-ui, sans-serif";
+      ctx.fillText(state.config.enabled ? "waiting for a run…"
+                                        : "profiling is off", x0 + 6, (y0 + y1) / 2);
       ctx.globalAlpha = 1;
       continue;
     }
 
     const t0 = samples[0].t;
-    const t1 = samples[samples.length - 1].t;
-    const span = Math.max(t1 - t0, 0.001);
-    const x = (s) => ((s.t - t0) / span) * w;
-    const y = (v) => h - Math.min(1, (v || 0) / max) * (h - 3) - 1;
+    const tEnd = samples[samples.length - 1].t;
+    const tSpan = Math.max(tEnd - t0, 0.001);
+    const x = (t) => x0 + ((t - t0) / tSpan) * plotW;
 
-    for (const ser of spec.series) {
+    // ── vertical grid (time) ──────────────────────────────────────
+    const tStep = niceTimeStep(tSpan);
+    ctx.textAlign = "center";
+    for (let t = tStep; t < tSpan * 0.999; t += tStep) {
+      const px = Math.round(x(t0 + t)) + 0.5;
+      ctx.strokeStyle = border;
+      ctx.globalAlpha = 0.3;
       ctx.beginPath();
-      samples.forEach((s, i) => {
-        const px = x(s), py = y(s[ser.key]);
-        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-      });
-      if (ser.fill) {
-        ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
-        ctx.fillStyle = ser.color; ctx.globalAlpha = 0.22; ctx.fill();
-        ctx.globalAlpha = 1;
+      ctx.moveTo(px, y0);
+      ctx.lineTo(px, y1);
+      ctx.stroke();
+      ctx.globalAlpha = 0.7;
+      ctx.fillStyle = dim;
+      ctx.fillText(shortTime(t), px, y1 + 7);
+    }
+    ctx.globalAlpha = 1;
+
+    // ── baseline: where memory sat before the run began ───────────
+    // Without it you cannot tell how much of the height is this run's
+    // doing and how much was already there when you pressed Run.
+    const base = run?.baseline?.[spec.baseKey];
+    if (base > 0 && base < max) {
+      const py = Math.round(y(base)) + 0.5;
+      ctx.strokeStyle = "#7f8f7f";
+      ctx.globalAlpha = 0.75;
+      ctx.setLineDash([2, 3]);
+      ctx.beginPath();
+      ctx.moveTo(x0, py);
+      ctx.lineTo(x1, py);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = "#93a893";
+      ctx.textAlign = "left";
+      ctx.fillText("start", x0 + 3, py - 5);
+      ctx.globalAlpha = 1;
+    }
+
+    // ── series ────────────────────────────────────────────────────
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0, y0 - 1, plotW, plotH + 2);
+    ctx.clip();
+    for (const ser of spec.series) {
+      const trace = () => {
         ctx.beginPath();
         samples.forEach((s, i) => {
-          const px = x(s), py = y(s[ser.key]);
+          const px = x(s.t), py = y(s[ser.key]);
           if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
         });
+      };
+      if (ser.fill) {
+        trace();
+        ctx.lineTo(x(tEnd), y1);
+        ctx.lineTo(x(t0), y1);
+        ctx.closePath();
+        ctx.fillStyle = ser.color;
+        ctx.globalAlpha = 0.2;
+        ctx.fill();
+        ctx.globalAlpha = 1;
       }
+      trace();
       ctx.strokeStyle = ser.color;
       ctx.lineWidth = ser.fill ? 1.5 : 1;
       ctx.stroke();
+    }
+    ctx.restore();
+
+    // ── hover readout ─────────────────────────────────────────────
+    // At this size the grid tells you roughly where you are; this tells
+    // you exactly, and names the node that was running at that instant.
+    if (hover.id === spec.id && hover.px >= x0 - 6 && hover.px <= x1 + 6) {
+      const ht = t0 + ((Math.min(Math.max(hover.px, x0), x1) - x0) / plotW) * tSpan;
+      let best = samples[0], bd = Infinity;
+      for (const s of samples) {
+        const d = Math.abs(s.t - ht);
+        if (d < bd) { bd = d; best = s; }
+      }
+      const px = Math.round(x(best.t)) + 0.5;
+      ctx.strokeStyle = "#ffffff";
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath();
+      ctx.moveTo(px, y0);
+      ctx.lineTo(px, y1);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      for (const ser of spec.series) {
+        ctx.fillStyle = ser.color;
+        ctx.beginPath();
+        ctx.arc(px, y(best[ser.key]), 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      const nodeName = best.node
+        ? (run.titles?.[best.node] || run.nodes?.[best.node]?.class_type || `#${best.node}`)
+        : null;
+      const lines = [`+${shortTime(best.t - t0)}`];
+      for (const ser of spec.series) lines.push(`${ser.label} ${fmtBytes(best[ser.key])}`);
+      if (nodeName) lines.push(nodeName);
+
+      ctx.font = "9px system-ui, sans-serif";
+      const bw = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 10;
+      const bh = lines.length * 11 + 6;
+      // Flip to the other side of the cursor near the right edge so the
+      // box never falls off the canvas.
+      let bx = px + 7;
+      if (bx + bw > x1) bx = px - 7 - bw;
+      const by = Math.max(y0, Math.min(y1 - bh, y0 + 2));
+
+      ctx.fillStyle = "rgba(12,12,14,0.92)";
+      ctx.strokeStyle = border;
+      ctx.globalAlpha = 1;
+      ctx.beginPath();
+      ctx.rect(bx, by, bw, bh);
+      ctx.fill();
+      ctx.stroke();
+      ctx.textAlign = "left";
+      lines.forEach((l, i) => {
+        ctx.fillStyle = i === 0 ? "#ffffff"
+                      : i <= spec.series.length ? spec.series[i - 1].color
+                      : dim;
+        ctx.fillText(l, bx + 5, by + 9 + i * 11);
+      });
     }
   }
 }
@@ -1136,7 +1390,10 @@ const CSS = `
 .bat-prof-charts { display:flex; flex-direction:column; gap:6px; }
 .bat-prof-chart-head { display:flex; justify-content:space-between;
   font-size:10px; color:var(--descrip-text,#888); margin-bottom:1px; }
-.bat-prof-canvas { width:100%; height:56px; display:block; }
+.bat-prof-canvas { width:100%; height:78px; display:block; cursor:crosshair; }
+.bat-prof-chart-val { cursor:pointer; }
+.bat-prof-chart-val:hover { color:var(--fg-color,#ddd); text-decoration:underline dotted; }
+.bat-prof-chart-val-fit { color:#e0b080; }
 .bat-prof-summary { display:flex; flex-wrap:wrap; gap:6px; }
 .bat-prof-stat { flex:1 1 60px; background:var(--comfy-input-bg,#222);
   border-radius:4px; padding:4px 6px; }

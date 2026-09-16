@@ -570,5 +570,109 @@ def t_report():
 t_report()
 
 # ─────────────────────────────────────────────────────────────────────
+print("\n[7] chart grid maths")
+
+
+def t_grid():
+    """A grid is only an improvement if its lines land on numbers a human
+    reads without thinking. Slice the real functions out of the panel
+    (sliced, not copied — a copy would drift) and check the values."""
+    try:
+        import quickjs
+    except Exception as e:
+        check("quickjs available", False, f"{e!r}")
+        return
+
+    src = open(os.path.join(PACK, "web", "bat_profiler.js")).read()
+
+    def slice_fn(name):
+        marker = f"function {name}("
+        i = src.index(marker)
+        depth, j = 0, src.index("{", i)
+        start = j
+        while True:
+            if src[j] == "{":
+                depth += 1
+            elif src[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        return src[i:j + 1]
+
+    ctx = quickjs.Context()
+    for fn in ("fmtBytes", "fmtTick", "niceTicks", "niceTimeStep", "shortTime"):
+        ctx.eval(slice_fn(fn))
+
+    GB = 1024 ** 3
+    ctx.eval(f"var GB = {GB};")
+
+    # The machine in the screenshot: 125 GB of RAM.
+    ticks = json.loads(ctx.eval("JSON.stringify(niceTicks(125*GB))"))
+    labels = json.loads(ctx.eval(
+        "JSON.stringify(niceTicks(125*GB).map(function(v){return fmtTick(v)}))"))
+    check("125 GB axis gets 4 gridlines", len(ticks) == 4, f"got {labels}")
+    check("125 GB labels are round", labels == ["25 GB", "50 GB", "75 GB", "100 GB"],
+          f"got {labels}")
+
+    # The card in the screenshot: 24 GB.
+    labels = json.loads(ctx.eval(
+        "JSON.stringify(niceTicks(24*GB).map(function(v){return fmtTick(v)}))"))
+    check("24 GB labels are round", labels == ["5 GB", "10 GB", "15 GB", "20 GB"],
+          f"got {labels}")
+
+    labels = json.loads(ctx.eval(
+        "JSON.stringify(niceTicks(8*GB).map(function(v){return fmtTick(v)}))"))
+    check("8 GB labels are round", labels == ["2 GB", "4 GB", "6 GB"], f"got {labels}")
+
+    # A fitted axis on a small trace must not produce byte-level noise.
+    labels = json.loads(ctx.eval(
+        "JSON.stringify(niceTicks(288*1024*1024).map(function(v){return fmtTick(v)}))"))
+    check("MB-scale axis stays readable",
+          all(("MB" in l) for l in labels) and len(labels) >= 2, f"got {labels}")
+
+    # Invariants that must hold for any ceiling.
+    bad = []
+    for gb in (1, 2, 6, 11, 12, 16, 24, 32, 40, 48, 64, 80, 96, 125, 128, 192, 256, 512):
+        t = json.loads(ctx.eval(f"JSON.stringify(niceTicks({gb}*GB))"))
+        if not t:
+            bad.append(f"{gb}GB:none")
+            continue
+        if any(v >= gb * GB for v in t):
+            bad.append(f"{gb}GB:over-top")
+        gaps = {round(t[i + 1] - t[i]) for i in range(len(t) - 1)}
+        if len(gaps) > 1:
+            bad.append(f"{gb}GB:uneven")
+        if not (2 <= len(t) <= 6):
+            bad.append(f"{gb}GB:count={len(t)}")
+    check("gridlines are even, inside the axis, 2-6 of them across every"
+          " plausible ceiling", not bad, str(bad))
+
+    noisy = []
+    for gb in (1, 2, 6, 8, 12, 16, 24, 32, 48, 64, 96, 125, 128, 256):
+        labs = json.loads(ctx.eval(
+            f"JSON.stringify(niceTicks({gb}*GB).map(function(v){{return fmtTick(v)}}))"))
+        noisy += [l for l in labs if l.endswith(".0 GB") or l.endswith(".0 MB")]
+    check("no gridline label carries a pointless .0", not noisy, str(noisy[:6]))
+
+    check("zero axis yields no grid",
+          json.loads(ctx.eval("JSON.stringify(niceTicks(0))")) == [])
+
+    # Time axis.
+    for span, want in ((10, 2), (60, 15), (300, 60), (3600, 900)):
+        got = ctx.eval(f"niceTimeStep({span})")
+        check(f"time step for {span}s span",
+              span / got <= 5 and 2 <= span / got <= 5 and got == want,
+              f"got {got}, want {want}")
+
+    check("short time under a minute", ctx.eval("shortTime(45)") == "45s")
+    check("short time on the minute", ctx.eval("shortTime(60)") == "1m")
+    check("short time with seconds", ctx.eval("shortTime(90)") == "1m30")
+    check("short time over an hour", ctx.eval("shortTime(3660)") == "1h01")
+
+
+t_grid()
+
+# ─────────────────────────────────────────────────────────────────────
 print("\n" + ("FAILURES: " + ", ".join(failures) if failures else "All checks passed."))
 sys.exit(1 if failures else 0)

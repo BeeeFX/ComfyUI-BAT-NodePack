@@ -220,6 +220,34 @@ they stream in rather than at run end, which is the point: the backend's history
 dies with the process, so after an OOM kill you reload the page and the last
 node to complete is still sitting at the top of the list.
 
+### Reading the charts
+
+RAM and VRAM are plotted against the machine's **real ceiling** rather than
+auto-scaled to the data — auto-scaling makes every run look equally alarming,
+while a fixed ceiling shows at a glance how much headroom there actually was.
+The ceiling itself is drawn as a dashed red line, since it is the one you die at.
+
+To make a chart that small actually readable:
+
+- **Horizontal gridlines land on round numbers**, computed in the unit the label
+  is written in, so a 125 GB axis gets lines at 25/50/75/100 GB rather than at
+  some exact fraction that renders as "34.36 GB".
+- **A left gutter holds the value labels**, so they never sit on top of the curve.
+- **A dashed "start" line** marks where memory sat before the run began —
+  without it you cannot tell how much of the height this run is responsible for
+  and how much was already there when you pressed Run.
+- **Vertical gridlines** fall on round durations, capped at five divisions
+  because the labels collide past that at sidebar width.
+- **Hovering** gives a crosshair and an exact readout — elapsed time, both
+  series, and the node that was running at that instant. At this size the grid
+  tells you roughly where you are; the readout tells you exactly.
+
+Clicking the figure in a chart's header (`122 GB peak / 125 GB`) switches that
+axis between the ceiling and a fitted range. Ceiling is right almost always, but
+a 288 MB trace on a 24 GB axis is a flat line pinned to the floor — true, and
+useless — and fitting it is the only way to see its shape. A fitted axis is
+labelled `· fitted` so the reading is never ambiguous.
+
 ### Copy report
 
 **Copy report** puts a few KB of plain text on the clipboard, meant to be pasted
