@@ -22,6 +22,38 @@ sharing them in case they're useful to others.
 | 🦇 **Video Combine**          | `BAT/video`    | Encodes an IMAGE batch (+ optional AUDIO) to a video file through ffmpeg. Format catalog in `bat_video_formats/*.json` covers H264 / H265 / VP9 / FFV1 / ProRes / GIF / WebP / EXR-sequence / PNG-sequence. Inline browser player with per-frame stepping, client-side hover thumbnails, save-frame-as-PNG, and smooth playhead via `requestVideoFrameCallback`. |
 | 🦇 **Framehold**              | `BAT/video`    | Holds one frame of a batch across the whole batch — the frame-sequence equivalent of a freeze frame. |
 
+### Loading media
+
+| Display name                  | Category       | What it does |
+|-------------------------------|----------------|---|
+| 🦇 **Loader**                 | `BAT/Loader`   | One node for anything a comp graph starts from — a still, a `####` frame sequence, a movie, or a folder of images — picked from a single `path` field with directory autocomplete. Multi-layer EXRs come back with their **layers**, **cryptomattes** and header **metadata** alongside the frames; movies reuse 🦇 Video Loader's decode stack, so 10/12-bit ProRes keeps its precision, a real alpha channel lands on `mask`, and `audio` is cut to the loaded range. The layer outputs and the audio are only decoded when something in the graph is actually wired to them, because on a plain plate load nothing reads them and building every layer of a 60-channel comp EXR is the most expensive thing the node can do. The `overscan` widget decides what to do when a render's bounding box is bigger than the format, or moves between frames — see below. Underneath the path field the node says what it resolved to (`EXR sequence · 48 frames · 2048x1080 · 18 layers`), which is how you find out that `###` matched nothing *before* you queue rather than after. |
+| 🦇 **EXR Layer**              | `BAT/Loader`   | Pulls one named layer (`diffuse`, `N`, `depth`, …) out of 🦇 Loader's `layers` output as image + mask. **Pick layer…** lists what the file actually contains, so the name never has to be typed from memory. |
+| 🦇 **Cryptomatte Matte**      | `BAT/Loader`   | Turns clicked points into a cryptomatte coverage mask. Wire 🦇 Points Editor (with the loader's `images` as its `bg_image`) into `positive_coords` / `negative_coords`: the IDs under the positive points are kept, the ones under the negative points dropped, and their coverage summed across every rank of the matte. |
+
+**🦇 Loader vs 🦇 Video Loader.** They live side by side on purpose. Video
+Loader is the one for working *on a movie*: a dual-handle trim slider with
+in/out thumbnails and an in-node player, for picking a range by eye. Loader is
+the one for everything else, and takes its range the way a sequence does —
+skip / every-nth / cap. No existing workflow changes.
+
+**Overscan.** An EXR carries two rectangles: the *display window* (the shot
+format) and the *data window* (the bounding box pixels were actually written
+for). A render with overscan has a data window bigger than the format; anything
+that shrank its bbox has one smaller. Either can change from frame to frame,
+and when it does the frames are genuinely different sizes — there is no batch to
+build.
+
+- **auto** (default) — load the frames exactly as they sit on disk, but conform
+  them to the format when their bounding boxes differ from each other. This can
+  only ever *fix* a load that used to fail.
+- **crop** — always conform to the format: overscan cropped off, black filled in
+  wherever the bounding box falls short.
+- **keep** — always load the bounding box as written. A sequence whose box moves
+  will error, naming the two frames that disagree.
+
+Conforming applies to every output at once — image, mask, layers, cryptomatte
+and the sizes in `metadata`.
+
 ### Canvas editors
 
 Interactive nodes that draw a live preview on the node itself. All of them
@@ -434,6 +466,7 @@ python tests/verify_exposure_bracket.py
 python tests/verify_rescale.py
 python tests/verify_bypass_switch.py
 python tests/verify_canvas_zoom.py
+python tests/verify_loader.py
 python tests/verify_fullscreen.py
 python tests/verify_profiler.py
 ```
@@ -532,6 +565,20 @@ which removes the case rather than papering over it. The divergence is
 instead of quietly passing. (It is a live, if minor, latent bug in Advanced
 Blend's `area` resize_filter when it is enlarging a plate; left alone rather
 than changed under a node this one does not own.)
+
+`verify_loader.py` is the odd one out in the other direction: *🦇 Loader* has no
+second implementation to diff against, so it is checked against the **bytes on
+disk** instead. Every branch is built into a temp directory and read back with
+an independent reader — Pillow for the stills, OpenImageIO for the EXRs — and
+compared for exact equality, because a loader that returns subtly wrong pixels
+poisons every node downstream while looking perfectly healthy. Three claims in
+it are worth naming. **Frame order**: EXR frames decode on a thread pool and
+land out of order, so each frame is written with a different value and the batch
+is asserted to carry them ascending. **Layer aliasing**: the `cryptomatte`
+output must *share* its tensors with `layers` rather than duplicate them, which
+on a 2K comp EXR is the difference between ~390 MB and ~780 MB a frame and is
+invisible unless something asserts it. And **overscan**, over a sequence whose
+bounding box genuinely moves frame to frame, in all three modes.
 
 `verify_fullscreen.py` proves the maximise button gives the editor back
 unharmed. It reproduces frontend 1.49.6's own `mountElementIfVisible` verbatim

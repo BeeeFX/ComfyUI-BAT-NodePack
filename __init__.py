@@ -26,6 +26,15 @@ backdrops, for making a template someone else can drive. Everything happens in
 ``web/bat_bypass_switch.js``; the Python is a stub whose only job is to declare
 the widget the state serialises into.
 
+2026-09-15: ``Bat_Loader`` ("🦇 Loader") joins the pack as a unified media
+loader — one ``path`` field that takes a still, a ``####`` frame sequence, a
+movie or a folder of images, and returns multi-layer EXR layers, cryptomattes
+and header metadata alongside the frames. It sits BESIDE 🦇 Video Loader rather
+than replacing it: that node stays the one for interactively trimming a movie
+with a scrubber, and no existing workflow changes. Its movie branch imports
+``bat_video_loader``'s decode stack rather than copying it. Two companion nodes
+(``Bat_ExrLayer``, ``Bat_CryptomatteMatte``) consume the layer outputs.
+
 2026-09-15: ``web/bat_fullscreen.js`` adds a ⛶ maximise button to the six
 advanced editors (Roto, Animated Crop, Animated Grade, Layered Images, HDR
 Tonal Composite, Rescale). It moves the live editor root into a full-window
@@ -46,6 +55,8 @@ from .bat_wan_context_calculator import VoltWanContextCalculator
 from .bat_wan_batch_format import VoltWanBatchFormat, VoltWanBatchCrop
 from .bat_batch_format import BatBatchFormat
 from .bat_video_loader import VideoLoader
+from .bat_loader import BatLoader
+from .bat_exr_layers import BatExrLayer, BatCryptomatteMatte
 from .bat_frame_picker import BatFramePicker
 from .bat_points_editor import BatPointsEditor
 from .bat_ref_aligner import RefAligner
@@ -93,6 +104,9 @@ NODE_CLASS_MAPPINGS = {
     "Bat_WanBatchCrop":         VoltWanBatchCrop,
     "Bat_BatchFormat":          BatBatchFormat,
     "Bat_VideoLoader":          VideoLoader,
+    "Bat_Loader":               BatLoader,
+    "Bat_ExrLayer":             BatExrLayer,
+    "Bat_CryptomatteMatte":     BatCryptomatteMatte,
     "Bat_FramePicker":          BatFramePicker,
     "Bat_PointsEditor":         BatPointsEditor,
     "Bat_RefAligner":           RefAligner,
@@ -128,6 +142,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_WanBatchCrop":         "🦇 Batch Crop",
     "Bat_BatchFormat":          "🦇 Batch Format",
     "Bat_VideoLoader":          "🦇 Video Loader",
+    "Bat_Loader":               "🦇 Loader",
+    "Bat_ExrLayer":             "🦇 EXR Layer",
+    "Bat_CryptomatteMatte":     "🦇 Cryptomatte Matte",
     "Bat_FramePicker":          "🦇 BAT Frame Picker",
     "Bat_PointsEditor":         "🦇 Points Editor",
     "Bat_RefAligner":           "🦇 Wan Reference Aligner",

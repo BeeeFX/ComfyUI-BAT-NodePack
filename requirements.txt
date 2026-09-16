@@ -13,6 +13,13 @@
 # sources, or for audio: those go through the ffmpeg binary that
 # imageio-ffmpeg already ships.
 #
+# Optional, for 🦇 Loader's EXR support:
+#
+#   OpenImageIO   reading multi-layer EXR (layers, cryptomattes, the data and
+#                 display windows the `overscan` widget works from). Without it
+#                 🦇 Loader still handles stills, sequences, folders and movies,
+#                 and says so when handed an .exr. `pip install OpenImageIO`
+#
 # The entries below are for the SeC segmenter
 # (bat_sec_segmenter.py + the vendored stack in bat_sec/) ONLY.
 #
