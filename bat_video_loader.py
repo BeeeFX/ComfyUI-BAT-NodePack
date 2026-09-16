@@ -153,12 +153,36 @@ def _probe_torchvision(path: str):
         return None
 
 
+# Cached the same way and for the same reason as _PROBE_CACHE below: keyed on
+# (abs path, mtime_ns:size), so a rewritten file re-probes and an unchanged one
+# does not.
+_VIDEO_PROBE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
+_VIDEO_PROBE_CACHE_MAX = 64
+
+
 def probe_video(path: str) -> Optional[dict]:
-    """Return basic info about a video, or None if no backend can read it."""
+    """Return basic info about a video, or None if no backend can read it.
+
+    Cached: /bat/video-info calls this on every path change, and opening a
+    container is not free — _probe_decord in particular DECODES frame 0 just to
+    read the width and height, which on a 4K ProRes is a real cost to pay per
+    keystroke. Misses (no backend could open it) are deliberately not cached, so
+    a path that is still being typed doesn't poison the entry for the real file.
+    """
+    key = (os.path.abspath(path), _fingerprint(path))
+    hit = _VIDEO_PROBE_CACHE.get(key)
+    if hit is not None:
+        _VIDEO_PROBE_CACHE.move_to_end(key)
+        # A copy: load() mutates nothing today, but a cached dict handed to
+        # several callers is one edit away from being a bug somewhere else.
+        return dict(hit)
     for fn in (_probe_decord, _probe_cv2, _probe_torchvision):
         info = fn(path)
         if info is not None:
             info.pop("_reader", None)
+            _VIDEO_PROBE_CACHE[key] = dict(info)
+            while len(_VIDEO_PROBE_CACHE) > _VIDEO_PROBE_CACHE_MAX:
+                _VIDEO_PROBE_CACHE.popitem(last=False)
             return info
     return None
 
@@ -309,7 +333,7 @@ def _select_expr(start: int, end: int, stride: int) -> str:
 
 
 def _iter_ffmpeg_rgba(path: str, start: int, end: int, stride: int,
-                      probe: dict):
+                      probe: dict, errbox: Optional[list] = None):
     """Yield RGBA frames from ffmpeg as (H,W,4) uint8 or uint16 arrays.
 
     Raises on a decoder failure rather than returning None: by the time we get
@@ -373,8 +397,14 @@ def _iter_ffmpeg_rgba(path: str, start: int, end: int, stride: int,
             pass
         proc.wait()
         if err.strip():
-            logger.debug("[Bat_VideoLoader] ffmpeg: %s",
-                         err.decode("utf-8", "replace").strip())
+            text = err.decode("utf-8", "replace").strip()
+            logger.debug("[Bat_VideoLoader] ffmpeg: %s", text)
+            # Handed back to the caller as well, because the interesting case
+            # is the one where ffmpeg wrote a reason and yielded no frames: the
+            # exception load_batch raises then says "decoded no frames" and the
+            # reason is only in a debug log nobody has enabled.
+            if errbox is not None:
+                errbox.append(text)
 
 
 def load_audio(path: str, start_time: float = 0.0,
@@ -517,6 +547,7 @@ def _frames_decord(path: str, start: int, end: int, stride: int = 1,
 
 def _frames_cv2(path: str, start: int, end: int, stride: int = 1,
                 progress=None) -> Optional[np.ndarray]:
+    cap = None
     try:
         import cv2  # type: ignore
         cap = cv2.VideoCapture(path)
@@ -561,13 +592,25 @@ def _frames_cv2(path: str, start: int, end: int, stride: int = 1,
             else:
                 if not cap.grab():
                     break
-        cap.release()
         if out is None or kept == 0:
             return None
         return out[:kept]
     except Exception as e:
         _backend_failed("cv2", e)
         return None
+    finally:
+        # In a finally rather than on the happy path: `progress` raises to
+        # abort the load (that is how "Cancel current run" gets out of a
+        # backend mid-clip, via comfy's InterruptProcessingException — which
+        # derives from BaseException, so the `except` above deliberately does
+        # not catch it). Released only where it is guaranteed to run, so a
+        # cancelled load doesn't strand a decoder and its file handle until
+        # the next garbage collection.
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
 
 
 def _frames_torchvision(path: str, start: int, end: int, stride: int = 1,
@@ -676,7 +719,8 @@ def load_batch(path: str, start: int, end: int, stride: int = 1,
     scale = 65535.0 if probe["bit_depth"] > 8 else 255.0
     images = mask = None
     kept = 0
-    for frame in _iter_ffmpeg_rgba(path, start, end, stride, probe):
+    ffmpeg_err: list = []
+    for frame in _iter_ffmpeg_rgba(path, start, end, stride, probe, ffmpeg_err):
         if kept >= wanted:
             break
         if images is None:
@@ -698,8 +742,10 @@ def load_batch(path: str, start: int, end: int, stride: int = 1,
         report(kept)
 
     if images is None or kept == 0:
+        detail = ("\n" + "\n".join(ffmpeg_err)) if ffmpeg_err else ""
         raise RuntimeError(f"Bat_VideoLoader: ffmpeg decoded no frames from "
-                           f"{path!r} (pixel format {probe['pix_fmt']!r})")
+                           f"{path!r} (pixel format {probe['pix_fmt']!r})"
+                           f"{detail}")
     if kept < wanted:
         # Short clip, or a frame count the container lied about. Keep what
         # arrived rather than handing back a batch padded with empty frames.
@@ -888,7 +934,27 @@ class VideoLoader:
         info = probe_video(path)
         if info is None:
             raise RuntimeError(f"Bat_VideoLoader: no decoder could open {path!r}")
-        n = info["frame_count"]
+        n = int(info.get("frame_count") or 0)
+        if n <= 0:
+            # A container whose frame count nothing could read — OpenCV reports
+            # 0 for some streamed/fragmented sources, and it is the counter of
+            # record whenever decord isn't installed. Left alone this clamps the
+            # whole clip to [0..0] and returns ONE frame, silently: the artist
+            # asks for a 3000-frame plate and gets a still, with nothing in the
+            # log. Derive the count from ffmpeg's duration x rate instead, and
+            # if even that is unreadable say so rather than guessing.
+            probe = probe_ffmpeg(path)
+            if probe and probe["duration"] > 0 and probe["fps"] > 0:
+                n = int(round(probe["duration"] * probe["fps"]))
+                logger.info("[Bat_VideoLoader] %s reports no frame count — "
+                            "using %d from ffmpeg's duration x rate",
+                            os.path.basename(path), n)
+            if n <= 0:
+                raise RuntimeError(
+                    f"Bat_VideoLoader: could not determine the frame count of "
+                    f"{path!r}. The container may be streamed or damaged; "
+                    f"re-wrap it (ffmpeg -i in.ext -c copy out.mov) or install "
+                    f"decord for a more reliable count.")
         start = max(0, min(int(start_frame), n - 1))
         end = int(end_frame)
         if end < 0 or end >= n:
@@ -925,6 +991,9 @@ class VideoLoader:
                            "the frame_rate output falls back to 24",
                            os.path.basename(path))
             source_fps = 24.0
+            # Back into the cache entry, so a re-run of an unchanged graph
+            # doesn't repeat the warning on every execute.
+            entry["fps"] = source_fps
         # The batch is every `stride`-th frame of the source, so it plays at
         # the source rate divided by the stride. Encoding it at the SOURCE rate
         # would run it `stride` times too fast.

@@ -691,11 +691,25 @@ function fetchFrame(node, which) {
     if (which === "start" && st.startImgFrame === frame) return;
     if (which === "end" && st.endImgFrame === frame) return;
 
+    // Same supersede guard fetchVideoInfo uses, for the same reason — an
+    // <img> load can't be aborted, so a thumbnail requested for the previous
+    // clip can still arrive after the artist has typed a new path and paint
+    // the OLD frame onto the NEW file's slider, where it stays until something
+    // else invalidates it. Stamp the request and re-check the path on arrival.
+    //
+    // One counter PER endpoint: fetchVideoInfo fires start and end back to
+    // back, so a single shared counter would have the end request supersede
+    // the start one every time and the start thumbnail would never paint.
+    const pathAtRequest = pathW.value;
+    const seqs = (node._batFrameSeq ||= { start: 0, end: 0 });
+    const seq = (seqs[which] = seqs[which] + 1);
+
     const url = api.apiURL(
-        `${FRAME_ROUTE}?path=${encodeURIComponent(pathW.value)}&frame=${frame}&max_w=320`
+        `${FRAME_ROUTE}?path=${encodeURIComponent(pathAtRequest)}&frame=${frame}&max_w=320`
     );
     const img = new Image();
     img.onload = () => {
+        if (seq !== seqs[which] || pathW.value !== pathAtRequest) return;
         if (which === "start") { st.startImg = img; st.startImgFrame = frame; }
         else                   { st.endImg = img;   st.endImgFrame = frame; }
         node.setDirtyCanvas(true, true);
