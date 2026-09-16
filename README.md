@@ -365,6 +365,50 @@ graph area costs box fills, not text and HTML.
 
 ---
 
+## Run selected output nodes
+
+`Alt`+`Enter` queues **only the selected output nodes** and the nodes feeding
+them, instead of the whole graph. Rebindable under *Settings → Keybinding*,
+and mirrored read-only under *Settings → 🦇 BAT → Hotkeys* so it is findable
+from where the rest of the pack's options live.
+
+The execution half of this is not ours. The frontend has shipped the command
+since 1.19.6 — `Comfy.QueueSelectedOutputNodes`, which is what the ▶ button in
+the selection toolbox and the node menu's *Run branch* both call. It resolves
+the execution path of the selected output nodes and queues the prompt with
+`partialExecutionTargets`, which reaches the server as
+`partial_execution_targets` on `/prompt` and becomes the output set in
+`execution.validate_prompt()`. What core does *not* ship is a keybinding for
+it: the default list binds `Ctrl`+`Enter` to *Queue Prompt*, `Ctrl`+`Shift`+
+`Enter` to *Queue Prompt (Front)* and `Ctrl`+`Alt`+`Enter` to *Interrupt*, and
+leaves the branch command registered but unbound — mouse-only. That gap is
+what `web/bat_hotkeys.js` fills.
+
+It fills it with a *default* keybinding (`registerExtension({ keybindings })`)
+rather than a `keydown` listener of our own, which is what makes it
+configurable for free: core's capture dialog owns rebinding, unsetting,
+conflict warnings and per-user persistence, and core's `keybindHandler` owns
+the bailouts — no firing while a dialog is open, no firing from a text field
+for combos that are text-reserved. A hand-rolled listener would have to
+reimplement all of that, slightly differently.
+
+`Alt`+`Enter` is the one free member of the Enter family, which puts "queue
+this branch" next to its siblings rather than somewhere unrelated. It carries
+a modifier, so like `Ctrl`+`Enter` it still fires from inside a text widget.
+
+The BAT row is deliberately **read-only**. The combo lives in core's keybinding
+store; a second editable copy in the BAT panel would be a second source of
+truth that could disagree with it. It reads the effective binding back out of
+`Comfy.Keybinding.NewBindings` / `UnsetBindings` — the public settings that
+`persistUserKeybindings()` writes that store into — so it shows the shipped
+default, the user's combo after a rebind, or *Not bound* once cleared.
+
+With no output node selected you get core's own "please select output nodes"
+toast. Guessing at the output nodes downstream of the selection, or falling
+back to a full queue, both risk rendering something nobody looked at.
+
+---
+
 ## Shared frontend modules
 
 Four modules under `web/` are shared by the canvas editors rather than
@@ -494,6 +538,7 @@ python tests/verify_exposure_bracket.py
 python tests/verify_rescale.py
 python tests/verify_bypass_switch.py
 python tests/verify_canvas_zoom.py
+python tests/verify_hotkeys.py
 python tests/verify_loader.py
 python tests/verify_fullscreen.py
 python tests/verify_profiler.py
