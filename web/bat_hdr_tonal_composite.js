@@ -36,6 +36,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
 import { batReplayLastExecution } from "./bat_lifecycle.js";
 
@@ -402,12 +403,14 @@ function buildPreview(node) {
     // Pixel probe. The whole node is an argument about values in the extremes,
     // so being able to read one is worth the few lines.
     const probe = document.createElement("div");
-    probe.style.cssText = `position:absolute; right:6px; top:4px; font:10px monospace;
+    probe.style.cssText = `position:absolute; right:110px; top:4px; font:10px monospace;
         color:#cde; background:rgba(0,0,0,0.62); padding:3px 6px; border-radius:3px;
         pointer-events:none; white-space:pre; display:none; line-height:1.45;`;
     stage.appendChild(probe);
 
     root.appendChild(stage);
+    // Picture area — where bat_fullscreen.js hangs its maximise button.
+    stage.dataset.batFsMount = "1";
 
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
@@ -901,9 +904,10 @@ app.registerExtension({
             addResetButton(this, DEFAULTS);
             setTimeout(() => syncVersions(this), 0);
             const el = buildPreview(this);
-            addBatDOMWidget(this, "bat_hdrcomp_preview", "bat_hdrcomp_preview", el, {
+            const editorWidget = addBatDOMWidget(this, "bat_hdrcomp_preview", "bat_hdrcomp_preview", el, {
                 minWidth: 380, height: 460, growable: true,
             });
+            addBatFullscreen(this, editorWidget, el);
             this._batHdrCompWatch?.();
             clampNodeSize(this, 380, 460);
             setTimeout(() => this._batHdrCompRestore?.(), 0);

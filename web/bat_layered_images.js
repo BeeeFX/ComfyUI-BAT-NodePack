@@ -28,6 +28,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
 import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
@@ -188,13 +189,15 @@ function buildEditor(node) {
     stage.appendChild(hint);
 
     const badge = document.createElement("div");
-    badge.style.cssText = `position:absolute; right:6px; top:4px; font:10px monospace;
+    badge.style.cssText = `position:absolute; right:110px; top:4px; font:10px monospace;
         color:#9aa; background:rgba(0,0,0,0.62); padding:2px 6px; border-radius:3px;
         pointer-events:none; white-space:pre; text-align:right; line-height:1.45;
         display:none;`;
     stage.appendChild(badge);
 
     root.appendChild(stage);
+    // Picture area — where bat_fullscreen.js hangs its maximise button.
+    stage.dataset.batFsMount = "1";
 
     const viewRow = document.createElement("div");
     viewRow.style.cssText = `display:flex; flex-wrap:wrap; gap:4px; padding:4px 6px;
@@ -892,9 +895,10 @@ app.registerExtension({
             }
 
             const el = buildEditor(this);
-            addBatDOMWidget(this, "bat_layered_preview", "bat_layered_preview", el, {
+            const editorWidget = addBatDOMWidget(this, "bat_layered_preview", "bat_layered_preview", el, {
                 minWidth: 420, height: 520, growable: true,
             });
+            addBatFullscreen(this, editorWidget, el);
             clampNodeSize(this, 420, 520);
 
             // Deferred: the node is not in the graph yet, and addInput before

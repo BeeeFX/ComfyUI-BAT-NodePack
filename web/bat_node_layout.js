@@ -224,6 +224,13 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
     // editor set in its own cssText (roto / animated_crop rely on theirs),
     // whereas on a re-measure the widget's contract is the newer truth.
     const publishVars = (force) => {
+        // While the editor is maximised its root is out of the widget slot and
+        // sized by the overlay (bat_fullscreen.js). Re-publishing the node's
+        // design height here would put the floor back and stretch the editor
+        // past the bottom of the overlay — and `force` is exactly the caller
+        // that would win. The values are republished on the way out, by the
+        // refreshBatLayout() in exit().
+        if (el.dataset?.batFullscreen === "1") return;
         try {
             // The ceiling is published too. Previously only the pinned case set
             // it, so a growable editor gave the frontend a floor and no ceiling

@@ -48,6 +48,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 import {
     batTrack, isNodeAlive, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay,
 } from "./bat_lifecycle.js";
@@ -336,7 +337,7 @@ function buildViewer(node) {
 
     const badge = document.createElement("div");
     badge.style.cssText = `
-        position:absolute; right:5px; top:4px; padding:1px 5px; border-radius:3px;
+        position:absolute; right:109px; top:4px; padding:1px 5px; border-radius:3px;
         background:#000a; pointer-events:none; letter-spacing:0.04em;
     `;
 
@@ -362,6 +363,8 @@ function buildViewer(node) {
     status.append(resOut, lossOut, viewOut);
 
     root.append(bar, wrap, status);
+    // Picture area — where bat_fullscreen.js hangs its maximise button.
+    wrap.dataset.batFsMount = "1";
 
     /* ---- widget access --------------------------------------------------- */
 
@@ -1319,9 +1322,10 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
             const el = buildViewer(this);
-            addBatDOMWidget(this, "bat_rescale_viewer", "bat_rescale_viewer", el, {
+            const editorWidget = addBatDOMWidget(this, "bat_rescale_viewer", "bat_rescale_viewer", el, {
                 minWidth: 380, height: 460, growable: true,
             });
+            addBatFullscreen(this, editorWidget, el);
             this._batRescaleWatch?.();
             clampNodeSize(this, 380, 520);
             // Deferred: node.id is only final once litegraph has finished

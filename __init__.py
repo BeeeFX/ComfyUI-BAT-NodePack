@@ -26,6 +26,13 @@ backdrops, for making a template someone else can drive. Everything happens in
 ``web/bat_bypass_switch.js``; the Python is a stub whose only job is to declare
 the widget the state serialises into.
 
+2026-09-15: ``web/bat_fullscreen.js`` adds a ⛶ maximise button to the six
+advanced editors (Roto, Animated Crop, Animated Grade, Layered Images, HDR
+Tonal Composite, Rescale). It moves the live editor root into a full-window
+overlay rather than building a second copy, so the fullscreen view IS the node's
+editor. See that file's header for why ``widget.hidden`` is the load-bearing
+part.
+
 2026-09-08: ``web/bat_canvas_zoom.js`` unlocks zooming further out on the graph
 canvas. No node and no Python at all — it lowers litegraph's
 ``canvas.ds.min_scale`` floor from 10% to 5% (adjustable, *Settings → 🦇 BAT →

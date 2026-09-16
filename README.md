@@ -28,6 +28,15 @@ Interactive nodes that draw a live preview on the node itself. All of them
 share the display-zoom / pan, teardown, and layout modules described under
 [Shared frontend modules](#shared-frontend-modules).
 
+The six most involved editors — **Roto**, **Animated Crop**, **Animated
+Grade**, **Layered Images**, **HDR Tonal Composite** and **Rescale** — carry a
+**⛶ Fullscreen** button in the top-right of their picture area that fills the
+ComfyUI window with the editor. It is the *same* editor, moved rather than rebuilt, so
+the undo stack, the decoded frames and every setting carry straight across and
+edits apply to the node immediately. **Esc** leaves it, unless the editor wanted
+that key (Roto's Esc deselects first, and leaves fullscreen on the second
+press); the ✕ in the header always works.
+
 | Display name                  | Category       | What it does |
 |-------------------------------|----------------|---|
 | 🦇 **Crop**                   | `BAT/image`    | Crop an IMAGE batch to a rectangular region, dragged directly on the node. Emits the cropped IMAGE + an Uncrop payload (original-size canvas + crop rect) so the inverse op can recompose without state shared through the graph. `constrain_to_canvas` controls whether the box may extend past the frame edge. |
@@ -425,6 +434,7 @@ python tests/verify_exposure_bracket.py
 python tests/verify_rescale.py
 python tests/verify_bypass_switch.py
 python tests/verify_canvas_zoom.py
+python tests/verify_fullscreen.py
 python tests/verify_profiler.py
 ```
 
@@ -522,6 +532,16 @@ which removes the case rather than papering over it. The divergence is
 instead of quietly passing. (It is a live, if minor, latent bug in Advanced
 Blend's `area` resize_filter when it is enlarging a plate; left alone rather
 than changed under a node this one does not own.)
+
+`verify_fullscreen.py` proves the maximise button gives the editor back
+unharmed. It reproduces frontend 1.49.6's own `mountElementIfVisible` verbatim
+and calls it while the editor is maximised, because the frontend re-appending
+`widget.element` into its wrapper on every visibility change is the one thing
+that breaks this — and it breaks it minutes later, in another node, as "my roto
+editor went blank". It also asserts the root returns to the exact slot it left
+carrying a byte-identical inline style string, and that a forced re-measure
+(which *Layered Images* triggers whenever its layer stack changes) cannot stamp
+the node's design height back onto a full-screen editor.
 
 One thing the exposure test deliberately does not assert: `align="auto"`
 measures the ratio between two passes over the whole frame in the render and

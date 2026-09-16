@@ -24,6 +24,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 import {
     hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
 } from "./bat_hdr_preview.js";
@@ -90,6 +91,8 @@ function buildEditor(node) {
     const canvasWrap = document.createElement("div");
     canvasWrap.style.cssText = "position:relative; flex:1; min-width:0; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden;";
     topRow.appendChild(canvasWrap);
+    // Picture area — where bat_fullscreen.js hangs its maximise button.
+    canvasWrap.dataset.batFsMount = "1";
 
     const canvas = document.createElement("canvas");
     // Aspect-preserving: max-width/max-height pin the canvas inside the
@@ -1037,9 +1040,10 @@ app.registerExtension({
             // Dual-mode sizing: Nodes 2.0 derives node height from
             // computeLayoutSize, so a bare addDOMWidget + this.size left the
             // node and the widget disagreeing (grey band, no resize).
-            addBatDOMWidget(this, "bat_animgrade_editor", "bat_animgrade_editor", el, {
+            const editorWidget = addBatDOMWidget(this, "bat_animgrade_editor", "bat_animgrade_editor", el, {
                 minWidth: 640, height: 580, growable: true,
             });
+            addBatFullscreen(this, editorWidget, el);
             clampNodeSize(this, 640, 580);
             return r;
         };

@@ -29,6 +29,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 
@@ -82,6 +83,8 @@ function buildEditor(node) {
     const canvasWrap = document.createElement("div");
     canvasWrap.style.cssText = "position:relative; flex:1; min-height:0; background:#000;";
     root.appendChild(canvasWrap);
+    // Picture area — where bat_fullscreen.js hangs its maximise button.
+    canvasWrap.dataset.batFsMount = "1";
 
     const canvas = document.createElement("canvas");
     // Out of flow on purpose — see the note in bat_roto.js. In flow, its
@@ -102,7 +105,7 @@ function buildEditor(node) {
 
     const info = document.createElement("div");
     info.style.cssText = `
-        position:absolute; right:8px; top:6px; font:11px monospace;
+        position:absolute; right:112px; top:6px; font:11px monospace;
         color:#cde; background:rgba(0,0,0,0.55); padding:2px 6px;
         border-radius:3px; pointer-events:none;
     `;
@@ -1419,9 +1422,10 @@ app.registerExtension({
             // Dual-mode sizing: Nodes 2.0 derives node height from
             // computeLayoutSize, so a bare addDOMWidget + this.size left the
             // node and the widget disagreeing (grey band, no resize).
-            addBatDOMWidget(this, "bat_animcrop_editor", "bat_animcrop_editor", el, {
+            const editorWidget = addBatDOMWidget(this, "bat_animcrop_editor", "bat_animcrop_editor", el, {
                 minWidth: 560, height: 540, growable: true,
             });
+            addBatFullscreen(this, editorWidget, el);
             clampNodeSize(this, 560, 540);
 
             // When the artist toggles "constrain to canvas" back on, snap

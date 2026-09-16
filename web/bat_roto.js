@@ -39,6 +39,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
@@ -245,6 +246,8 @@ function buildEditor(node) {
     const canvasWrap = document.createElement("div");
     canvasWrap.style.cssText = "position:relative; flex:1; min-width:0; background:#000;";
     topRow.appendChild(canvasWrap);
+    // Picture area — where bat_fullscreen.js hangs its maximise button.
+    canvasWrap.dataset.batFsMount = "1";
 
     const canvas = document.createElement("canvas");
     // Absolutely positioned, NOT in flow, and that's load-bearing under Nodes
@@ -272,7 +275,7 @@ function buildEditor(node) {
     // ── floating help overlay (toggled by the ? button) ──────────────
     const helpOverlay = document.createElement("div");
     helpOverlay.style.cssText = `
-        position:absolute; right:8px; top:6px; max-width:280px;
+        position:absolute; right:112px; top:6px; max-width:280px;
         background:rgba(15,18,24,0.96); border:1px solid #2a2f37;
         border-radius:5px; padding:10px 12px; font:11px sans-serif;
         color:#cde; display:none; line-height:1.6;
@@ -2071,6 +2074,16 @@ function buildEditor(node) {
                     const pts = shapePointsAtCurrent();
                     if (pts && pts.length >= 3) { sh.closed = true; mutated = true; }
                 }
+                // With no shape to close and nothing selected, this press does
+                // nothing — so report it UNHANDLED rather than swallowing it.
+                // bat_fullscreen.js decides whether Escape belongs to the
+                // editor or to the overlay by reading `defaultPrevented`, and
+                // an Escape that is always consumed would trap the artist in
+                // fullscreen with no keyboard way out. Now it reads the way a
+                // pen tool should: Esc deselects, Esc again leaves fullscreen.
+                const hadFocus = state.activeId != null || state.activePoint >= 0
+                    || state.selection.size > 0 || state.kfSelection.size > 0;
+                if (!mutated && !hadFocus) { handled = false; break; }
                 state.activeId = null; state.activePoint = -1;
                 state.selection = new Set();
                 state.kfSelection = new Set();
@@ -3132,9 +3145,10 @@ app.registerExtension({
             // Dual-mode sizing: Nodes 2.0 derives node height from
             // computeLayoutSize, so a bare addDOMWidget + this.size left the
             // node and the widget disagreeing (grey band, no resize).
-            addBatDOMWidget(this, "bat_roto_editor", "bat_roto_editor", el, {
+            const editorWidget = addBatDOMWidget(this, "bat_roto_editor", "bat_roto_editor", el, {
                 minWidth: 640, height: 540, growable: true,
             });
+            addBatFullscreen(this, editorWidget, el);
             clampNodeSize(this, 640, 540);
             return r;
         };
