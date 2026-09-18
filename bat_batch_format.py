@@ -98,7 +98,7 @@ class BatBatchFormat:
                 }),
                 "mode": (["nearest_compatible", "specific_num_frames", "arbitrary_pad"], {
                     "default": "nearest_compatible",
-                    "tooltip": "nearest_compatible = pad to the closest length the selected model accepts. specific_num_frames = pad to exactly target_num_frames. arbitrary_pad = ignore the grid, just add pad_frames at the chosen position.",
+                    "tooltip": "nearest_compatible = add pad_frames, then pad on to the closest length the selected model accepts. specific_num_frames = pad to exactly target_num_frames. arbitrary_pad = ignore the grid, just add pad_frames at the chosen position.",
                 }),
                 "pad_method": (["repeat_edge", "grey_inpaint"], {
                     "default": "repeat_edge",
@@ -113,9 +113,9 @@ class BatBatchFormat:
                 "target_num_frames": ("INT", {"default": 81, "min": 1, "max": 100000, "step": 1,
                                               "tooltip": "Used when mode=specific_num_frames and auto_target_frames is off. Never truncates if shorter than input — crop afterwards if you need exact trimming."}),
                 "pad_frames": ("INT", {"default": 0, "min": 0, "max": 100000, "step": 1,
-                                       "tooltip": "Used when mode=arbitrary_pad. Number of frames to add at the chosen position (preroll if start, postroll if end)."}),
+                                       "tooltip": "Frames to add at the chosen position (preroll if start, postroll if end). In arbitrary_pad this is the exact pad. In nearest_compatible it is a minimum pad applied before the grid snap, so 24 frames + 7 pad on WAN gives 33. Ignored in specific_num_frames."}),
                 "round_up": ("BOOLEAN", {"default": True,
-                                         "tooltip": "Used when mode=nearest_compatible. Pick the smallest valid length >= input length so no input frames get cropped."}),
+                                         "tooltip": "Used when mode=nearest_compatible. Pick the smallest valid length >= input length + pad_frames so nothing gets cropped."}),
                 "grey_value": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
                                          "tooltip": "Grey level for grey_inpaint padded RGB."}),
             },
@@ -204,7 +204,19 @@ class BatBatchFormat:
                 target = int(target_num_frames)
             pad_count = max(0, target - current_frames)
         else:  # nearest_compatible
-            target = _nearest_valid_num_frames(current_frames, stride, offset, minimum, round_up)
+            # pad_frames is added FIRST, then the result is snapped to the
+            # grid: 24 frames + 7 pad on WAN is 31 -> 33, not 25. Ignoring
+            # pad_frames in this mode (the old behaviour) silently dropped the
+            # padding you typed.
+            #
+            # The snap still has the last word, so with round_up off the pad
+            # can come back under what you asked for (31 -> 29, i.e. 5 of your
+            # 7). That is what "nearest" means, and an off-grid length the
+            # model rejects would be worse than two fewer pad frames. Leave
+            # round_up on if the pad count is the thing you care about.
+            extra = max(0, int(pad_frames))
+            target = _nearest_valid_num_frames(
+                current_frames + extra, stride, offset, minimum, round_up)
             pad_count = max(0, target - current_frames)
 
         if pad_count <= 0:

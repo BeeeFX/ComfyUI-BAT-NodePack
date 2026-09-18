@@ -9,6 +9,10 @@
  * `auto_target_frames` itself is only meaningful in "specific_num_frames"
  * mode, so it hides in the other two modes for the same reason.
  *
+ * `pad_frames` is live in both "arbitrary_pad" (exact pad) and
+ * "nearest_compatible" (minimum pad, applied before the grid snap); it is
+ * dead only in "specific_num_frames", where the target sets the length.
+ *
  * Hiding uses the pack's usual approach (type/computeSize/draw/hidden), which
  * removes the row from layout rather than just blanking it — see the `state`
  * widget in bat_animated_grade.js.
@@ -42,11 +46,13 @@ function syncVisibility(node) {
     const mode = node.widgets?.find(w => w.name === "mode");
     const auto = node.widgets?.find(w => w.name === "auto_target_frames");
     const target = node.widgets?.find(w => w.name === "target_num_frames");
+    const pad = node.widgets?.find(w => w.name === "pad_frames");
     if (!mode || !auto || !target) return;
 
     const isSpecific = mode.value === "specific_num_frames";
     setHidden(node, auto, !isSpecific);
     setHidden(node, target, !isSpecific || auto.value === true);
+    setHidden(node, pad, isSpecific);
 
     // Re-fit: the node keeps its old height otherwise, leaving a dead band
     // where the collapsed rows used to be.
