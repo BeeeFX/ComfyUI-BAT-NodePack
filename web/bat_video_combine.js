@@ -10,7 +10,10 @@
  *   - Timeline scrubber with two draggable loop-in/out pins for review.
  *   - Hover-scrub thumbnails (debounced, in-memory cached).
  *   - "Save current frame as PNG" → /bat/video/save_frame endpoint.
- *   - Fullscreen.
+ *   - Fullscreen (F) — maximises the WHOLE player into a BAT overlay, so
+ *     the transport, scrub bar, loop pins and shortcuts all come with it;
+ *     not the browser's native video fullscreen, which keeps only the
+ *     picture. See bat_fullscreen.js.
  *   - Keyboard shortcuts (focus-scoped): Space, ←/→, ,/., Home/End, F, M, Esc.
  *   - View-transform dropdown, EXR sequences only (see below).
  *
@@ -33,6 +36,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { batTrack, batNodeCacheKey, batReplayLastExecution } from "./bat_lifecycle.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
+import { addBatFullscreen } from "./bat_fullscreen.js";
 
 const NODE_TYPE = "Bat_VideoCombine";
 
@@ -1059,10 +1063,19 @@ function buildPlayer(node) {
         thumbVideo.load();
     };
 
-    fullscreenBtn.onclick = () => {
-        if (document.fullscreenElement) document.exitFullscreen();
-        else videoEl.requestFullscreen?.();
-    };
+    // The BAT overlay, not videoEl.requestFullscreen(). Native fullscreen
+    // promotes the <video> ALONE into the browser's top layer, which throws
+    // away everything that makes this a review player: the transport, the
+    // scrub bar and its loop pins, the hover thumbnails, the frame readout,
+    // save-frame, and every keyboard shortcut bound on `root`. You get a big
+    // picture and the browser's own generic controls. Maximising the whole
+    // player keeps the tool intact and just makes it big.
+    //
+    // The toggle is installed from onNodeCreated (the widget it needs does not
+    // exist yet at build time); until then the button is inert rather than
+    // wrong.
+    node._batVCFullscreenBtn = fullscreenBtn;
+    fullscreenBtn.onclick = () => node._batVCToggleFullscreen?.();
 
     // Save the CURRENTLY-DISPLAYED frame as a PNG straight into the
     // browser's Downloads folder. Client-side: draw the visible <video>
@@ -1350,6 +1363,16 @@ function buildPlayer(node) {
             case "f": case "F": fullscreenBtn.click(); break;
             case "m": case "M": if (state.hasAudio) muteBtn.click(); break;
             case "Escape":
+                // Only OURS when there are loop pins to clear. With none set
+                // the press does nothing, and reporting it handled would both
+                // preventDefault and stopPropagation it — so it would never
+                // reach bat_fullscreen.js's window listener and there would be
+                // no keyboard way out of fullscreen. Clearing the pins wins on
+                // the first press; a second one leaves fullscreen.
+                if (state.loopIn == null && state.loopOut == null) {
+                    handled = false;
+                    break;
+                }
                 state.loopIn = state.loopOut = null;
                 inPin.style.display = outPin.style.display = "none";
                 break;
@@ -1641,9 +1664,24 @@ app.registerExtension({
                 // node height comes from computeLayoutSize, so the this.size
                 // assignment below is a no-op there and the player would
                 // otherwise disagree with the node box.
-                addBatDOMWidget(this, "bat_video_player", "bat_video_player", el, {
-                    minWidth: MIN_NODE_W, height: MIN_NODE_H, growable: true,
+                const playerWidget = addBatDOMWidget(
+                    this, "bat_video_player", "bat_video_player", el, {
+                        minWidth: MIN_NODE_W, height: MIN_NODE_H, growable: true,
+                    });
+                // button:false — the transport bar already has a ⛶; this only
+                // supplies the behaviour behind it, and relabels it on the way
+                // in and out. `F` goes through the same button, so it toggles.
+                const fsBtn = this._batVCFullscreenBtn;
+                const fs = addBatFullscreen(this, playerWidget, el, {
+                    button: false,
+                    onEnter: () => {
+                        if (fsBtn) { fsBtn.textContent = "⤡"; fsBtn.title = "Exit fullscreen (F or Esc)"; }
+                    },
+                    onExit: () => {
+                        if (fsBtn) { fsBtn.textContent = "⛶"; fsBtn.title = "Fullscreen (F)"; }
+                    },
                 });
+                this._batVCToggleFullscreen = () => fs?.toggle();
                 // Wider than the default to give the controls + scrubber room.
                 clampNodeSize(this, MIN_NODE_W, MIN_NODE_H);
             } catch (e) {

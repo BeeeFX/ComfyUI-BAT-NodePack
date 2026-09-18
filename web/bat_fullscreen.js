@@ -4,10 +4,12 @@
  * Why
  * ---
  * The advanced editors (Roto, Animated Crop, Animated Grade, Layered Images,
- * HDR Tonal Composite, Rescale) are real tools living inside a node, and a node
- * is a small box on a canvas the artist has to zoom to exactly the right scale
- * before the editor is usable. This adds a ⛶ button in the editor's top-right
- * corner: one click and the SAME editor fills the ComfyUI window.
+ * HDR Tonal Composite, Rescale, Video Combine) are real tools living inside a
+ * node, and a node is a small box on a canvas the artist has to zoom to exactly
+ * the right scale before the editor is usable. This adds a ⛶ button in the
+ * editor's top-right corner: one click and the SAME editor fills the ComfyUI
+ * window. An editor that already HAS a fullscreen control of its own passes
+ * `button: false` and wires the returned toggle() to it — see Video Combine.
  *
  * The editor is moved, not rebuilt. Every bit of state — the roto document, the
  * decoded frames, the undo stack, the worker caches — is held in closures over
@@ -182,50 +184,62 @@ export function addBatFullscreen(node, widget, el, opts = {}) {
 
     ensureStyles();
 
-    const { title = null, mount = null, onEnter = null, onExit = null } = opts;
+    const { title = null, mount = null, button = true,
+            onEnter = null, onExit = null } = opts;
 
-    // Where the ⛶ button hangs. It should be the editor's PICTURE area, so the
-    // control lands in the same place on every node the way a viewer's maximise
-    // button does — not the root, which for rescale starts with a toolbar and
-    // for roto / animated grade is a canvas with a sidebar beside it.
-    //
-    // Resolved from a `data-bat-fs-mount` marker rather than an argument
-    // because every editor builds its DOM in a `buildEditor(node)` that returns
-    // only the root: the canvas wrap is a local in there and is simply not in
-    // scope at the addBatFullscreen() call site in onNodeCreated. A marker is
-    // one line in the builder, next to the element it describes. Falls back to
-    // the root, which is correct for an editor whose picture starts at the top.
-    const host = mount || el.querySelector("[data-bat-fs-mount]") || el;
-    if (getComputedStyle(host).position === "static") {
-        // Absolute positioning would otherwise escape to the nearest positioned
-        // ancestor and put the button somewhere arbitrary.
-        host.style.position = "relative";
+    let btn = null, btnGlyph = null, btnLabel = null;
+
+    // `button: false` for an editor that ALREADY has a fullscreen control of
+    // its own — Video Combine's player has one in its transport bar, and a
+    // second floating pill over the picture would be two controls for one
+    // thing. That caller wires its own button to the returned toggle() and
+    // relabels it from onEnter / onExit.
+    if (button) {
+        // Where the ⛶ button hangs. It should be the editor's PICTURE area, so
+        // the control lands in the same place on every node the way a viewer's
+        // maximise button does — not the root, which for rescale starts with a
+        // toolbar and for roto / animated grade is a canvas with a sidebar
+        // beside it.
+        //
+        // Resolved from a `data-bat-fs-mount` marker rather than an argument
+        // because every editor builds its DOM in a `buildEditor(node)` that
+        // returns only the root: the canvas wrap is a local in there and is
+        // simply not in scope at the addBatFullscreen() call site in
+        // onNodeCreated. A marker is one line in the builder, next to the
+        // element it describes. Falls back to the root, which is correct for an
+        // editor whose picture starts at the top.
+        const host = mount || el.querySelector("[data-bat-fs-mount]") || el;
+        if (getComputedStyle(host).position === "static") {
+            // Absolute positioning would otherwise escape to the nearest
+            // positioned ancestor and put the button somewhere arbitrary.
+            host.style.position = "relative";
+        }
+
+        btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "bat-fs-btn";
+        // Glyph AND word. ⛶ on its own was 22px at 55% opacity over a dark
+        // plate, which is invisible in practice — the control nobody finds may
+        // as well not exist. The label is what makes it findable; the glyph is
+        // what makes it recognisable once you know it's there.
+        btnGlyph = document.createElement("span");
+        btnGlyph.className = "bat-fs-glyph";
+        btnGlyph.textContent = "⛶";
+        btnLabel = document.createElement("span");
+        btnLabel.textContent = "Fullscreen";
+        btn.append(btnGlyph, btnLabel);
+        btn.title = "Fullscreen";
+        btn.setAttribute("aria-label", "Fullscreen");
+        // The editors below read pointer events on their own canvases; none of
+        // this button's belong to them, and litegraph must not see them either.
+        btn.addEventListener("pointerdown", (e) => e.stopPropagation());
+        btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            toggle();
+        });
+        host.appendChild(btn);
     }
-
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "bat-fs-btn";
-    // Glyph AND word. ⛶ on its own was 22px at 55% opacity over a dark plate,
-    // which is invisible in practice — the control nobody finds may as well not
-    // exist. The label is what makes it findable; the glyph is what makes it
-    // recognisable once you know it's there.
-    const btnGlyph = document.createElement("span");
-    btnGlyph.className = "bat-fs-glyph";
-    btnGlyph.textContent = "⛶";
-    const btnLabel = document.createElement("span");
-    btnLabel.textContent = "Fullscreen";
-    btn.append(btnGlyph, btnLabel);
-    btn.title = "Fullscreen";
-    btn.setAttribute("aria-label", "Fullscreen");
-    // The editors below read pointer events on their own canvases; none of this
-    // button's belong to them, and litegraph must not see them either.
-    btn.addEventListener("pointerdown", (e) => e.stopPropagation());
-    btn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        toggle();
-    });
-    host.appendChild(btn);
 
     // Where the root came from, so it goes back exactly there. Captured at
     // enter() rather than now: the frontend has not mounted the element yet
@@ -304,10 +318,12 @@ export function addBatFullscreen(node, widget, el, opts = {}) {
         body.appendChild(el);
         document.body.appendChild(overlay);
 
-        btnGlyph.textContent = "⤡";
-        btnLabel.textContent = "Exit";
-        btn.title = "Exit fullscreen (Esc)";
-        btn.setAttribute("aria-label", "Exit fullscreen");
+        if (btn) {
+            btnGlyph.textContent = "⤡";
+            btnLabel.textContent = "Exit";
+            btn.title = "Exit fullscreen (Esc)";
+            btn.setAttribute("aria-label", "Exit fullscreen");
+        }
 
         // Bubble phase on window, deliberately — it runs AFTER the editor's own
         // keydown handler on the root, so `defaultPrevented` tells us whether
@@ -358,10 +374,12 @@ export function addBatFullscreen(node, widget, el, opts = {}) {
         try { overlay?.remove(); } catch (_) {}
         overlay = null;
 
-        btnGlyph.textContent = "⛶";
-        btnLabel.textContent = "Fullscreen";
-        btn.title = "Fullscreen";
-        btn.setAttribute("aria-label", "Fullscreen");
+        if (btn) {
+            btnGlyph.textContent = "⛶";
+            btnLabel.textContent = "Fullscreen";
+            btn.title = "Fullscreen";
+            btn.setAttribute("aria-label", "Fullscreen");
+        }
 
         if (isNodeAlive(node)) {
             widget.hidden = false;

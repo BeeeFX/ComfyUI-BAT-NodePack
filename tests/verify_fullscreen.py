@@ -367,6 +367,32 @@ def make_ctx():
         return { node: node, root: root, picture: picture,
                  widget: widget, handle: handle, wrapper: wrapper };
     };
+
+    // Video Combine's shape: the player already owns a fullscreen button in
+    // its transport bar, so the helper must add none and hand back a toggle
+    // the caller drives.
+    globalThis.buildNoButton = function () {
+        var node = makeNode("\ud83e\udd87 Video Combine");
+        var root = document.createElement("div");
+        root.style.cssText = "position:relative; display:flex; min-height:240px";
+        var picture = document.createElement("div");
+        picture.dataset.batFsMount = "1";
+        root.appendChild(picture);
+        var widget = addBatDOMWidget(node, "bat_video_player", "bat_video_player", root, {
+            minWidth: 420, height: 300, growable: true,
+        });
+        globalThis.__ownLabel = "Fullscreen";
+        var handle = addBatFullscreen(node, widget, root, {
+            button: false,
+            onEnter: function () { globalThis.__ownLabel = "Exit"; },
+            onExit:  function () { globalThis.__ownLabel = "Fullscreen"; },
+        });
+        var wrapper = document.createElement("div");
+        document.body.appendChild(wrapper);
+        wrapper.appendChild(root);
+        return { node: node, root: root, picture: picture,
+                 widget: widget, handle: handle, wrapper: wrapper };
+    };
     """)
     return ctx
 
@@ -399,6 +425,46 @@ def test_button_mounts_on_picture_area():
     check("re-wiring adds no second button", ctx, "t.picture.children.length", 1)
     check("stylesheet injected once", ctx,
           "document.head.children.filter(function (c) { return c.id === 'bat-fullscreen-style'; }).length", 1)
+
+
+def test_no_button_mode():
+    """Video Combine supplies its own control, so the helper must add none."""
+    print("\nan editor that owns its fullscreen control")
+    ctx = make_ctx()
+    ctx.eval("var t = buildNoButton();")
+    check("no button is added anywhere", ctx,
+          "t.picture.children.length + t.root.children.filter("
+          "function (c) { return c.className === 'bat-fs-btn'; }).length", 0)
+    check("but a toggle is returned", ctx, "typeof t.handle.toggle", "function")
+    ctx.eval("t.handle.toggle();")
+    check("toggle maximises", ctx, "t.widget.hidden", True)
+    check("the caller's own label was updated", ctx, "__ownLabel", "Exit")
+    ctx.eval("t.handle.toggle();")
+    check("toggle restores", ctx, "t.widget.hidden", False)
+    check("and the label went back", ctx, "__ownLabel", "Fullscreen")
+    check("the editor is home", ctx, "t.root.parentNode === t.wrapper", True)
+
+
+def test_video_combine_is_wired():
+    print("\nVideo Combine uses the overlay, not the browser's")
+    src = read("bat_video_combine.js")
+    problems = []
+    if 'from "./bat_fullscreen.js"' not in src:
+        problems.append("no import")
+    if "addBatFullscreen(this, playerWidget, el" not in src:
+        problems.append("not called")
+    if "button: false" not in src:
+        problems.append("would add a second button")
+    # The whole point: the native path must be gone.
+    if "requestFullscreen?.()" in src or "document.exitFullscreen()" in src:
+        problems.append("still calls native fullscreen")
+    if "if (state.loopIn == null && state.loopOut == null)" not in src:
+        problems.append("Escape is still swallowed unconditionally")
+    if problems:
+        FAILURES.append(f"bat_video_combine.js: {', '.join(problems)}")
+        print(f"  FAIL bat_video_combine.js: {', '.join(problems)}")
+    else:
+        print("  ok   bat_video_combine.js")
 
 
 def test_enter_moves_the_editor():
@@ -580,6 +646,8 @@ def test_all_six_are_wired():
 def main():
     print("BAT fullscreen verification")
     test_button_mounts_on_picture_area()
+    test_no_button_mode()
+    test_video_combine_is_wired()
     test_enter_moves_the_editor()
     test_frontend_cannot_steal_element()
     test_exit_restores_everything()
