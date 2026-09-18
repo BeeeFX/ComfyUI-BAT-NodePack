@@ -96,6 +96,182 @@ function mapFromWanFrameFormat(old) {
             targetNumFrames, padFrames, roundUp, greyValue];
 }
 
+
+// ─── Retiring ComfyUI-Easy-Use and comfyui-art-venture (2026-09-17) ─────────
+//
+// Both packs pip-install into the shared venv at node-execution time, and
+// easy-use < 1.4.1 writes files anywhere on disk from `easy saveText`. The
+// studio is removing them, so every node of theirs that was reachable from a
+// workflow needs somewhere to land.
+//
+// Targets are split deliberately. Where core ComfyUI now covers the node, the
+// migration points at the CORE class, not a BAT one — `StringToInt` becomes
+// `ComfyNumberConvert`, the primitives become `Primitive*`. The migration
+// engine only cares about class_type strings, so a target we do not own works
+// exactly the same, and it is one less node for this pack to maintain.
+//
+// Verified against the nine studio workflows in the September audit: of all
+// of these, only `easy showAnything` and `StringToInt` actually appear. The
+// rest are registered so that a workflow nobody has opened yet still has a
+// path forward, but their widget mappings are reasoned from the node
+// definitions rather than observed on a real graph.
+
+const PACK_CORE = "ComfyUI core";
+
+// ─── ComfyUI_QwenVL (alexcong) → ComfyUI-QwenVL (1038lab) ───────────────────
+//
+// Two packs implemented the same model. The studio keeps 1038lab's because its
+// `video` input is a piped IMAGE batch, where alexcong's takes a `video_path`
+// STRING — a file already on disk, which cannot come from a Loader or a VAE
+// decode. So the node that survives is the one that works inside a graph.
+//
+// The two nodes are shaped very differently (9 widgets vs 16), so this needs a
+// real map rather than a pass-through. Target is the *Advanced* node: it is the
+// only one of the pair that carries temperature, max_tokens and seed, all of
+// which the studio workflows set.
+//
+// Prompt handling is the one piece of luck here. 1038lab splits the prompt into
+// `preset_prompt` (a canned dropdown) + `custom_prompt` (free text), and
+// AILab_QwenVL.py:368-370 reads:
+//     prompt = SYSTEM_PROMPTS.get(preset_prompt, preset_prompt)
+//     if custom_prompt and custom_prompt.strip(): prompt = custom_prompt.strip()
+// custom_prompt wins outright when non-empty, so dropping alexcong's single
+// `text` into custom_prompt reproduces the old behaviour exactly, whatever
+// preset_prompt happens to be set to.
+
+const QWEN_TARGET = "AILab_QwenVL_Advanced";
+
+// alexcong "none"/"4bit"/"8bit" -> 1038lab's Quantization enum values.
+const QWEN_QUANT = {
+    "none": "None (FP16)",
+    "4bit": "4-bit (VRAM-friendly)",
+    "8bit": "8-bit (Balanced)",
+};
+
+// Every model alexcong offered that 1038lab also has. SkyCaptioner-V1 is the
+// single one with no equivalent — it is not a Qwen-VL checkpoint at all.
+const QWEN_MODELS = new Set([
+    "Qwen2.5-VL-3B-Instruct", "Qwen2.5-VL-7B-Instruct",
+    "Qwen3-VL-2B-Instruct", "Qwen3-VL-2B-Thinking",
+    "Qwen3-VL-4B-Instruct", "Qwen3-VL-4B-Thinking",
+    "Qwen3-VL-8B-Instruct", "Qwen3-VL-8B-Thinking",
+    "Qwen3-VL-32B-Instruct", "Qwen3-VL-32B-Thinking",
+]);
+const QWEN_MODEL_FALLBACK = "Qwen2.5-VL-7B-Instruct";
+
+// preset_prompt is inert once custom_prompt is set (see above), but it still
+// has to hold a value the combo accepts or the node will not validate.
+const QWEN_PRESET = "🖼️ Detailed Description";
+
+const clamp = (v, lo, hi, dflt) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+};
+
+/**
+ * alexcong Qwen2.5VL widgets:
+ *   0 text, 1 model, 2 quantization, 3 keep_model_loaded, 4 temperature,
+ *   5 max_new_tokens, 6 seed, 7 control_after_generate, 8 video_path
+ *
+ * 1038lab AILab_QwenVL_Advanced widgets:
+ *   0 model_name, 1 quantization, 2 attention_mode, 3 use_torch_compile,
+ *   4 device, 5 preset_prompt, 6 custom_prompt, 7 max_tokens, 8 temperature,
+ *   9 top_p, 10 num_beams, 11 repetition_penalty, 12 frame_count,
+ *   13 keep_model_loaded, 14 seed, 15 control_after_generate
+ */
+function mapFromQwen25VL(old) {
+    const [text, model, quant, keepLoaded, temperature,
+           maxNewTokens, seed, controlAfterGenerate, videoPath] = old || [];
+
+    let modelName = model;
+    if (!QWEN_MODELS.has(model)) {
+        console.warn(
+            `[BAT.Migrations] Qwen2.5VL used model='${model}', which QwenVL ` +
+            `(1038lab) does not provide. Defaulted to '${QWEN_MODEL_FALLBACK}' — ` +
+            `check this node.`
+        );
+        modelName = QWEN_MODEL_FALLBACK;
+    }
+
+    if (videoPath && String(videoPath).trim()) {
+        console.warn(
+            `[BAT.Migrations] Qwen2.5VL had video_path='${videoPath}'. The ` +
+            `replacement takes video as a piped IMAGE batch on its 'video' ` +
+            `input, not a path — wire a loader into it.`
+        );
+    }
+
+    return [
+        modelName,
+        QWEN_QUANT[quant] ?? "None (FP16)",
+        "auto",                                   // attention_mode
+        false,                                    // use_torch_compile
+        "auto",                                   // device
+        QWEN_PRESET,                              // preset_prompt (inert)
+        text ?? "",                               // custom_prompt — wins outright
+        clamp(maxNewTokens, 64, 4096, 512),       // max_tokens
+        // alexcong allowed temperature 0; 1038lab's floor is 0.1.
+        clamp(temperature, 0.1, 1.0, 0.6),
+        0.9,                                      // top_p
+        1,                                        // num_beams
+        1.2,                                      // repetition_penalty
+        16,                                       // frame_count
+        keepLoaded ?? true,
+        // alexcong's seed defaults to -1 ("random"); 1038lab's minimum is 1.
+        clamp(seed, 1, 4294967295, 1),
+        controlAfterGenerate ?? "fixed",
+    ];
+}
+
+/**
+ * Re-wire by input NAME, never by index.
+ *
+ * alexcong's node has `image` at slot 0, but a workflow that converted `seed`
+ * to an input puts it at slot 1 — exactly where 1038lab's `video` input sits.
+ * A positional map would silently land a seed link on the video socket, which
+ * is the kind of failure nobody notices until the captions come back wrong.
+ */
+function qwenInputs(slot, name, oldNode, newNode) {
+    const target = (newNode?.inputs || []).findIndex((i) => i && i.name === name);
+    if (target >= 0) return target;
+    console.warn(
+        `[BAT.Migrations] Qwen2.5VL had a link on '${name}' (slot ${slot}) with ` +
+        `no matching input on ${QWEN_TARGET}. That link is not carried over — ` +
+        `reconnect it by hand.`
+    );
+    return -1;
+}
+
+
+
+// easy-use's two display nodes carry no widgets at all. BAT's equivalents put
+// an `enabled` toggle at index 0, which has to be seeded true — otherwise a
+// migrated readout comes back switched off and silently shows nothing.
+const enableFirst = () => [true];
+
+// Core's PrimitiveInt / PrimitiveFloat declare `control_after_generate`, which
+// the frontend renders as a second widget; easy-use's Int/Float have only
+// `value`. Pad rather than truncate: a trailing extra entry is ignored where
+// the widget does not exist, while a missing one would leave the control
+// unset on a node that does have it.
+const padControl = (old) => [old?.[0], "fixed"];
+
+// easy-use built 20 input slots on `anythingIndexSwitch` but clamped its index
+// widget to 0-9, so only the first ten were ever reachable. Bat_IndexSwitch
+// has exactly those ten. Anything wired beyond slot 9 was unreachable already,
+// but say so rather than dropping it in silence.
+function indexSwitchInputs(slot, name) {
+    if (slot > 9) {
+        console.warn(
+            `[BAT.Migrations] easy anythingIndexSwitch had a link on '${name}' ` +
+            `(slot ${slot}), which its own index widget could never select. ` +
+            `Bat_Index Switch has 10 branches, so that link is not carried over.`
+        );
+    }
+    return slot;
+}
+
 const PACK = "BAT NodePack";
 const MIGRATIONS = [
     { from: "Volt_VideoGridSplit",       to: "Bat_VideoGridSplit",       pack: PACK },
@@ -111,27 +287,56 @@ const MIGRATIONS = [
     { from: "Volt_VideoBatchFormat",     to: "Bat_BatchFormat", pack: PACK, mapWidgetValues: mapFromVideoBatchFormat },
     { from: "Bat_VideoBatchFormat",      to: "Bat_BatchFormat", pack: PACK, mapWidgetValues: mapFromVideoBatchFormat },
     { from: "Bat_WanBatchFrameFormat",   to: "Bat_BatchFormat", pack: PACK, mapWidgetValues: mapFromWanFrameFormat },
+    // ── easy-use → BAT (no core equivalent exists) ──────────────────────
+    { from: "easy showAnything",        to: "Bat_ShowAny",          pack: PACK, mapWidgetValues: enableFirst },
+    { from: "easy showTensorShape",     to: "Bat_ShowTensorShape",  pack: PACK, mapWidgetValues: enableFirst },
+    { from: "easy convertAnything",     to: "Bat_ConvertAny",       pack: PACK },
+    { from: "easy compare",             to: "Bat_Compare",          pack: PACK },
+    { from: "easy lengthAnything",      to: "Bat_ListLength",       pack: PACK },
+    { from: "easy indexAnything",       to: "Bat_ListIndex",        pack: PACK },
+    { from: "easy batchAnything",       to: "Bat_ListBatch",        pack: PACK },
+    { from: "easy anythingIndexSwitch", to: "Bat_IndexSwitch",      pack: PACK, mapInputs: indexSwitchInputs },
+
+    // ── art-venture / easy-use → core ComfyUI ───────────────────────────
+    // StringToInt's lone output is INT. ComfyNumberConvert emits FLOAT on
+    // slot 0 and INT on slot 1, so the output link has to move across.
+    { from: "StringToInt",     to: "ComfyNumberConvert", pack: PACK_CORE, mapOutputs: () => 1 },
+    { from: "StringToNumber",  to: "ComfyNumberConvert", pack: PACK_CORE },
+    { from: "BooleanPrimitive", to: "PrimitiveBoolean",  pack: PACK_CORE },
+    { from: "easy string",     to: "PrimitiveString",    pack: PACK_CORE },
+    { from: "easy boolean",    to: "PrimitiveBoolean",   pack: PACK_CORE },
+    { from: "easy int",        to: "PrimitiveInt",       pack: PACK_CORE, mapWidgetValues: padControl },
+    { from: "easy float",      to: "PrimitiveFloat",     pack: PACK_CORE, mapWidgetValues: padControl },
+    // ── ComfyUI_QwenVL (alexcong) → ComfyUI-QwenVL (1038lab) ────────────
+    { from: "Qwen2.5VL", to: QWEN_TARGET, pack: "ComfyUI-QwenVL (1038lab)",
+      mapWidgetValues: mapFromQwen25VL, mapInputs: qwenInputs },
 ];
 
+/**
+ * Register straight away if ETC_Core's engine is already up; queue otherwise.
+ *
+ * This used to poll for the registry and give up after 20 x 50ms. ETC_Core's
+ * import chain (etc-core.js -> events -> ui -> fetch -> paths -> the migration
+ * engine) can take longer than that second on a cold NFS-served load, and
+ * whenever it did, every migration below was dropped for the whole session --
+ * a workflow full of legacy nodes then opened with no popup at all, which is
+ * indistinguishable from the pack not being installed.
+ *
+ * The queue is drained by etc-node-migration.js as soon as it evaluates, so
+ * load order no longer matters and there is nothing to time out.
+ */
 function registerAll() {
     const reg = window.ETC?.registerNodeMigration;
-    if (typeof reg !== "function") return false;
-    for (const m of MIGRATIONS) reg(m);
-    console.log(`[BAT.Migrations] registered ${MIGRATIONS.length} migrations`);
-    return true;
+    if (typeof reg === "function") {
+        for (const m of MIGRATIONS) reg(m);
+        console.log(`[BAT.Migrations] registered ${MIGRATIONS.length} migrations`);
+        return true;
+    }
+    window.ETC = window.ETC || {};
+    window.ETC.pendingNodeMigrations = window.ETC.pendingNodeMigrations || [];
+    window.ETC.pendingNodeMigrations.push(...MIGRATIONS);
+    console.log(`[BAT.Migrations] ETC registry not up yet; queued ${MIGRATIONS.length} migrations`);
+    return false;
 }
 
-// Try immediately (covers the case where ETC_Core's module ran first).
-if (!registerAll()) {
-    // ETC_Core's etc-node-migration.js hasn't executed yet. Retry on a
-    // microtask, then on a few short timeouts. Module load order between
-    // unrelated extensions isn't guaranteed.
-    console.log("[BAT.Migrations] ETC registry not ready, will retry");
-    let attempts = 0;
-    const tick = () => {
-        if (registerAll()) return;
-        if (++attempts < 20) setTimeout(tick, 50);
-        else console.warn("[BAT.Migrations] ETC_Core never appeared; migrations not registered");
-    };
-    queueMicrotask(tick);
-}
+registerAll();

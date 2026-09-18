@@ -35,12 +35,30 @@ with a scrubber, and no existing workflow changes. Its movie branch imports
 ``bat_video_loader``'s decode stack rather than copying it. Two companion nodes
 (``Bat_ExrLayer``, ``Bat_CryptomatteMatte``) consume the layer outputs.
 
-2026-09-15: ``web/bat_fullscreen.js`` adds a ⛶ maximise button to the six
+2026-09-15: ``web/bat_fullscreen.js`` adds a ⛶ maximise button to the
 advanced editors (Roto, Animated Crop, Animated Grade, Layered Images, HDR
 Tonal Composite, Rescale). It moves the live editor root into a full-window
 overlay rather than building a second copy, so the fullscreen view IS the node's
 editor. See that file's header for why ``widget.hidden`` is the load-bearing
 part.
+
+2026-09-17: ``Bat_VideoCombine`` joins them, driven from the ⛶ already in its
+transport bar rather than a second button (``addBatFullscreen(..., {button:
+false})``). It previously called ``videoEl.requestFullscreen()``, which
+promotes the ``<video>`` alone and discards the transport, scrub bar, loop
+pins, hover thumbnails and every keyboard shortcut.
+
+2026-09-17: ten small utility nodes join the pack so two third-party packs can
+be retired from the studio installs — ``ComfyUI-Easy-Use`` (runtime ``pip
+install`` into the shared venv; an arbitrary-file-write in its ``easy saveText``
+before v1.4.1) and ``comfyui-art-venture`` (same runtime-pip behaviour). Only
+``easy showAnything`` and ``StringToInt`` were actually used in studio
+workflows; the rest of these cover the type/logic gaps that core ComfyUI still
+does not fill, so nobody reaches for those packs again. Where core DOES cover
+it, the migration popup points at the *core* node rather than a BAT one —
+``StringToInt`` goes to ``ComfyNumberConvert``, the primitives go to
+``Primitive*`` — because the cheapest node to maintain is the one we do not
+own. See ``web/bat-migrations.js`` and the CREDITS section of README.md.
 
 2026-09-08: ``web/bat_canvas_zoom.js`` unlocks zooming further out on the graph
 canvas. No node and no Python at all — it lowers litegraph's
@@ -78,6 +96,11 @@ from .bat_framehold import BatFramehold
 from .bat_sec_segmenter import BatSecSegmenter
 from .bat_sec_advanced import BatSecAdvancedParams
 from .bat_bypass_switch import BatBypassSwitch
+from .bat_show import BatShowAny, BatShowTensorShape
+from .bat_convert import BatConvertAny, BatAnyToString, BatNumberToString
+from .bat_logic import (
+    BatCompare, BatIndexSwitch, BatListLength, BatListIndex, BatListBatch,
+)
 
 # ─── Execution profiler ──────────────────────────────────────────────
 # Not a node: a sidebar panel that instruments *every* node in the graph
@@ -130,6 +153,18 @@ NODE_CLASS_MAPPINGS = {
     "Bat_SecSegmenter":         BatSecSegmenter,
     "Bat_SecAdvancedParams":    BatSecAdvancedParams,
     "Bat_BypassSwitch":         BatBypassSwitch,
+
+    # ─── Utility nodes (2026-09-17) ──────────────────────────────────
+    "Bat_ShowAny":              BatShowAny,
+    "Bat_ShowTensorShape":      BatShowTensorShape,
+    "Bat_ConvertAny":           BatConvertAny,
+    "Bat_AnyToString":          BatAnyToString,
+    "Bat_NumberToString":       BatNumberToString,
+    "Bat_Compare":              BatCompare,
+    "Bat_IndexSwitch":          BatIndexSwitch,
+    "Bat_ListLength":           BatListLength,
+    "Bat_ListIndex":            BatListIndex,
+    "Bat_ListBatch":            BatListBatch,
 }
 
 # Display names — bat emoji prefix so the nodes stand out as
@@ -168,6 +203,17 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_SecSegmenter":         "🦇 SeC Segmenter",
     "Bat_SecAdvancedParams":    "🦇 SeC Advanced Params",
     "Bat_BypassSwitch":         "🦇 Bypass Switch",
+
+    "Bat_ShowAny":              "🦇 Show Any",
+    "Bat_ShowTensorShape":      "🦇 Show Tensor Shape",
+    "Bat_ConvertAny":           "🦇 Convert Any",
+    "Bat_AnyToString":          "🦇 Any to String",
+    "Bat_NumberToString":       "🦇 Number to String",
+    "Bat_Compare":              "🦇 Compare",
+    "Bat_IndexSwitch":          "🦇 Index Switch",
+    "Bat_ListLength":           "🦇 List Length",
+    "Bat_ListIndex":            "🦇 List Index",
+    "Bat_ListBatch":            "🦇 List Batch",
 }
 
 WEB_DIRECTORY = "./web"

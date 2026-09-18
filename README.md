@@ -60,14 +60,23 @@ Interactive nodes that draw a live preview on the node itself. All of them
 share the display-zoom / pan, teardown, and layout modules described under
 [Shared frontend modules](#shared-frontend-modules).
 
-The six most involved editors — **Roto**, **Animated Crop**, **Animated
-Grade**, **Layered Images**, **HDR Tonal Composite** and **Rescale** — carry a
+The most involved editors — **Roto**, **Animated Crop**, **Animated Grade**,
+**Layered Images**, **HDR Tonal Composite** and **Rescale** — carry a
 **⛶ Fullscreen** button in the top-right of their picture area that fills the
 ComfyUI window with the editor. It is the *same* editor, moved rather than rebuilt, so
 the undo stack, the decoded frames and every setting carry straight across and
 edits apply to the node immediately. **Esc** leaves it, unless the editor wanted
 that key (Roto's Esc deselects first, and leaves fullscreen on the second
 press); the ✕ in the header always works.
+
+**🦇 Video Combine** uses the same overlay, driven from the **⛶** already in its
+transport bar (or `F`). It used to call the browser's native video fullscreen,
+which promotes the `<video>` element *alone* into the top layer — you got a big
+picture and the browser's generic controls, and lost the transport, the scrub
+bar and its loop pins, the hover thumbnails, the frame readout, save-frame and
+every keyboard shortcut. Maximising the whole player keeps the tool intact and
+just makes it big; the timeline and hover thumbs scale up with it. `Esc` clears
+the loop pins first if any are set, and leaves fullscreen otherwise.
 
 | Display name                  | Category       | What it does |
 |-------------------------------|----------------|---|
@@ -174,6 +183,47 @@ All nodes register under `class_type` keys prefixed `Bat_…`, e.g.
 in the *Add Node* menu.
 
 ---
+
+### Utility, logic & conversion
+
+Small nodes for the plumbing between the big ones — displaying a value,
+converting a type, picking a branch. They exist so a graph doesn't need a
+general-purpose third-party pack installed just to turn a number into a
+padded string.
+
+**Check core first.** ComfyUI now ships `PrimitiveString` / `Int` / `Float` /
+`Boolean`, `ComfyMathExpression`, `ComfyNumberConvert` ("Convert Number",
+which takes INT/FLOAT/STRING/BOOL and emits FLOAT and INT), `ComfySwitchNode`
+(If/Else), the `String*` / `Regex*` family and `PreviewAny`. Everything below
+is something core does *not* cover — nothing here duplicates a core node.
+
+| Display name                 | Category      | What it does |
+|------------------------------|---------------|---|
+| 🦇 **Show Any**              | `BAT/Logic`   | Prints any value on the node face **and passes it through unchanged**, so it can sit inline on a wire — core's `PreviewAny` outputs the *rendering* of its input, not the input, so it cannot. Tensors are summarised (`Tensor(48x1080x1920x3) float32 cuda:0`) rather than dumped. The **enabled** toggle is the interesting part: see *Parked readouts* below. |
+| 🦇 **Show Tensor Shape**     | `BAT/Logic`   | Shape, layout (`batch 48 · 1920x1080 · 3 ch`), dtype, device, value range, mean and memory size — recursing into lists and dicts, so 🦇 Loader's `layers` output can be inspected in one node. Passes the value through and also emits the report as a STRING. |
+| 🦇 **Convert Any**           | `BAT/Convert` | any → STRING / INT / FLOAT / BOOLEAN, picked on the node. Handles the cases `int()` and `bool()` get wrong: `"3.7"` → `3`, and `"false"` / `"0"` / `"no"` → `False` (plain `bool("False")` is `True`). |
+| 🦇 **Any to String**         | `BAT/Convert` | Renders any value as text — `auto` (readable summary), `json`, or `repr` for debugging exact types. Tensors are summarised by shape and range rather than dumped, so a frame batch can't flood the graph. |
+| 🦇 **Number to String**      | `BAT/Convert` | Formats a number as text with zero-padding, fixed precision and affixes: `42` → `0042`, `3` → `v003`, `3.14159` → `3.14`. Padding applies to the integer part only, and a negative keeps its sign outside the zeros (`-0007`). This is the frame-number / version-string node. |
+| 🦇 **Compare**               | `BAT/Logic`   | Two values and an operator → BOOLEAN, for driving a switch off a frame count or a resolution. Core only compares strings. Twelve operators, including the four zero-comparisons (`a > 0`, `a <= 0`, `b > 0`, `b <= 0`) carried over so migrated nodes keep their setting. |
+| 🦇 **Index Switch**          | `BAT/Logic`   | Pass through one of **ten** inputs, chosen by an integer. Core's switch is binary, so choosing between five loaders otherwise takes four chained If/Else nodes. The inputs are **lazy**: the branches you didn't select are never executed, not executed-and-discarded. |
+| 🦇 **List Length**           | `BAT/Logic`   | Item count of a batch, list or string. An image batch reports its frame count. |
+| 🦇 **List Index**            | `BAT/Logic`   | Item N of a batch or list; negative counts from the end. An image batch **keeps its batch dimension**, so the result is still a valid IMAGE. |
+| 🦇 **List Batch**            | `BAT/Logic`   | Joins two batches or lists. Image batches concatenate along frames and must agree on resolution and channel count — mismatches name both shapes rather than failing deep inside torch. |
+
+**Parked readouts, and why the toggle matters.** A display node has to be an
+`OUTPUT_NODE`, or a dead-end readout would never execute at all. But output
+nodes are *unconditional execution roots*: the executor adds every one to the
+run, so a branch feeding only a readout can never be skipped. Leave eight
+debug readouts in a production template and eight branches are pinned into
+every queue whether anyone is reading them or not.
+
+`OUTPUT_NODE` is read off the class by `execution.py`, so it cannot be varied
+per node instance. What can be varied is whether the input is ever *asked*
+for — so the `value` input is declared `lazy` and `check_lazy_status` requests
+it only while **enabled** is on. Switch a readout off and its upstream branch
+is genuinely not evaluated. The cost is that the passthrough emits `None`
+while it's off, which is why it defaults to on: turn it off on readouts whose
+output feeds nothing, which is what a readout usually is.
 
 ## Video formats
 
@@ -542,7 +592,17 @@ python tests/verify_hotkeys.py
 python tests/verify_loader.py
 python tests/verify_fullscreen.py
 python tests/verify_profiler.py
+python tests/verify_utility_nodes.py
 ```
+
+`verify_utility_nodes.py` is the odd one out: the utility nodes have no live
+preview to diff, so what it guards is the *migration*. Those mappings rewrite
+someone's workflow in place, and a wrong widget index or output slot changes
+what the graph computes without any visible error — so it checks the cases
+that would be silent, chiefly that `StringToInt` lands on `ComfyNumberConvert`'s
+INT output rather than its FLOAT one, that every one of `easy compare`'s
+operators still exists here, and that the display nodes' `enabled` toggle still
+stops `check_lazy_status` from requesting its input.
 
 The profiler is verified in two layers. `verify_profiler.py` covers the pieces
 in isolation — the payload walker (including that it retains no references to
@@ -713,6 +773,68 @@ in by hand.
 For fresh installs (the vast majority of public users) none of this
 matters — just install and add nodes as usual.
 
+
+### Migrating off ComfyUI-Easy-Use, comfyui-art-venture and ComfyUI_QwenVL
+
+Both packs `pip install` into the running venv at node-execution time, which
+silently rewrites a shared environment mid-job; easy-use before v1.4.1 also
+writes files to any path from `easy saveText`. Workflows that use their
+utility nodes are handled by the usual migration popup — open the workflow and
+accept the replacement.
+
+Where **core ComfyUI** covers the node, the popup points at the core class
+rather than a BAT one, because the cheapest node to maintain is the one
+nobody has to maintain:
+
+| Legacy node | Replaced by | Note |
+|---|---|---|
+| `easy showAnything` | 🦇 Show Any | arrives enabled |
+| `easy showTensorShape` | 🦇 Show Tensor Shape | arrives enabled |
+| `easy convertAnything` | 🦇 Convert Any | |
+| `easy compare` | 🦇 Compare | all ten operators preserved |
+| `easy lengthAnything` / `indexAnything` / `batchAnything` | 🦇 List Length / Index / Batch | |
+| `easy anythingIndexSwitch` | 🦇 Index Switch | ten branches, matching the old index range |
+| `StringToInt` | `ComfyNumberConvert` (core) | the output link moves to the INT slot |
+| `StringToNumber` | `ComfyNumberConvert` (core) | |
+| `easy string` / `int` / `float` / `boolean`, `BooleanPrimitive` | `PrimitiveString` / `Int` / `Float` / `Boolean` (core) | |
+| `Qwen2.5VL` (alexcong) | `AILab_QwenVL_Advanced` (1038lab) | 9 widgets → 16; see below |
+
+**The QwenVL consolidation.** Two packs implemented the same model and both
+ended up in studio workflows. The one kept is **1038lab's ComfyUI-QwenVL**,
+because its `video` input is a piped IMAGE batch — alexcong's takes a
+`video_path` string, a file that must already be on disk, so video can never
+come from a Loader or a VAE decode inside the graph.
+
+The migration targets the **Advanced** node, the only one of the pair carrying
+`temperature`, `max_tokens` and `seed`. Three things make it more than a
+rename:
+
+- **The prompt.** 1038lab splits it into `preset_prompt` (a dropdown) and
+  `custom_prompt` (free text), and `custom_prompt` wins outright when non-empty
+  (`AILab_QwenVL.py:368-370`). alexcong's single `text` therefore goes into
+  `custom_prompt` and reproduces the old behaviour exactly, whatever the preset
+  is set to.
+- **Ranges differ.** alexcong allowed `temperature` down to 0 and used
+  `seed = -1` for "random"; 1038lab's floors are 0.1 and 1. Both are clamped
+  rather than passed through, since an out-of-range widget value fails
+  validation on the new node.
+- **Inputs are mapped by name, never by index.** alexcong's node has `image` at
+  slot 0, but a workflow that converted `seed` to an input puts it at slot 1 —
+  which is exactly where the target's `video` socket sits. A positional map
+  would wire a seed into the video input, and nothing would look wrong until
+  the captions came back wrong. Unmatched inputs are refused with a warning
+  instead of being guessed.
+
+`SkyCaptioner-V1` is the one model with no equivalent (it is not a Qwen-VL
+checkpoint); it falls back to `Qwen2.5-VL-7B-Instruct` with a console warning.
+A set `video_path` also warns, since that value cannot carry across.
+
+Only `easy showAnything`, `StringToInt` and `Qwen2.5VL` were found in real
+studio workflows; the rest are registered so a workflow nobody has opened yet still
+has a path forward, and their mappings are reasoned from the node definitions
+rather than observed on a live graph. `tests/verify_utility_nodes.py` covers
+the ones that would corrupt a graph if they regressed.
+
 ### Removed nodes
 
 **🦇 VRI Frame Picker** (`Bat_VriPicker`) has been removed. It was tied to
@@ -723,6 +845,40 @@ contact-sheet UI, but driven by an ordinary filesystem path or `####`
 sequence pattern, so it works on any machine.
 
 ---
+
+## Credits
+
+The utility, logic and conversion nodes were built so this pack could replace
+two third-party packs in our installs. Several of them follow the *shape* of
+nodes in those packs — the same job, comparable inputs, and in one case the
+same operator labels — so that existing workflows migrate without changing
+what they compute. Credit where it's due:
+
+- **[ComfyUI-Easy-Use](https://github.com/yolain/ComfyUI-Easy-Use)** by
+  [yolain](https://github.com/yolain) — the originals behind 🦇 Show Any
+  (`easy showAnything`), 🦇 Show Tensor Shape (`easy showTensorShape`),
+  🦇 Convert Any (`easy convertAnything`), 🦇 Compare (`easy compare`),
+  🦇 Index Switch (`easy anythingIndexSwitch`) and the three list nodes
+  (`easy lengthAnything` / `indexAnything` / `batchAnything`).
+- **[comfyui-art-venture](https://github.com/sipherxyz/comfyui-art-venture)**
+  by [sipherxyz](https://github.com/sipherxyz) — `StringToInt` /
+  `StringToNumber`, which prompted the conversion nodes here (both now migrate
+  to core's `ComfyNumberConvert`).
+- **[rgthree-comfy](https://github.com/rgthree/rgthree-comfy)** by
+  [rgthree](https://github.com/rgthree) — `display_any`, the ancestor of both
+  core ComfyUI's `PreviewAny` and every "show me this value" node since.
+
+**On licensing.** ComfyUI-Easy-Use is **GPL-3.0**; this pack is MIT. No code
+was copied from it, and none of these nodes is a derivative work of it — each
+was written from scratch against the public node signature (inputs, outputs,
+widget order) so that migration is lossless. The only text carried across
+verbatim is `🦇 Compare`'s ten operator labels (`"a == b"`, `"a > 0"`, …),
+which are interface identifiers a migrated widget value has to match exactly
+in order to keep meaning. If you would rather not have even that, the labels
+can be renamed and the migration given a value map instead.
+
+comfyui-art-venture ships no LICENSE file in the version we had installed, so
+its terms are unstated; nothing was taken from it either way.
 
 ## Author
 
