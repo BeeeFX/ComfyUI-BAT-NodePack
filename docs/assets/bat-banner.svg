@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 440" role="img" aria-labelledby="title desc">
+  <title id="title">BAT banner proposal: calibration plate</title>
+  <desc id="desc">Warm light banner inspired by VFX test plates, with crop marks, colour chips, and a checkerboard target.</desc>
+  <defs><pattern id="check" width="40" height="40" patternUnits="userSpaceOnUse"><rect width="40" height="40" fill="#e4eae6"/><rect width="20" height="20" fill="#cbd8d2"/><rect x="20" y="20" width="20" height="20" fill="#cbd8d2"/></pattern></defs>
+  <rect width="1440" height="440" rx="24" fill="#eff4ee"/>
+  <rect x="28" y="28" width="1384" height="384" rx="12" fill="none" stroke="#9db2a9" stroke-width="2"/>
+  <path d="M48 80h38 M67 61v38 M1354 80h38 M1373 61v38 M48 360h38 M67 341v38 M1354 360h38 M1373 341v38" stroke="#205247" stroke-width="3"/>
+  <text x="88" y="93" fill="#497165" font-family="Consolas, monospace" font-size="20" letter-spacing="3">BEEEFX  /  VFX TOOLKIT  /  COMFYUI</text>
+  <text x="78" y="261" fill="#123c37" font-family="Arial, Helvetica, sans-serif" font-size="165" font-weight="800" letter-spacing="-12">BAT</text>
+  <text x="92" y="316" fill="#215b50" font-family="Arial, Helvetica, sans-serif" font-size="31" font-weight="700">Video, animation &amp; compositing</text>
+  <rect x="91" y="342" width="84" height="15" fill="#cf7976"/><rect x="175" y="342" width="84" height="15" fill="#e9ba72"/><rect x="259" y="342" width="84" height="15" fill="#a1c9bc"/><rect x="343" y="342" width="84" height="15" fill="#5b8a9b"/><rect x="427" y="342" width="84" height="15" fill="#182a36"/>
+  <rect x="772" y="84" width="560" height="274" rx="8" fill="url(#check)" stroke="#447c71" stroke-width="3"/>
+  <rect x="822" y="120" width="460" height="202" rx="2" fill="none" stroke="#215b50" stroke-width="3" stroke-dasharray="12 10"/>
+  <circle cx="1052" cy="221" r="72" fill="none" stroke="#215b50" stroke-width="3"/>
+  <path d="M1052 132v178 M963 221h178" stroke="#215b50" stroke-width="3"/>
+  <circle cx="1052" cy="221" r="6" fill="#cf7976"/>
+  <rect x="832" y="131" width="124" height="29" rx="3" fill="#eff4ee"/>
+  <text x="842" y="152" fill="#215b50" font-family="Consolas, monospace" font-size="17">PLATE / 01</text>
+  <text x="1166" y="344" fill="#215b50" font-family="Consolas, monospace" font-size="17">1920 × 1080</text>
+</svg>
