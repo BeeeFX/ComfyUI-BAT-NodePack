@@ -4,29 +4,29 @@
 
 # 🦇 ComfyUI-BAT-NodePack
 
-BAT brings media loading, video tools, keyframe animation, and familiar compositing controls into your node graph. Bring in a clip or layered EXR, animate a crop, draw a mask, balance a grade, or blend an upscale back into your original footage—with interactive previews right on the nodes.
+BAT is a ComfyUI node pack for loading and exporting media, keyframed image adjustments, masks, and compositing. Several nodes have interactive previews and editors directly on the graph.
 
-These are the tools I use in my own workflows. I'm **BeeeFX**, and I'm sharing them in case they make your next shot a little easier too.
+I'm **BeeeFX**. I built these nodes for my own ComfyUI workflows and share them here.
 
 **43 nodes · Interactive editors · BAT Profiler · MIT-licensed BAT code**
 
-[Highlights](#highlights) · [All nodes](#all-nodes) · [Install](#install) · [Try it](#try-it) · [Help](#help)
+[Highlights](#highlights) · [All nodes](#all-nodes) · [Install](#install) · [Example workflows](#example-workflows) · [Help](#help)
 
 ## Highlights
 
-### Start with the media you have.
+### Loader and EXR inputs
 
 **Loader** brings stills, numbered image sequences, folders of images, and movies into one node. Enter a path, then skip frames, sample every *n*th frame, or cap the batch. Movie audio and source alpha are available when present.
 
 For a **layered EXR**, Loader can also hand off its passes and Cryptomatte data. Use **EXR Layer** to pick a named pass, or connect **Points Editor → Cryptomatte Matte** to click on objects and build a mask. EXR support needs the optional `OpenImageIO` package; see [installation](#install).
 
-Prefer to choose a movie's in and out points by eye? Use the dedicated **Video Loader** below. It sits alongside Loader and offers a visual trim slider and player.
+The separate **Video Loader** provides a visual trim slider and in-node player for choosing a movie's in and out points.
 
-### Bring your footage in. Send the finished shot out.
+### Video loading and export
 
-**Video Loader + Video Combine** bookend your video workflow. Load a clip, scrub through it, and choose your in/out range with a visual trim control. Audio follows the trim, and sources with transparency can supply a mask.
+**Video Loader** reads clips and lets you scrub and trim them visually. Audio follows the trim, and sources with transparency can supply a mask.
 
-When you're ready, export video, GIF, WebP, or an image sequence. Video Combine includes an inline player you can maximise, frame stepping, and a save-frame-as-PNG option for reviewing the result.
+**Video Combine** exports video, GIF, WebP, or an image sequence. It includes an inline player you can maximise, frame stepping, and a save-frame-as-PNG option for reviewing the result.
 
 **Export choices:** H.264 · H.265 · VP9 · FFV1 · ProRes · GIF · WebP · EXR · PNG. Playback in the inline player depends on the browser and format.
 
@@ -34,7 +34,7 @@ When you're ready, export video, GIF, WebP, or an image sequence. Video Combine 
 
 *Trim a clip in Video Loader, then review the export in Video Combine.*
 
-### Animate the adjustment, frame by frame.
+### Keyframed adjustments and masks
 
 **Animated Crop, Animated Grade, and Roto** let you set keyframes directly in the node. Follow a subject with a moving crop, change the look over time, or draw and animate Bézier mask shapes.
 
@@ -48,9 +48,9 @@ Pair **Animated Crop** with **Uncrop** to work on a moving region, then put the 
 
 *Draw an animated Roto mask, use it for a selective grade, and preview the result in Video Combine.*
 
-### A little compositing room inside your graph.
+### Compositing nodes
 
-If you work in Nuke or another compositor, these tools should feel familiar:
+These nodes use controls and concepts familiar from Nuke and other compositors:
 
 - **Grade:** balance blackpoint, lift, gain, and gamma with a live preview.
 - **Advanced Blend:** mix two images, or control their tone and fine detail separately—useful for dialling back an upscale's sharpening.
@@ -59,23 +59,23 @@ If you work in Nuke or another compositor, these tools should feel familiar:
 - **HDR tools:** prepare exposure brackets, merge reconstructed passes, and blend recovered shadow/highlight information into a shot.
 - **EXR Layer + Cryptomatte Matte:** pull passes and object masks from a layered EXR loaded by BAT.
 
-### Point to an object. Get a tracked mask.
+### SeC object segmentation
 
 **SeC Segmenter** combines an on-node points editor with video object segmentation. Mark what to include or exclude, or draw a bounding box, then generate masks through the clip. Review them as an overlay before using them downstream.
 
-Start with the segmenter's defaults. Add **SeC Advanced Params** when you want to choose the model, tracking direction, or memory settings. **SeC needs extra dependencies and model weights**—see [SeC setup](#sec-setup).
+**SeC Advanced Params** exposes the model, tracking direction, and memory settings. **SeC needs extra dependencies and model weights**; see [SeC setup](#sec-setup).
 
-### Find where your workflow spends time and memory.
+### Profiler
 
 **BAT Profiler** lives in the sidebar and works across your graph, including nodes from other packs. Enable recording, run your workflow, then sort nodes by time, RAM, or VRAM and click a result to jump to that node.
 
 Live memory charts show usage against your machine's capacity. Saved run history and **Copy report** help investigate slow runs or crashes, including the node that was running when a connection was lost. A lost run is a clue to investigate, not proof of an out-of-memory error.
 
-### Still working with WAN VACE 2.1? This one's for you.
+### VACE Batch Tool for WAN VACE 2.1
 
-**VACE Batch Tool** is one of my most-used nodes. Assemble images and masks at chosen frame positions, add or remove keyframe inputs, and build the input batch for a WAN VACE 2.1 workflow in one place.
+**VACE Batch Tool** is one of the nodes I use most often. It assembles images and masks at chosen frame positions and lets you add or remove keyframe inputs for a WAN VACE 2.1 batch.
 
-It's a specialised helper for that workflow, with fill colour and premultiplication controls when you need them.
+It also provides fill colour and premultiplication controls.
 
 ## All nodes
 
@@ -215,11 +215,11 @@ SeC is optional: the other BAT nodes can load without its extra packages or mode
 
 To control this, connect **SeC Advanced Params** and turn off `auto_download` before running. SeC uses CUDA when available; CPU inference is very slow. Model weights and dependencies are separate from the lightweight editing tools in the pack.
 
-## Try it
+## Example workflows
 
-These are small starting ideas to build in your own graph:
+Some starting node chains:
 
-| I want to… | Start here |
+| Goal | Nodes |
 | --- | --- |
 | **Trim and export a clip** | Video Loader → Video Combine. Connect the images, frame rate, and audio if needed. |
 | **Load a layered EXR pass** | Loader → EXR Layer → your processing nodes. Run once, then choose the pass from EXR Layer's list. |
@@ -233,14 +233,14 @@ These are small starting ideas to build in your own graph:
 ## Help
 
 <details>
-<summary><strong>Installed, but can't find the nodes?</strong></summary>
+<summary><strong>Nodes missing after install</strong></summary>
 
 Check that the pack is in the active installation's `custom_nodes` folder, restart ComfyUI, and reload the interface. Look at the startup log for a BAT import error. For SeC, install requirements in ComfyUI's own environment rather than an unrelated system Python.
 
 </details>
 
 <details>
-<summary><strong>Opening an older BAT or Volt workflow?</strong></summary>
+<summary><strong>Older BAT or Volt workflows</strong></summary>
 
 **Batch Format** replaces the former **Video Batch Format** and **WAN Batch Frame Format** nodes. **Batch Crop** is the current display name of **WAN Batch Crop**. **BAT Frame Picker** replaces the old studio-specific **VRI Frame Picker**.
 
@@ -248,12 +248,12 @@ Legacy `Volt_*` workflows have a migration shim for a separate ETC migration too
 
 </details>
 
-Found a problem or have a suggestion? [Open an issue](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/issues) with the node name, what you expected, and what happened. A small example workflow or screenshot helps. For performance problems, BAT Profiler's **Copy report** is a useful starting point.
+For bugs or suggestions, [open an issue](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/issues) with the node name, what you expected, and what happened. A small example workflow or screenshot helps. For performance problems, BAT Profiler's **Copy report** is a useful starting point.
 
-Looking for implementation details? The [technical notes archive](docs/technical-notes.md) preserves the previous README's deeper explanations and development history.
+The [technical notes archive](docs/technical-notes.md) preserves the previous README's deeper explanations and development history.
 
 ---
 
-Made by [BeeeFX](https://github.com/BeeeFX). Personal tools, shared for your workflows.
+Made by [BeeeFX](https://github.com/BeeeFX).
 
 BAT code is [MIT licensed](LICENSE). The bundled SeC stack has separate [third-party attribution and licensing](bat_sec/NOTICE.md); model weights are downloaded separately.
