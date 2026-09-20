@@ -40,13 +40,13 @@ When you're ready, export video, GIF, WebP, or an image sequence. Video Combine 
 
 Pair **Animated Crop** with **Uncrop** to work on a moving region, then put the processed result back into the original shot. Uncrop follows the saved crop positions and offers edge feathering to soften the join.
 
-![Animated Crop and Animated Grade with keyframes visible in their on-node timelines](docs/assets/bat-animated-crop-grade.png)
+![Full workflow connecting Loader, Animated Crop, Animated Grade, Uncrop, and Video Combine](docs/assets/bat-animated-crop-grade.png)
 
-*Move the crop and change the grade over time with keyframes right on the nodes.*
+*Keyframe a crop and grade, then place the result back in the original frame with Uncrop.*
 
-![BAT Roto shape connected to Animated Grade for a selective adjustment](docs/assets/bat-roto-masked-grade.png)
+![Full workflow connecting Loader, Roto, Animated Grade, and Video Combine](docs/assets/bat-roto-masked-grade.png)
 
-*Draw an animated Roto mask and use it to limit a grade to part of the shot.*
+*Draw an animated Roto mask, use it for a selective grade, and preview the result in Video Combine.*
 
 ### A little compositing room inside your graph.
 
