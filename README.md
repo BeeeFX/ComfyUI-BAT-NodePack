@@ -4,82 +4,55 @@
 
 # 🦇 ComfyUI-BAT-NodePack
 
-BAT is a ComfyUI node pack for loading and exporting media, keyframed image adjustments, masks, and compositing. Several nodes have interactive previews and editors directly on the graph.
+BAT is my ComfyUI node pack for video, animation, masking, and compositing. Many nodes have previews and editors directly on the graph.
 
-I'm **BeeeFX**. I built these nodes for my own ComfyUI workflows and share them here.
-
-**43 nodes · Interactive editors · BAT Profiler · MIT-licensed BAT code**
+**43 nodes · On-node editors · BAT Profiler**
 
 [Highlights](#highlights) · [All nodes](#all-nodes) · [Install](#install) · [Example workflows](#example-workflows) · [Help](#help)
 
 ## Highlights
 
-### Loader and EXR inputs
+### Load and export
 
-**Loader** brings stills, numbered image sequences, folders of images, and movies into one node. Enter a path, then skip frames, sample every *n*th frame, or cap the batch. Movie audio and source alpha are available when present.
+**Loader** reads stills, sequences, folders, movies, and layered EXRs. **Video Loader** offers visual trimming. **Video Combine** exports video, GIF, WebP, or image sequences.
 
-For a **layered EXR**, Loader can also hand off its passes and Cryptomatte data. Use **EXR Layer** to pick a named pass, or connect **Points Editor → Cryptomatte Matte** to click on objects and build a mask. EXR support needs the optional `OpenImageIO` package; see [installation](#install).
-
-The separate **Video Loader** provides a visual trim slider and in-node player for choosing a movie's in and out points.
-
-### Video loading and export
-
-**Video Loader** reads clips and lets you scrub and trim them visually. Audio follows the trim, and sources with transparency can supply a mask.
-
-**Video Combine** exports video, GIF, WebP, or an image sequence. It includes an inline player you can maximise, frame stepping, and a save-frame-as-PNG option for reviewing the result.
-
-**Export choices:** H.264 · H.265 · VP9 · FFV1 · ProRes · GIF · WebP · EXR · PNG. Playback in the inline player depends on the browser and format.
+For EXRs, **EXR Layer** selects passes and **Cryptomatte Matte** builds masks from clicked points. Audio and alpha are available where the source supports them.
 
 ![BAT Video Loader and Video Combine showing trim controls and an inline video preview](docs/assets/bat-video-loader-combine.png)
 
-*Trim a clip in Video Loader, then review the export in Video Combine.*
+*Video Loader → Video Combine.*
 
 ### Keyframed adjustments and masks
 
-**Animated Crop, Animated Grade, and Roto** let you set keyframes directly in the node. Follow a subject with a moving crop, change the look over time, or draw and animate Bézier mask shapes.
-
-Pair **Animated Crop** with **Uncrop** to work on a moving region, then put the processed result back into the original shot. Uncrop follows the saved crop positions and offers edge feathering to soften the join.
+**Animated Crop**, **Animated Grade**, and **Roto** put keyframes on the node. **Uncrop** places a processed crop back into its source frame.
 
 ![Full workflow connecting Loader, Animated Crop, Animated Grade, Uncrop, and Video Combine](docs/assets/bat-animated-crop-grade.png)
 
-*Keyframe a crop and grade, then place the result back in the original frame with Uncrop.*
+*Animated Crop → Animated Grade → Uncrop.*
 
 ![Full workflow connecting Loader, Roto, Animated Grade, and Video Combine](docs/assets/bat-roto-masked-grade.png)
 
-*Draw an animated Roto mask, use it for a selective grade, and preview the result in Video Combine.*
+*Roto mask → Animated Grade.*
 
 ### Compositing nodes
 
-These nodes use controls and concepts familiar from Nuke and other compositors:
-
-- **Grade:** balance blackpoint, lift, gain, and gamma with a live preview.
-- **Advanced Blend:** mix two images, or control their tone and fine detail separately—useful for dialling back an upscale's sharpening.
-- **Layered Images:** stack up to eight images with blend modes, opacity, and masks.
-- **Rescale:** compare detail at a fixed viewing size while choosing your working resolution.
-- **HDR tools:** prepare exposure brackets, merge reconstructed passes, and blend recovered shadow/highlight information into a shot.
-- **EXR Layer + Cryptomatte Matte:** pull passes and object masks from a layered EXR loaded by BAT.
+**Grade**, **Advanced Blend**, **Layered Images**, and **Rescale** cover common compositing tasks. The HDR nodes handle exposure-bracket reconstruction and tonal blending.
 
 ### SeC object segmentation
 
-**SeC Segmenter** combines an on-node points editor with video object segmentation. Mark what to include or exclude, or draw a bounding box, then generate masks through the clip. Review them as an overlay before using them downstream.
-
-**SeC Advanced Params** exposes the model, tracking direction, and memory settings. **SeC needs extra dependencies and model weights**; see [SeC setup](#sec-setup).
+**SeC Segmenter** tracks an object mask through a clip from points or a box. It needs [extra setup](#optional-features).
 
 ### Profiler
 
-**BAT Profiler** lives in the sidebar and works across your graph, including nodes from other packs. Enable recording, run your workflow, then sort nodes by time, RAM, or VRAM and click a result to jump to that node.
-
-Live memory charts show usage against your machine's capacity. Saved run history and **Copy report** help investigate slow runs or crashes, including the node that was running when a connection was lost. A lost run is a clue to investigate, not proof of an out-of-memory error.
+**BAT Profiler** shows per-node time, RAM, and VRAM in the sidebar. It records run history and can copy a report.
 
 ### VACE Batch Tool for WAN VACE 2.1
 
-**VACE Batch Tool** is one of the nodes I use most often. It assembles images and masks at chosen frame positions and lets you add or remove keyframe inputs for a WAN VACE 2.1 batch.
-
-It also provides fill colour and premultiplication controls.
+**VACE Batch Tool** places image and mask keyframes into a WAN VACE 2.1 batch, with fill and premultiplication controls.
 
 ## All nodes
 
-Names below match the Add Node menu, with the 🦇 prefix omitted for readability. Browse the **BAT** categories or search for a node by name.
+Names match the Add Node menu; the 🦇 prefix is omitted here.
 
 [Loading](#loading-media) · [Video](#video-and-frames) · [Animation](#crop-animation-and-masks) · [Compositing](#colour-and-compositing) · [SeC](#sec-masking) · [WAN / VACE](#wan-and-vace) · [Helpers](#workflow-helpers) · [Graph utilities](#graph-utilities)
 
@@ -87,170 +60,143 @@ Names below match the Add Node menu, with the 🦇 prefix omitted for readabilit
 
 | Node | Use it to… |
 | --- | --- |
-| **Loader** | Open a still, numbered sequence, image folder, or movie; get EXR layers and Cryptomatte data when available. |
-| **EXR Layer** | Choose a named pass from Loader's layered EXR output. |
-| **Cryptomatte Matte** | Use clicked points to turn EXR object IDs into a mask. |
-
-Loader handles frame sampling; **Video Loader** below has the visual trim controls for movies. EXR loading requires `OpenImageIO`.
+| **Loader** | Load stills, sequences, folders, movies, and layered EXRs. |
+| **EXR Layer** | Extract a named EXR pass. |
+| **Cryptomatte Matte** | Make an EXR object mask from clicked points. |
 
 ### Video and frames
 
 | Node | Use it to… |
 | --- | --- |
-| **Video Loader** | Load and visually trim footage, with matching audio and source alpha where available. |
-| **Video Combine** | Save a frame batch as video, animation, or an image sequence, with optional audio. |
-| **BAT Frame Picker** | Pick one frame from a contact sheet of a video or a numbered image sequence. |
-| **Framehold** | Freeze a chosen frame across the whole batch. |
-| **Video Grid Split** | Divide a clip into grid regions, with optional overlap for tiled processing. |
-| **Batch Format** | Adjust a batch to a valid frame count for WAN, Hunyuan, LTX 2.3, Cosmos, or MiniMax H3. |
+| **Video Loader** | Preview and trim video, with audio and alpha. |
+| **Video Combine** | Export video, GIF, WebP, or image sequences. |
+| **BAT Frame Picker** | Choose a frame from a contact sheet. |
+| **Framehold** | Hold one frame across a batch. |
+| **Video Grid Split** | Split video into overlapping grid regions. |
+| **Batch Format** | Match frame counts for supported video models. |
 
 ### Crop, animation, and masks
 
 | Node | Use it to… |
 | --- | --- |
-| **Crop** | Draw a crop directly on the image and save its position for Uncrop. |
-| **Animated Crop** | Keyframe the crop region through a shot. |
-| **Uncrop** | Place a processed crop back into its original image or shot, including animated crops. |
-| **Animated Grade** | Keyframe colour adjustments over time. |
-| **Roto** | Draw and animate Bézier shapes to create masks. |
-| **Grow Mask** | Expand a mask's edges by a chosen number of pixels. |
-| **Erode Mask** | Shrink a mask's edges by a chosen number of pixels. |
+| **Crop** | Draw a crop for later Uncrop. |
+| **Animated Crop** | Keyframe a moving crop. |
+| **Uncrop** | Return a processed crop to its source. |
+| **Animated Grade** | Keyframe colour adjustments. |
+| **Roto** | Draw animated Bézier masks. |
+| **Grow Mask** | Expand mask edges. |
+| **Erode Mask** | Shrink mask edges. |
 
 ### Colour and compositing
 
 | Node | Use it to… |
 | --- | --- |
-| **Grade** | Balance blackpoint, lift, gain, and gamma with a live preview. |
-| **Advanced Blend** | Blend two images, with optional separate controls for tone and detail. |
-| **Layered Images** | Composite up to eight layers using 19 blend modes, opacity, and masks. |
-| **Rescale** | Resize images while comparing the result against the source at a fixed viewing size. |
-| **Exposure Bracket** | Create multiple exposures to feed into separate LTX SDR-to-HDR passes. |
-| **Exposure Merge** | Combine those reconstructed passes into one linear HDR result. |
-| **HDR Tonal Composite** | Blend an LTX HDR reconstruction into the original's shadows and highlights. |
+| **Grade** | Adjust blackpoint, lift, gain, and gamma. |
+| **Advanced Blend** | Blend images; mix tone and detail separately. |
+| **Layered Images** | Composite up to eight masked layers. |
+| **Rescale** | Resize while comparing at a fixed viewing size. |
+| **Exposure Bracket** | Prepare exposures for LTX HDR reconstruction. |
+| **Exposure Merge** | Merge reconstructed passes into linear HDR. |
+| **HDR Tonal Composite** | Blend reconstructed shadows and highlights into a shot. |
 
-The HDR nodes are companions to an HDR reconstruction workflow; they don't run the LTX model themselves. For HDR export, use the linear output and a suitable format such as EXR. The display preview is for viewing, not a substitute for that linear data.
+The HDR nodes work with a separate LTX reconstruction workflow. Export their linear output in a suitable format such as EXR.
 
 ### SeC masking
 
 | Node | Use it to… |
 | --- | --- |
-| **SeC Segmenter** | Mark an object on a frame and track its mask through a clip, with an overlay preview. |
-| **SeC Advanced Params** | Set the segmenter's model, device, tracking direction, and memory options. |
+| **SeC Segmenter** | Track an object mask through video. |
+| **SeC Advanced Params** | Set model, device, and tracking options. |
 
 ### WAN and VACE
 
 | Node | Use it to… |
 | --- | --- |
-| **VACE Batch Tool** | Arrange image and mask keyframes for WAN VACE 2.1 inputs. |
-| **WAN Context Calculator** | Choose frame, context, stride, and overlap settings for sliding-context WAN workflows. |
-| **WAN Batch Format** | Prepare a clip for a WAN sliding-context workflow, including padding. |
-| **Batch Crop** | Remove the padding from a WAN-formatted result after generation. |
-| **Wan Reference Aligner** | Match a reference image or clip to a WAN-formatted batch's window layout. |
+| **VACE Batch Tool** | Arrange WAN VACE 2.1 image and mask keyframes. |
+| **WAN Context Calculator** | Set context, stride, and overlap. |
+| **WAN Batch Format** | Prepare and pad a WAN video batch. |
+| **Batch Crop** | Remove padding after generation. |
+| **Wan Reference Aligner** | Align references with WAN context windows. |
 
 ### Workflow helpers
 
 | Node | Use it to… |
 | --- | --- |
-| **Points Editor** | Place labelled points on an image for workflows that accept point coordinates. |
-| **Filename Prefix** | Build consistent output names from workflow context. |
-| **Bypass Switch** | Make named toggles for bypassing groups of nodes, subgraphs, or backdrops. |
+| **Points Editor** | Place labelled points on an image. |
+| **Filename Prefix** | Build output names from workflow context. |
+| **Bypass Switch** | Toggle bypass for node groups and backdrops. |
 
 ### Graph utilities
 
-Small helpers for inspecting values, formatting labels, and routing batches without an extra general-purpose node pack.
-
 | Node | Use it to… |
 | --- | --- |
-| **Show Any** | See a value on the node and pass it onward. Turn the readout off when you no longer need that branch to run. |
-| **Show Tensor Shape** | Inspect a batch's shape, size, range, and memory use while passing it onward. |
-| **Convert Any** | Convert a value to text, integer, float, or boolean. |
-| **Any to String** | Render a value as readable text, JSON, or its exact representation. |
-| **Number to String** | Format frame numbers or versions with padding, precision, and optional text. |
-| **Compare** | Compare two values to drive a boolean input. |
-| **Index Switch** | Pick one of up to ten inputs; unused branches do not run. |
-| **List Length** | Count items or frames in a list or batch. |
-| **List Index** | Take one item or frame from a list or batch. |
-| **List Batch** | Join two lists or matching image batches. |
+| **Show Any** | Display a value and pass it through. |
+| **Show Tensor Shape** | Show a tensor's shape, range, and memory use. |
+| **Convert Any** | Convert to text, number, or boolean. |
+| **Any to String** | Render a value as text or JSON. |
+| **Number to String** | Format numbers with padding and precision. |
+| **Compare** | Compare values for a boolean output. |
+| **Index Switch** | Select one of ten inputs; others don't run. |
+| **List Length** | Count items or frames. |
+| **List Index** | Select an item or frame. |
+| **List Batch** | Join lists or image batches. |
 
 **Also included, without adding a node:**
 
-- **BAT Profiler:** per-node timing and memory inspection in the sidebar.
-- **Canvas zoom:** zoom further out to see larger graphs. Adjust the minimum zoom under **Settings → 🦇 BAT → Canvas**.
-- **Run selected outputs:** select output nodes and press **Alt+Enter** to queue just those branches. Change the shortcut under **Settings → Keybinding**.
-- **Larger editors:** maximise the interactive editor when you need more room to work, then press **Esc** to return to the graph.
+- **BAT Profiler:** per-node timing and memory in the sidebar.
+- **Canvas zoom:** a wider zoom range under **Settings → 🦇 BAT → Canvas**.
+- **Run selected outputs:** **Alt+Enter** queues selected output branches.
+- **Larger editors:** maximise an editor; **Esc** exits.
 
 ## Install
 
-### Add the pack
-
-Place this repository in your active ComfyUI installation's `custom_nodes` folder. With Git, run:
+Clone into your active ComfyUI installation's `custom_nodes` folder, then restart:
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/BeeeFX/ComfyUI-BAT-NodePack.git
 ```
 
-Alternatively, use GitHub's **Code → Download ZIP**, extract it, and place the extracted folder inside `custom_nodes`. The pack's `__init__.py` should be directly inside that folder, not inside a second nested copy.
+For Desktop, use its active `custom_nodes` folder. Downloading the repository ZIP also works; keep `__init__.py` at the folder root. Search the Add Node menu for **BAT** or 🦇.
 
-**Using ComfyUI Desktop?** Use the `custom_nodes` folder in Desktop's active ComfyUI installation; the path above is an example, not a fixed Desktop location.
+### Optional features
 
-Restart ComfyUI, then search the Add Node menu for **Loader**, **Animated Crop**, or another name above. BAT nodes have a 🦇 prefix.
+Install these with the Python environment that runs ComfyUI:
 
-Most tools use packages already supplied by ComfyUI. Video encoding uses FFmpeg through `imageio-ffmpeg`, with a system FFmpeg fallback. Optional `decord` can speed up video seeking; the loader can work without it.
+- **EXR:** `python -m pip install OpenImageIO`. Other Loader formats work without it.
+- **SeC:** `python -m pip install -r requirements.txt`. Restart after installation. The default model is about **7.35 GB** and downloads on first use. See [model setup](bat_sec/NOTICE.md#models).
 
-To load **EXR files and their layers**, install `OpenImageIO` in the Python environment that runs ComfyUI (`python -m pip install OpenImageIO`), then restart. Loader's still, sequence, folder, and movie support works without it. See the [technical notes](docs/technical-notes.md#loading-media) for EXR overscan options.
-
-### SeC setup
-
-SeC is optional: the other BAT nodes can load without its extra packages or model.
-
-1. Install the pack's requirements **using the Python environment that runs your ComfyUI**. From the pack folder, the command is:
-
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
-
-2. Restart ComfyUI.
-3. On its first run, SeC downloads the default **SeC-4B-fp16** checkpoint (about **7.35 GB**) into `ComfyUI/models/sams` if no model is installed. For manual setup, see the [model locations and downloads](bat_sec/NOTICE.md#models).
-
-To control this, connect **SeC Advanced Params** and turn off `auto_download` before running. SeC uses CUDA when available; CPU inference is very slow. Model weights and dependencies are separate from the lightweight editing tools in the pack.
+To prevent the SeC model download, connect **SeC Advanced Params** and turn off `auto_download` before running.
 
 ## Example workflows
 
-Some starting node chains:
-
 | Goal | Nodes |
 | --- | --- |
-| **Trim and export a clip** | Video Loader → Video Combine. Connect the images, frame rate, and audio if needed. |
-| **Load a layered EXR pass** | Loader → EXR Layer → your processing nodes. Run once, then choose the pass from EXR Layer's list. |
-| **Mask an EXR object** | Loader → Cryptomatte Matte; connect Loader's images to Points Editor as a background and its points to Cryptomatte Matte. |
-| **Adjust a shot's colour** | Video Loader → Grade → Video Combine. Use Animated Grade for a changing look. |
-| **Process a moving region** | Animated Crop → your processing nodes → Uncrop. Also connect Animated Crop's crop information to Uncrop. |
-| **Create a tracked mask** | Video Loader → SeC Segmenter. Mark the object, run, and inspect the overlay. |
-| **Reduce an upscale's harshness** | Connect the upscale and original to Advanced Blend, enable frequency separation, and compare the detail mix. |
-| **Investigate a slow render** | Open BAT Profiler in the sidebar, enable recording, run the graph, and sort by time. |
+| **Trim and export** | Video Loader → Video Combine; connect frame rate and audio. |
+| **Moving crop** | Animated Crop → processing → Uncrop; also connect `crop_info`. |
+| **EXR pass** | Loader → EXR Layer → processing. |
+| **Object mask** | Loader → Points Editor + Cryptomatte Matte. |
+| **Tracked mask** | Video Loader → SeC Segmenter. |
 
 ## Help
 
 <details>
 <summary><strong>Nodes missing after install</strong></summary>
 
-Check that the pack is in the active installation's `custom_nodes` folder, restart ComfyUI, and reload the interface. Look at the startup log for a BAT import error. For SeC, install requirements in ComfyUI's own environment rather than an unrelated system Python.
+Check the active `custom_nodes` folder, restart ComfyUI, and look for a BAT import error in the startup log.
 
 </details>
 
 <details>
 <summary><strong>Older BAT or Volt workflows</strong></summary>
 
-**Batch Format** replaces the former **Video Batch Format** and **WAN Batch Frame Format** nodes. **Batch Crop** is the current display name of **WAN Batch Crop**. **BAT Frame Picker** replaces the old studio-specific **VRI Frame Picker**.
-
-Legacy `Volt_*` workflows have a migration shim for a separate ETC migration tool. Without that companion tool, replace legacy nodes manually; installing BAT alone does not automatically migrate them.
+**Batch Format** replaces **Video Batch Format** and **WAN Batch Frame Format**. **Batch Crop** was **WAN Batch Crop**; **BAT Frame Picker** replaces **VRI Frame Picker**. Legacy `Volt_*` nodes need the separate ETC migration tool or manual replacement.
 
 </details>
 
-For bugs or suggestions, [open an issue](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/issues) with the node name, what you expected, and what happened. A small example workflow or screenshot helps. For performance problems, BAT Profiler's **Copy report** is a useful starting point.
+For bugs or suggestions, [open an issue](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/issues). Include the node name and a small workflow or screenshot.
 
-The [technical notes archive](docs/technical-notes.md) preserves the previous README's deeper explanations and development history.
+More detail: [technical notes](docs/technical-notes.md).
 
 ---
 
