@@ -4,9 +4,15 @@
 
 # 🦇 ComfyUI-BAT-NodePack
 
+[![43 nodes](https://img.shields.io/badge/nodes-43-13b8ad?style=flat-square)](#all-nodes)
+[![Last commit](https://img.shields.io/github/last-commit/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square&label=updated)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/commits/main/)
+[![GitHub stars](https://img.shields.io/github/stars/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/stargazers)
+[![MIT license](https://img.shields.io/github/license/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](LICENSE)
+[![Download ZIP](https://img.shields.io/badge/download-ZIP-2671be?style=flat-square)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/archive/refs/heads/main.zip)
+
 BAT is my ComfyUI node pack for video, animation, masking, and compositing. Many nodes have previews and editors directly on the graph.
 
-**43 nodes · On-node editors · BAT Profiler**
+**On-node editors · BAT Profiler**
 
 [Highlights](#highlights) · [All nodes](#all-nodes) · [Install](#install) · [Example workflows](#example-workflows) · [Help](#help)
 
