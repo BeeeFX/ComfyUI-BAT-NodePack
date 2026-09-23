@@ -40,7 +40,13 @@ function parseRatio(str) {
 
 function makeEditor(node) {
     const root = document.createElement("div");
-    root.style.cssText = "position:relative;width:100%;height:100%;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;overflow:hidden;";
+    // Focusable so the Nodes 2.0 wheel exemption can apply: TransformPane only
+    // lets a wheel through to an element marked data-capture-wheel that
+    // CONTAINS the focused element (see bat_zoom_control.js). Crop handles no
+    // keys of its own, so none are stopped — core's Delete on the selected
+    // node is expected here.
+    root.tabIndex = 0;
+    root.style.cssText = "position:relative;width:100%;height:100%;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;overflow:hidden;outline:none;";
     const canvas = document.createElement("canvas");
     // Out of flow on purpose — see the note in bat_roto.js. In flow, its
     // `height:100%` degrades to the canvas's intrinsic width:height ratio
@@ -291,6 +297,7 @@ function makeEditor(node) {
     }
 
     canvas.addEventListener("pointerdown", (e) => {
+        try { root.focus({ preventScroll: true }); } catch (_) {}
         if (!state.img) return;
         const p = localMouse(e);
         const cP = d2c(p.x, p.y);
@@ -553,7 +560,7 @@ function makeEditor(node) {
 
     // Display-only zoom control (bottom-left). Lets the artist pull back to
     // see area outside the frame when placing an off-canvas crop.
-    attachZoomControl({ wrap: root, canvas, state, onChange: render, corner: "bl" });
+    attachZoomControl({ wrap: root, canvas, state, onChange: render, corner: "bl", scope: root });
 
     node._batCrop = { root, canvas, ctx, state, render };
 

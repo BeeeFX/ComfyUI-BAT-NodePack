@@ -16,8 +16,15 @@ import math
 import torch
 import torch.nn.functional as F
 
-# Lanczos uses ComfyUI core's resampler when available; otherwise we fall back
-# to bicubic transparently.
+# Lanczos uses the pack's own float resampler (bat_rescale → one lanczos in the
+# pack). It used to go through comfy.utils.common_upscale, whose lanczos
+# round-trips through 8-bit PIL: it clipped HDR to [0,1] and quantised every
+# paste to 256 levels. Core's is kept only as a fallback if that import fails,
+# then bicubic.
+try:
+    from .bat_rescale import resize_batch as _float_resize
+except Exception:
+    _float_resize = None
 try:
     from comfy.utils import common_upscale as _common_upscale
     _HAS_COMMON_UPSCALE = True
@@ -34,7 +41,9 @@ def _resize_nhwc(t, h, w, mode):
     if t.shape[1] == h and t.shape[2] == w:
         return t
     nchw = t.permute(0, 3, 1, 2)
-    if mode == "lanczos" and _HAS_COMMON_UPSCALE:
+    if mode == "lanczos" and _float_resize is not None:
+        out = _float_resize(t.to(torch.float32), h, w, "lanczos").permute(0, 3, 1, 2)
+    elif mode == "lanczos" and _HAS_COMMON_UPSCALE:
         out = _common_upscale(nchw, w, h, "lanczos", "disabled")
     else:
         fmode = mode

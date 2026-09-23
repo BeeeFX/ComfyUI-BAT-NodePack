@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from .bat_ui_ref import stash_ui
+
 
 def _first(img):
     return img[0:1] if img is not None and img.shape[0] > 1 else img
@@ -456,9 +458,11 @@ class BatCrop:
         }
 
         return {
-            "ui": {
+            # Sidecar, not inline: a 1024px JPEG per run would otherwise sit in
+            # the prompt history for the life of the server (bat_ui_ref.py).
+            "ui": stash_ui({
                 "preview": [_b64_jpeg(_first(image))],
                 "w": [int(W)], "h": [int(H)],
-            },
+            }),
             "result": (out_image, crop_info, cropped_mask, rect_mask),
         }

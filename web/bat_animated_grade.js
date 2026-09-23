@@ -12,7 +12,12 @@
  *
  *   { keyframes: { "<frame>": { blackpoint, whitepoint, lift, gain,
  *                                multiply, offset, gamma,
- *                                clamp_white, clamp_black } } }
+ *                                clamp_white, clamp_black, ease? } } }
+ *
+ * `ease` (bat_easing.js) is the curve on the way OUT of a key; absent =
+ * linear. The clip's size and frame count live in node.properties, not in
+ * the state: `state` is a prompt input, so anything written there after a
+ * run changed the cache key and re-ran the node and everything downstream.
  *
  * The Python sibling (bat_animated_grade.py) reads the same JSON and
  * applies the per-frame grade frame-by-frame.
@@ -29,6 +34,8 @@ import {
     hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
 } from "./bat_hdr_preview.js";
 import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { easeName, applyEase, EASES, EASE_LABELS } from "./bat_easing.js";
+import { gradeCoefficients, restoreLegacyLiftMode } from "./bat_grade.js";
 
 const NODE_TYPE = "Bat_AnimatedGrade";
 
@@ -216,8 +223,20 @@ function buildEditor(node) {
     frameLabel.textContent = "1 / 1";
 
     // Timeline first (full width), then the controls beneath it.
+    // Ease of the selected keyframe(s) — or of the key under the playhead when
+    // nothing is selected. Disabled when neither exists. See syncEasePicker.
+    const easeSelect = document.createElement("select");
+    easeSelect.title = "Ease out of the selected keyframe, towards the next one";
+    easeSelect.style.cssText = "background:#0e1116; border:1px solid #2a2f37; color:#cdd; font-size:11px; border-radius:3px; padding:1px 2px;";
+    for (const name of EASES) {
+        const o = document.createElement("option");
+        o.value = name; o.textContent = EASE_LABELS[name] || name;
+        easeSelect.appendChild(o);
+    }
+    easeSelect.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+
     controlsRow.append(prevBtn, playBtn, nextBtn, addKeyBtn, delKeyBtn,
-                       clearKeysBtn, autoKeyToggle, frameLabel);
+                       clearKeysBtn, easeSelect, autoKeyToggle, frameLabel);
 
     // Any click that isn't the clear button itself cancels a pending confirm.
     root.addEventListener("pointerdown", (ev) => {
@@ -286,7 +305,9 @@ function buildEditor(node) {
         if (prev === nxt) return { ...DEFAULT_GRADE, ...kfs[String(prev)] };
         const a = { ...DEFAULT_GRADE, ...kfs[String(prev)] };
         const b = { ...DEFAULT_GRADE, ...kfs[String(nxt)] };
-        const t = (f - prev) / (nxt - prev);
+        // The segment's curve belongs to the EARLIER key — same rule and
+        // table as the render (bat_animated_grade.py / bat_easing.py).
+        const t = applyEase((f - prev) / (nxt - prev), easeName(kfs[String(prev)]));
         return {
             blackpoint: a.blackpoint + (b.blackpoint - a.blackpoint) * t,
             whitepoint: a.whitepoint + (b.whitepoint - a.whitepoint) * t,
@@ -355,7 +376,9 @@ function buildEditor(node) {
         const bp = +p.blackpoint, wp = +p.whitepoint;
         const lift = +p.lift, gain = +p.gain, mult = +p.multiply, off = +p.offset;
         const gamma = Math.max(+p.gamma, 0.01);
-        const wpMbp = Math.max(wp - bp, 1e-6), invG = 1 / gamma;
+        const invG = 1 / gamma;
+        const { a: A, b: B } = gradeCoefficients(bp, wp, lift, gain, mult, off,
+                                                 W("lift_mode")?.value);
         const cw = !!p.clamp_white, cb = !!p.clamp_black;
         // Float32, stride 3, whether it came from a frame JPEG or the 16-bit
         // tile. Grading in float and quantising only at the write below is the
@@ -372,11 +395,8 @@ function buildEditor(node) {
         const view = inspectBar.gain;
         for (let i = 0, sp = 0, q = 0; i < n; i++, sp += 3, q += 4) {
             const r0 = src[sp], g0 = src[sp + 1], b0 = src[sp + 2];
-            let r = (r0 - bp) / wpMbp, g = (g0 - bp) / wpMbp, b = (b0 - bp) / wpMbp;
-            r = r * (gain - lift) + lift;
-            g = g * (gain - lift) + lift;
-            b = b * (gain - lift) + lift;
-            r = r * mult + off; g = g * mult + off; b = b * mult + off;
+            // Levels as one multiply-add — see gradeCoefficients (bat_grade.js).
+            let r = r0 * A + B, g = g0 * A + B, b = b0 * A + B;
             // Negatives skip the gamma and pass through linear; `cb` below
             // decides whether they survive (mirrors _apply_grade).
             if (invG !== 1) {
@@ -441,7 +461,7 @@ function buildEditor(node) {
         const kfs = state.doc.keyframes;
         const key = String(state.currentFrame);
         if (state.autoKey || !Object.keys(kfs).length) {
-            if (!kfs[key]) kfs[key] = resolveGradeAtFrame(state.currentFrame);
+            if (!kfs[key]) kfs[key] = freshKey(state.currentFrame);
             return kfs[key];
         }
         const keys = Object.keys(kfs).map(Number).sort((a, b) => a - b);
@@ -449,6 +469,39 @@ function buildEditor(node) {
         for (const k of keys) if (k <= state.currentFrame) target = k;
         return kfs[String(target)];
     }
+
+    // A NEW key starts linear. resolveGradeAtFrame() hands back a held key's
+    // own fields — its `ease` included — past either end of the animation.
+    function freshKey(f) {
+        const k = resolveGradeAtFrame(f);
+        delete k.ease;
+        return k;
+    }
+
+    // The keys the ease picker edits: the multi-selection, else the key under
+    // the playhead.
+    function easeTargets() {
+        const kfs = state.doc.keyframes || {};
+        const sel = [...state.kfSelection].filter((f) => kfs[String(f)] !== undefined);
+        if (sel.length) return sel;
+        return kfs[String(state.currentFrame)] !== undefined ? [state.currentFrame] : [];
+    }
+    function syncEasePicker() {
+        const targets = easeTargets();
+        easeSelect.disabled = targets.length === 0;
+        easeSelect.value = targets.length
+            ? easeName(state.doc.keyframes[String(targets[0])]) : "linear";
+    }
+    easeSelect.addEventListener("change", () => {
+        const name = easeSelect.value;
+        for (const f of easeTargets()) {
+            const k = state.doc.keyframes[String(f)];
+            // Linear is the absent value, so a linear key serialises exactly
+            // as it did before easing existed.
+            if (name === "linear") delete k.ease; else k.ease = name;
+        }
+        persist(); renderKeyStrip(); refreshSliders(); schedulePaint();
+    });
 
     function paramCommit(name, value) {
         const kf = editableKeyframe();
@@ -548,6 +601,7 @@ function buildEditor(node) {
 
     // ── keyframe strip ───────────────────────────────────────────────
     function renderKeyStrip() {
+        syncEasePicker();
         keyStrip.querySelectorAll(".bat-kf").forEach(el => el.remove());
         rangeStrip.querySelectorAll(".bat-kf-mini").forEach(el => el.remove());
         syncRangeWindow();
@@ -573,7 +627,8 @@ function buildEditor(node) {
             const dot = document.createElement("div");
             dot.className = "bat-kf";
             dot.dataset.frame = String(f);
-            dot.title = `Keyframe @ frame ${f + 1} — drag to move, Shift+click to multi-select, right-click to delete`;
+            const kEase = easeName(state.doc.keyframes[k]);
+            dot.title = `Keyframe @ frame ${f + 1}${kEase !== "linear" ? ` · ${EASE_LABELS[kEase]} out` : ""} — drag to move, Shift+click to multi-select, right-click to delete`;
             dot.style.cssText = `position:absolute; top:0; bottom:0; width:8px; background:${inSel ? "#7ab8ff" : "#f4b860"}; border:1px solid #000; left:${frameToPct(f)}%; transform:translateX(-50%); cursor:ew-resize; z-index:5;`;
             dot.addEventListener("contextmenu", (ev) => {
                 ev.preventDefault();
@@ -788,8 +843,9 @@ function buildEditor(node) {
     prevBtn.onclick = () => setFrame(state.currentFrame - 1);
     nextBtn.onclick = () => setFrame(state.currentFrame + 1);
     addKeyBtn.onclick = () => {
+        const had = state.doc.keyframes[String(state.currentFrame)];
         state.doc.keyframes[String(state.currentFrame)] =
-            resolveGradeAtFrame(state.currentFrame);
+            had ? resolveGradeAtFrame(state.currentFrame) : freshKey(state.currentFrame);
         persist(); renderKeyStrip(); refreshSliders();
     };
     delKeyBtn.onclick = () => {
@@ -812,7 +868,7 @@ function buildEditor(node) {
         }
         clearTimeout(clearArmed); clearIdle();
         // Snapshot BEFORE clearing — the resolver reads state.doc.keyframes.
-        const keep = resolveGradeAtFrame(state.currentFrame);
+        const keep = freshKey(state.currentFrame);
         state.doc.keyframes = { "0": keep };
         state.kfSelection = new Set();
         persist(); renderKeyStrip(); refreshSliders(); schedulePaint();
@@ -852,7 +908,8 @@ function buildEditor(node) {
     }
 
     root.addEventListener("keydown", (e) => {
-        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA"
+            || e.target.tagName === "SELECT") return;
         let handled = true;
         switch (e.key) {
             case " ":           togglePlay(); break;
@@ -895,9 +952,11 @@ function buildEditor(node) {
         state.frameCount = Math.max(1, frameCount || state.previewFrames.length || 1);
         state.viewStart = 0;
         state.viewEnd = Math.max(0, state.frameCount - 1);
-        state.doc.imgW = w; state.doc.imgH = h;
-        state.doc.frameCount = state.frameCount;
-        persist();
+        // Kept for the reopen-before-run view, but in node.properties: writing
+        // it into `state` (a prompt input) changed the cache key after every
+        // first run / clip change, so the next queue re-ran this node and
+        // everything downstream with nothing edited. Python never read it.
+        saveClipMeta(w, h, state.frameCount);
         if (frames.length > 0) {
             _saveCachedPreview(node, {
                 firstFrame: frames[0], imgW: w, imgH: h,
@@ -938,15 +997,29 @@ function buildEditor(node) {
         setFrame(Math.min(state.currentFrame, state.frameCount - 1));
     };
 
-    function _restoreCachedPreview() {
-        if (state.doc.imgW && state.doc.imgH) {
-            state.imgW = state.doc.imgW; state.imgH = state.doc.imgH;
+    // Clip size / frame count for the reopen-before-run view. node.properties
+    // first; a workflow saved before they moved there still has them in the
+    // state JSON, and that stays readable.
+    function saveClipMeta(w, h, frameCount) {
+        try {
+            node.properties = node.properties || {};
+            node.properties.bat_clip = { imgW: w, imgH: h, frameCount };
+        } catch (_) {}
+    }
+    function applyClipMeta() {
+        const m = node.properties?.bat_clip || state.doc;
+        if (m.imgW && m.imgH) {
+            state.imgW = m.imgW; state.imgH = m.imgH;
         }
-        if (state.doc.frameCount) {
-            state.frameCount = Math.max(1, state.doc.frameCount | 0);
+        if (m.frameCount) {
+            state.frameCount = Math.max(1, m.frameCount | 0);
             state.viewStart = 0;
             state.viewEnd = Math.max(0, state.frameCount - 1);
         }
+    }
+
+    function _restoreCachedPreview() {
+        applyClipMeta();
         // A full-res strip replayed from this session's last run beats the
         // cached thumbnail; its async decode must not land on top of it.
         if (batPreviewWillReplay(node)) return;
@@ -991,14 +1064,7 @@ function buildEditor(node) {
             if (!state.doc.keyframes) state.doc.keyframes = {};
         } catch (_) { return; }
         state.kfSelection = new Set();
-        if (state.doc.imgW && state.doc.imgH) {
-            state.imgW = state.doc.imgW; state.imgH = state.doc.imgH;
-        }
-        if (state.doc.frameCount) {
-            state.frameCount = Math.max(1, state.doc.frameCount | 0);
-            state.viewStart = 0;
-            state.viewEnd = Math.max(0, state.frameCount - 1);
-        }
+        applyClipMeta();
         setFrame(0);
         refreshSliders();
         renderKeyStrip();
@@ -1055,12 +1121,27 @@ app.registerExtension({
             });
             addBatFullscreen(this, editorWidget, el);
             clampNodeSize(this, 640, 580);
+            // lift_mode is a node widget, not a keyframed slider: repaint the
+            // preview when it changes.
+            const liftW = this.widgets?.find((w) => w.name === "lift_mode");
+            if (liftW) {
+                const prev = liftW.callback;
+                const node = this;
+                liftW.callback = function () {
+                    const rv = prev ? prev.apply(this, arguments) : undefined;
+                    node._batAnimGradePaint?.();
+                    return rv;
+                };
+            }
             return r;
         };
 
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (info) {
             const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            // A workflow saved before `lift_mode` existed keeps its original
+            // look (see savedBeforeLiftMode in bat_grade.js).
+            if (restoreLegacyLiftMode(this, info)) this._batAnimGradePaint?.();
             const node = this;
             setTimeout(() => { node._batAnimGradeReloadFromWidget?.(); }, 0);
             return r;

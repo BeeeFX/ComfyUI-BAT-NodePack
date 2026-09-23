@@ -4,7 +4,8 @@ Bat_AnimatedGrade — Nuke-style colour grade with per-frame keyframes.
 Same grade formula as Bat_Grade (blackpoint / whitepoint / lift / gain /
 multiply / offset / gamma + clamp toggles), but every parameter can be
 keyframed across the input image batch. Between keyframes the parameters
-lerp independently.
+lerp independently, through the earlier key's `ease` curve (bat_easing.py;
+a key without one is linear, as every key was before easing existed).
 
 State JSON (kept in a hidden STRING widget; same persistence model as
 Bat_Roto and Bat_AnimatedCrop):
@@ -12,7 +13,7 @@ Bat_Roto and Bat_AnimatedCrop):
     {
         "keyframes": {
             "0":  { blackpoint, whitepoint, lift, gain, multiply, offset,
-                    gamma, clamp_white, clamp_black },
+                    gamma, clamp_white, clamp_black, ease? },
             "24": { ... },
             ...
         }
@@ -38,10 +39,12 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .bat_easing import apply_ease, ease_name
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
 
 # Re-use the grade math from the static node so the two stay in lockstep.
-from .bat_grade import _apply_grade
+from .bat_grade import LIFT_MODES, _apply_grade
 
 logger = logging.getLogger("[Bat_AnimatedGrade]")
 
@@ -116,7 +119,9 @@ def _resolve_grade_at_frame(kfs: dict, frame: int) -> dict:
         return _merge_defaults(kfs[str(prev)])
     a = _merge_defaults(kfs[str(prev)])
     b = _merge_defaults(kfs[str(nxt)])
-    t = (frame - prev) / (nxt - prev)
+    # The segment's curve belongs to the EARLIER key (web/bat_easing.js is
+    # the same table, so the preview and the render agree mid-segment).
+    t = apply_ease((frame - prev) / (nxt - prev), ease_name(kfs[str(prev)]))
     out = {}
     for name in _PARAMS:
         out[name] = a[name] + (b[name] - a[name]) * t
@@ -162,6 +167,10 @@ class BatAnimatedGrade:
             },
             "optional": {
                 "mask": ("MASK",),
+                # Same switch as Bat_Grade: Nuke's formula, or the original one
+                # that also scaled lift by multiply. web/bat_animated_grade.js
+                # sets "legacy" on load for workflows saved before it existed.
+                "lift_mode": (LIFT_MODES, {"default": "nuke", "advanced": True}),
             },
         }
 
@@ -176,7 +185,10 @@ class BatAnimatedGrade:
     )
 
     @classmethod
-    def IS_CHANGED(cls, image, state, mask=None):
+    def IS_CHANGED(cls, image, state, mask=None, lift_mode="nuke"):
+        # Every input reaches IS_CHANGED as a keyword, so `lift_mode` has to be
+        # accepted here: a TypeError makes ComfyUI record NaN, which never
+        # compares equal, and the node would re-run on every queue.
         # sha1 rather than hash() — see the note in bat_roto.IS_CHANGED: hash()
         # is salted per process, so the key changed on every restart.
         try:
@@ -185,7 +197,7 @@ class BatAnimatedGrade:
         except Exception:
             return "state:err"
 
-    def grade(self, image, state, mask=None):
+    def grade(self, image, state, mask=None, lift_mode="nuke"):
         n, H, W, _ = image.shape
         try:
             doc = json.loads(state) if state else {}
@@ -251,6 +263,7 @@ class BatAnimatedGrade:
                 gamma=float(params["gamma"]),
                 clamp_white=bool(params["clamp_white"]),
                 clamp_black=bool(params["clamp_black"]),
+                lift_mode=str(lift_mode),
             )
             out_frames.append(graded)
         out = (out_frames[0] if len(out_frames) == 1
@@ -298,4 +311,6 @@ class BatAnimatedGrade:
         # No .cpu(): forcing the result to host memory cost a full device->host
         # copy (~750MB for a 300-frame 1080p batch) that the next node has to
         # copy straight back. ComfyUI handles device placement.
-        return {"ui": ui, "result": (out,)}
+        # The strip goes to a sidecar file (bat_ui_ref.py): up to 240 JPEGs
+        # per run used to sit in the prompt history for the server's life.
+        return {"ui": stash_ui(ui), "result": (out,)}

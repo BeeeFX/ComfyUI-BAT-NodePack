@@ -27,6 +27,57 @@ import { batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillRep
 
 const NODE_TYPE = "Bat_Grade";
 
+/**
+ * The grade's levels stage as one multiply-add, `in * a + b`. Must mirror
+ * _apply_grade in bat_grade.py (tests/verify_crop_grade.py runs both). "nuke"
+ * is Nuke's Grade (B = offset + lift - A*blackpoint); "legacy" is this node's
+ * original formula, which also scaled lift by multiply. Bat_AnimatedGrade's
+ * preview imports this too, so there is one copy of the maths in the browser.
+ */
+export function gradeCoefficients(bp, wp, lift, gain, mult, off, liftMode) {
+    const wpMbp = Math.max(wp - bp, 1e-6);
+    const a = (gain - lift) / wpMbp * mult;
+    const b = liftMode === "legacy"
+        ? (lift - bp * (gain - lift) / wpMbp) * mult + off
+        : off + lift - a * bp;
+    return { a, b };
+}
+
+/**
+ * Was this node saved before the `lift_mode` widget existed? Such a node was
+ * graded with the original formula, so it has to load as "legacy" or its look
+ * changes under the artist.
+ *
+ * Current frontends save `widgets_values_named` beside the positional array,
+ * which answers the question directly. Without it (an older frontend), look at
+ * the value sitting in lift_mode's POSITIONAL slot — restore is positional —
+ * rather than at the array's length: BAT DOM widgets serialise a trailing ""
+ * (docs/review-2026-09.md), so an old Grade's 11-entry array holds that ""
+ * exactly where lift_mode now sits, and a missing or foreign value there means
+ * the save predates the widget.
+ */
+export function savedBeforeLiftMode(node, info) {
+    const named = info?.widgets_values_named;
+    if (named && typeof named === "object") {
+        return !Object.prototype.hasOwnProperty.call(named, "lift_mode");
+    }
+    const vals = info?.widgets_values;
+    if (!Array.isArray(vals)) return false;
+    // The same filter the serialiser applies, so the index lines up.
+    const slot = (node.widgets || []).filter((w) => w.serialize !== false)
+        .findIndex((w) => w.name === "lift_mode");
+    if (slot < 0) return false;
+    return vals[slot] !== "nuke" && vals[slot] !== "legacy";
+}
+
+/** onConfigure half of the above: pin a pre-lift_mode node to "legacy". */
+export function restoreLegacyLiftMode(node, info) {
+    const w = node.widgets?.find((x) => x.name === "lift_mode");
+    if (!w || !savedBeforeLiftMode(node, info)) return false;
+    w.value = "legacy";
+    return true;
+}
+
 // localStorage preview cache. Mirrors the pattern in bat_roto.js /
 // bat_animated_crop.js — gives the live canvas something to show on workflow
 // reopen without bloating the workflow JSON. Workflow-scoped: a bare node.id
@@ -134,7 +185,8 @@ function buildPreview(node) {
         const gamma = Math.max(+get("gamma"), 0.01);
         const clampW = !!get("clamp_white");
         const clampB = !!get("clamp_black");
-        const wpMbp = Math.max(wp - bp, 1e-6);
+        const { a: A, b: B } = gradeCoefficients(bp, wp, lift, gain, mult, off,
+                                                 get("lift_mode"));
         const invG  = 1 / gamma;
 
         // Float32, RGB interleaved (stride 3) whether it came from the JPEG or
@@ -156,18 +208,11 @@ function buildPreview(node) {
         for (let i = 0, p = 0, q = 0; i < n; i++, p += 3, q += 4) {
             const r0 = src[p], g0 = src[p+1], b0 = src[p+2];
 
-            // Grade math — one channel at a time, vectorised inline.
-            let r = (r0 - bp) / wpMbp;
-            let g = (g0 - bp) / wpMbp;
-            let b = (b0 - bp) / wpMbp;
-
-            r = r * (gain - lift) + lift;
-            g = g * (gain - lift) + lift;
-            b = b * (gain - lift) + lift;
-
-            r = r * mult + off;
-            g = g * mult + off;
-            b = b * mult + off;
+            // Levels: blackpoint/whitepoint, lift/gain, multiply, offset as
+            // one multiply-add (see gradeCoefficients).
+            let r = r0 * A + B;
+            let g = g0 * A + B;
+            let b = b0 * A + B;
 
             // pow() on negatives is NaN, so negatives skip the gamma and pass
             // through linear — clamp_black below decides whether they survive.
@@ -214,6 +259,7 @@ function buildPreview(node) {
         if (raf) return;
         raf = requestAnimationFrame(() => { raf = 0; applyGrade(); });
     }
+    node._batGradeRepaint = schedule;
 
     // Hook each numeric / boolean widget so any change repaints the
     // preview. Done in onNodeCreated below after the widgets exist; we
@@ -221,7 +267,7 @@ function buildPreview(node) {
     node._batGradeWatchWidgets = () => {
         for (const name of ["blackpoint", "whitepoint", "lift", "gain",
                             "multiply", "offset", "gamma",
-                            "clamp_white", "clamp_black"]) {
+                            "clamp_white", "clamp_black", "lift_mode"]) {
             const w = W(name);
             if (!w) continue;
             const orig = w.callback;
@@ -328,6 +374,14 @@ app.registerExtension({
             // (LiteGraph sets it as part of construction; using a 0-ms
             // setTimeout puts us at the back of the microtask queue).
             setTimeout(() => this._batGradeRestoreFromCache?.(), 0);
+            return r;
+        };
+
+        // A workflow saved before `lift_mode` existed keeps its original look.
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            if (restoreLegacyLiftMode(this, info)) this._batGradeRepaint?.();
             return r;
         };
 
