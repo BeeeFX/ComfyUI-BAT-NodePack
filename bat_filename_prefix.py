@@ -27,6 +27,7 @@ clear error naming the offending segment rather than being cleaned up.
 """
 
 import json
+import re
 import logging
 
 logger = logging.getLogger(__name__)
@@ -105,8 +106,26 @@ def build_prefix(segments):
             out.append(text)
         else:
             sep = str(seg.get("separator", "/"))
+            # Same rule as the values: a separator is free text too, and ":"
+            # there wrote "A:B" — an NTFS alternate data stream on Windows.
+            bad = sorted(set(c for c in sep if c in _ILLEGAL_CHARS))
+            if bad:
+                label = seg.get("label") or f"segment_{i + 1}"
+                raise ValueError(
+                    f"segment {i + 1} ({label!r}) separator {sep!r} contains "
+                    f"illegal character(s) {''.join(bad)!r} — forbidden: "
+                    f"< > : \" | ? *"
+                )
             out.append(sep + text)
-    return "".join(out)
+    prefix = "".join(out)
+    # A ".." level — typed as a value, or built from a separator like "/../" —
+    # climbs out of the folder the save node is writing into.
+    if any(part == ".." for part in re.split(r"[\\/]", prefix)):
+        raise ValueError(
+            f"filename prefix {prefix!r} contains a '..' folder level — "
+            f"it would climb out of the output folder."
+        )
+    return prefix
 
 
 class BatFilenamePrefix:

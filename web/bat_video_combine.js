@@ -413,7 +413,9 @@ async function rebuildCodecWidgets(node, formatLabel, savedValues, opts) {
     // append we move the widget to just *before* the player, giving it a normal
     // row above the player. Codec widgets still sit after every static widget, so
     // positional widgets_values restore on load never shifts onto a static one.
-    // (The DOM player is serialize:false, so the serialiser skips it anyway.)
+    // (The DOM player is options.serialize:false, which keeps it out of the API
+    // prompt; widgets_values still records its "" after the codec entries —
+    // onConfigure discards it.)
     const playerIndex = () => node.widgets.findIndex((w) => w.name === "bat_video_player");
     const derived = def.derived || {};
     const preferMax = !!(opts && opts.preferMaxBitDepth);
@@ -679,6 +681,15 @@ function buildPlayer(node) {
     videoEl.style.cssText = "flex:1; min-height:120px; width:100%; background:#000; display:block;";
     root.appendChild(videoEl);
 
+    // GIF / animated WebP stand-in. A <video> element decodes neither (and the
+    // bundled ffmpeg can't decode animated WebP, so no transcode either), but an
+    // <img> animates both natively. Shown in videoEl's place for those formats;
+    // they get no frame stepping or scrub, since an <img> exposes no timeline.
+    const imgEl = document.createElement("img");
+    imgEl.draggable = false;
+    imgEl.style.cssText = "flex:1; min-height:120px; width:100%; object-fit:contain; background:#000; display:none;";
+    root.appendChild(imgEl);
+
     // ── hidden decoder used to grab hover-thumbnails ──────────────────
     // Decoupled from the visible player so the user can scrub the thumb
     // without disturbing playback. Same src as the main video; seek to
@@ -848,8 +859,24 @@ function buildPlayer(node) {
         //    next click to anchor too far forward (+2 in one click).
         displayedMediaTime: 0,
         pendingTarget: null,
+        imageMode: false,     // GIF / WebP shown through imgEl, see above
+        fallbackTried: false, // one-shot <video> error -> transcode retry
+        autoplay: false,
     };
     node._batVCState = state;
+
+    // Everything that only makes sense against a <video> timeline. Their own
+    // display values are kept so leaving image mode restores inline-flex etc.
+    const timelineOnly = [timeline, stepBack10, stepBack, playBtn, stepFwd,
+                          stepFwd10, speedSel, saveFrameBtn];
+    const shownDisplay = new Map(timelineOnly.map((el) => [el, el.style.display]));
+    function _setImageMode(on) {
+        state.imageMode = on;
+        videoEl.style.display = on ? "none" : "block";
+        imgEl.style.display = on ? "block" : "none";
+        for (const el of timelineOnly) el.style.display = on ? "none" : shownDisplay.get(el);
+        if (!on) imgEl.removeAttribute("src");
+    }
 
     // ── responsive sizing ────────────────────────────────────────────
     // Recompute the timeline height + hover-thumb width whenever the
@@ -890,6 +917,7 @@ function buildPlayer(node) {
                 thumbVideo.pause();
                 thumbVideo.removeAttribute("src");
                 thumbVideo.load();
+                imgEl.removeAttribute("src");
             } catch (_) {}
             state.preview = null;
         });
@@ -1351,6 +1379,8 @@ function buildPlayer(node) {
     root.addEventListener("keydown", (e) => {
         // Don't steal keystrokes that belong to a text input inside us.
         if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+        // An <img> preview has no timeline to step or play; only fullscreen.
+        if (state.imageMode && e.key !== "f" && e.key !== "F") return;
         let handled = true;
         switch (e.key) {
             case " ":   playBtn.click(); break;
@@ -1461,6 +1491,27 @@ function buildPlayer(node) {
         }
         updateTimeLabel();
     });
+    // One-shot fallback to the server transcode. `browser_playable` is per
+    // format, not per file: a 10-bit ("High 10") h264 is still flagged
+    // playable, and most browsers can't decode it, which left a silent black
+    // player. The transcode route accepts any file, so retry through it once.
+    videoEl.addEventListener("error", () => {
+        const p = state.preview;
+        if (!p || state.imageMode || !videoEl.getAttribute("src")) return;
+        const onPreviewRoute = String(videoEl.getAttribute("src")).includes("/bat/video/preview");
+        if (state.fallbackTried || onPreviewRoute) {
+            statusRow.textContent = `${p.filename}  ·  preview could not be decoded`;
+            return;
+        }
+        state.fallbackTried = true;
+        const url = api.apiURL(`/bat/video/preview?${buildPreviewParams(p, state.viewTrc).toString()}`);
+        statusRow.textContent = `${p.filename}  ·  ${p.format || ""}  (transcoded preview — the browser can't decode this file)`;
+        videoEl.src = url;
+        videoEl.load();
+        if (state.autoplay) videoEl.play().catch(() => {});
+        thumbVideo.src = url;
+        thumbVideo.load();
+    });
     videoEl.addEventListener("loadedmetadata", () => {
         // Reset the stepping anchor when a fresh source loads.
         state.displayedMediaTime = videoEl.currentTime || 0;
@@ -1539,6 +1590,25 @@ function buildPlayer(node) {
         // Drop any thumb from the previous file so the first hover on
         // the new file doesn't flash an unrelated frame.
         hoverThumb.removeAttribute("src");
+        state.fallbackTried = false;
+        state.autoplay = !restoring;
+
+        // GIF / animated WebP: straight into the <img>, which animates on its
+        // own. No meta probe either — ffmpeg can't read an animated WebP, and
+        // there is no timeline for its numbers to drive.
+        const animImage = !state.isSequence && /\.(gif|webp)$/i.test(preview.filename || "");
+        _setImageMode(animImage);
+        if (animImage) {
+            videoEl.pause();
+            videoEl.removeAttribute("src");
+            videoEl.load();
+            thumbVideo.removeAttribute("src");
+            thumbVideo.load();
+            imgEl.src = api.apiURL(`/view?${buildPreviewParams(preview).toString()}`);
+            timeLabel.textContent = `${state.frameCount || "?"} frames · animated preview`;
+            statusRow.textContent = `${preview.filename}  ·  ${preview.format || ""}`;
+            return;
+        }
 
         const url = buildPreviewUrl(preview, state.viewTrc);
         videoEl.src = url;
@@ -1730,8 +1800,16 @@ app.registerExtension({
                     // widgets in JSON order (the same order they serialised in).
                     const tail = savedVals.slice(staticCount);
                     savedByName = {};
+                    // "" is never a codec value (they are all COMBO / INT /
+                    // BOOLEAN) — it is the DOM player's own serialised value,
+                    // which the frontend writes after the codec entries: it
+                    // skips only `widget.serialize === false`, and the player
+                    // sets options.serialize (API prompt) alone. Where a knob
+                    // was appended since the save, that "" sat in its slot,
+                    // looked like a saved value, and stopped the inference
+                    // below from recovering it (a 10-bit h264 reloaded 8-bit).
                     (def.widgets || []).forEach((spec, i) => {
-                        if (i < tail.length) savedByName[spec.name] = tail[i];
+                        if (i < tail.length && tail[i] !== "") savedByName[spec.name] = tail[i];
                     });
                     // Widgets appended to a format AFTER this workflow was
                     // saved have no entry in the tail. Where one of them drives
