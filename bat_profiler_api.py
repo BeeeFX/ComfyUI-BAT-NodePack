@@ -39,8 +39,10 @@ if routes is not None:
 
     @routes.get("/bat/profiler/state")
     async def bat_profiler_state(request):
-        """Config, capabilities, and run summaries — optionally filtered
-        to one workflow so a tab never sees another tab's runs."""
+        """The caller's config, capabilities, and the caller's own run
+        summaries — optionally filtered to one workflow so a tab never
+        sees another tab's runs. Without a client_id there are no runs:
+        summaries carry workflow paths, which are nobody else's business."""
         prof.note_subscriber()
         workflow = request.query.get("workflow") or None
         client_id = request.query.get("client_id") or None
@@ -101,6 +103,10 @@ if routes is not None:
 
         Called on toggle rather than on queue, so there is no race with
         a prompt that starts executing the moment it is submitted.
+
+        Arming may carry the panel's measurement settings (``sync_cuda``,
+        ``reset_peak``, ``sample_hz``), so a re-arm after a server restart
+        comes back measuring the way it did before.
         """
         try:
             body = await request.json()
@@ -110,7 +116,7 @@ if routes is not None:
         if not client_id:
             return web.json_response({"error": "client_id required"}, status=400)
         enabled = bool(body.get("enabled"))
-        prof.arm(str(client_id), enabled)
+        prof.arm(str(client_id), enabled, body)
         return web.json_response(prof.state_payload(None, str(client_id)))
 
     @routes.post("/bat/profiler/config")
@@ -120,19 +126,15 @@ if routes is not None:
         except Exception:
             return web.json_response({"error": "bad json"}, status=400)
         # Note: enablement is NOT here — it is per-client, via /arm.
-        # These are measurement-method settings that only take effect
-        # inside an already-armed run.
-        if "sync_cuda" in body:
-            prof.CONFIG.sync_cuda = bool(body["sync_cuda"])
-        if "reset_peak" in body:
-            prof.CONFIG.reset_peak = bool(body["reset_peak"])
-        if "sample_hz" in body:
-            try:
-                hz = float(body["sample_hz"])
-                prof.CONFIG.sample_hz_active = max(0.5, min(20.0, hz))
-            except Exception:
-                pass
-        logger.info("[BAT Profiler] config: sync_cuda=%s reset_peak=%s hz=%s",
-                    prof.CONFIG.sync_cuda, prof.CONFIG.reset_peak,
-                    prof.CONFIG.sample_hz_active)
-        return web.json_response(prof.state_payload(None, body.get("client_id")))
+        # These are measurement-method settings, and they are the calling
+        # browser's own: they used to be process-global, so one artist
+        # switching GPU sync off changed how everyone else was measured.
+        # They take effect from that client's next run.
+        client_id = body.get("client_id")
+        if not client_id:
+            return web.json_response({"error": "client_id required"}, status=400)
+        stored = prof.configure(str(client_id), body)
+        logger.info("[BAT Profiler] config for %s%s: %s", client_id,
+                    "" if stored else " (not armed, not stored)",
+                    prof.client_config(str(client_id)))
+        return web.json_response(prof.state_payload(None, str(client_id)))

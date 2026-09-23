@@ -131,16 +131,14 @@ def t_cuda():
     check("peak reset works", prof.cuda_peak() <= freed["alloc"] + 2**20,
           f"peak {prof.cuda_peak()} alloc {freed['alloc']}")
 
-    # And it must honour the config switch.
-    prof.CONFIG.reset_peak = False
+    # And it must honour the run's own setting (per client since 2026-09).
     spike = torch.zeros((128, 1024, 1024), dtype=torch.float16, device="cuda")
     hi = prof.cuda_peak()
     del spike
     torch.cuda.empty_cache()
-    prof.cuda_reset_peak()
+    prof.cuda_reset_peak(False)
     check("reset_peak=False leaves the counter alone", prof.cuda_peak() == hi,
           f"{prof.cuda_peak()} vs {hi}")
-    prof.CONFIG.reset_peak = True
 
 
 def t_arming():
@@ -166,6 +164,62 @@ def t_arming():
 
 
 t_arming()
+
+
+def t_client_config():
+    """Measurement settings used to be process-global: one artist turning
+    GPU sync off changed how everybody else's runs were measured, and
+    /state listed every user's runs with their workflow paths."""
+    prof.arm("A", True, {"sync_cuda": False, "sample_hz": 50})
+    prof.arm("B", True)
+    a, b = prof.client_config("A"), prof.client_config("B")
+    check("arming carries this client's settings",
+          a["sync_cuda"] is False and a["sample_hz"] == 20.0, str(a))
+    check("another client keeps the defaults",
+          b["sync_cuda"] is True and b["sample_hz"] == prof.CONFIG.sample_hz_active, str(b))
+    check("/config applies to the caller only",
+          prof.configure("B", {"reset_peak": False}) is True
+          and prof.client_config("B")["reset_peak"] is False
+          and prof.client_config("A")["reset_peak"] is True)
+    check("an unarmed client has nothing server-side to configure",
+          prof.configure("C", {"sync_cuda": False}) is False
+          and prof.client_config("C")["sync_cuda"] is True)
+    prof.arm("A", True)
+    check("re-arming keeps the client's settings", prof.client_config("A")["sync_cuda"] is False)
+
+    # A run freezes its submitter's settings.
+    run_a = prof.RunRecord("pa", "A")
+    prof.configure("A", {"sync_cuda": True})
+    check("a run keeps the settings it started with", run_a.config["sync_cuda"] is False)
+    check("the run summary says how it was measured",
+          run_a.summary()["config"]["sync_cuda"] is False)
+
+    # /state: the caller's config and the caller's runs, nobody else's.
+    run_a.workflow = "wf/a-secret.json"
+    run_b = prof.RunRecord("pb", "B")
+    run_b.workflow = "wf/b-secret.json"
+    prof._history.extend([run_a, run_b])
+    try:
+        sa = prof.state_payload(None, "A")
+        sn = prof.state_payload(None, None)
+        check("/state lists only the caller's runs",
+              [r["prompt_id"] for r in sa["runs"]] == ["pa"], str(sa["runs"]))
+        check("/state leaks no workflow path to an anonymous caller",
+              sn["runs"] == [] and "b-secret" not in json.dumps(sn), str(sn["runs"]))
+        check("/state reports the caller's own config",
+              sa["config"]["sync_cuda"] is True and sa["config"]["enabled"] is True
+              and prof.state_payload(None, "B")["config"]["reset_peak"] is False)
+        prof._current = run_b
+        check("someone else's live run is not reported as current",
+              prof.state_payload(None, "A")["current"] is None
+              and prof.state_payload(None, "B")["current"] == "pb")
+    finally:
+        prof._current = None
+        prof._history.clear()
+        prof._armed.clear()
+
+
+t_client_config()
 
 # ─────────────────────────────────────────────────────────────────────
 print("\n[2b] CUDA probes")
@@ -348,6 +402,29 @@ def t_failures():
                   sent and all(sid == "fail-client" for _, _, sid in sent),
                   f"sids={[sid for _, _, sid in sent]}")
             prof.arm("fail-client", False)
+
+        # The GPU sync follows the submitting client's own setting.
+        seen_sync = []
+        real_sync = prof.cuda_sync
+        prof.cuda_sync = lambda enabled=None: seen_sync.append(enabled)
+        try:
+            async def ok_god(*a, **k):
+                return ([], {}, False, False)
+            prof._orig_get_output_data = ok_god
+            for cid, cfg in (("nosync", {"sync_cuda": False}), ("sync", {})):
+                prof.arm(cid, True, cfg)
+
+                async def orig_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+                    await prof._wrapped_execute(None, DP(), None, "7", extra_data, set(),
+                                                prompt_id, None, {}, {}, {}, None)
+                asyncio.run(prof._wrap_execute_async(orig_async)(
+                    types.SimpleNamespace(success=True), None, "ps-" + cid,
+                    {"client_id": cid}, []))
+                prof.arm(cid, False)
+        finally:
+            prof.cuda_sync = real_sync
+        check("each run syncs the GPU per its own client's setting",
+              seen_sync == [False, False, True, True], f"got {seen_sync}")
 
         # An upstream signature change must not become a TypeError for
         # every prompt on the box.

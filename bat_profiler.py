@@ -112,6 +112,9 @@ class Config:
     # process — most artists on this box are not debugging, and they
     # should not pay for the per-node GPU sync so that one person can.
     default_enabled: bool = False
+    # Defaults for a newly armed client. The live values are per client
+    # (see _armed below): one artist switching GPU sync off must not
+    # change how somebody else's runs are measured.
     sync_cuda: bool = True
     reset_peak: bool = True
     sample_hz_active: float = 5.0
@@ -138,21 +141,75 @@ CONFIG = Config()
 # the instant it is submitted.
 #
 # The registry is in-memory: a server restart forgets it, and the
-# frontend re-arms from its stored preference on load.
+# frontend re-arms from its stored preference on load (sending its
+# measurement settings along, so those survive the restart too).
+#
+# Each entry also carries that client's measurement settings. A run
+# snapshots its submitter's settings when it starts, so every node of
+# one run is measured the same way even if the panel changes mid-run.
 # ─────────────────────────────────────────────────────────────────────
 _ARMED_LIMIT = 64
-_armed: Dict[str, float] = {}
+# client_id -> {"t": armed at, "config": {sync_cuda, reset_peak, sample_hz}}
+_armed: Dict[str, Dict[str, Any]] = {}
 
 
-def arm(client_id: Optional[str], enabled: bool) -> None:
+def _default_client_config() -> Dict[str, Any]:
+    return {"sync_cuda": CONFIG.sync_cuda, "reset_peak": CONFIG.reset_peak,
+            "sample_hz": CONFIG.sample_hz_active}
+
+
+def _clean_config(patch: Any) -> Dict[str, Any]:
+    """The measurement keys of ``patch``, type-checked and clamped."""
+    out: Dict[str, Any] = {}
+    if not isinstance(patch, dict):
+        return out
+    for k in ("sync_cuda", "reset_peak"):
+        if k in patch:
+            out[k] = bool(patch[k])
+    if "sample_hz" in patch:
+        try:
+            hz = float(patch["sample_hz"])
+            if hz == hz:   # not NaN
+                out["sample_hz"] = max(0.5, min(20.0, hz))
+        except Exception:
+            pass
+    return out
+
+
+def client_config(client_id: Optional[str]) -> Dict[str, Any]:
+    """This client's measurement settings, or the defaults if unarmed."""
+    with _lock:
+        entry = _armed.get(str(client_id)) if client_id else None
+        return dict(entry["config"]) if entry else _default_client_config()
+
+
+def configure(client_id: Optional[str], patch: Any) -> bool:
+    """Apply measurement settings to one armed client. False if unarmed —
+    there is nothing server-side to hold them; the panel keeps them and
+    sends them with the next /arm."""
+    if not client_id:
+        return False
+    with _lock:
+        entry = _armed.get(str(client_id))
+        if entry is None:
+            return False
+        entry["config"].update(_clean_config(patch))
+        return True
+
+
+def arm(client_id: Optional[str], enabled: bool, config: Any = None) -> None:
     if not client_id:
         return
     client_id = str(client_id)
     with _lock:
         if enabled:
-            _armed[client_id] = time.time()
+            entry = _armed.get(client_id)
+            if entry is None:
+                entry = _armed[client_id] = {"config": _default_client_config()}
+            entry["t"] = time.time()
+            entry["config"].update(_clean_config(config))
             if len(_armed) > _ARMED_LIMIT:
-                for k, _ in sorted(_armed.items(), key=lambda kv: kv[1])[:len(_armed) - _ARMED_LIMIT]:
+                for k, _ in sorted(_armed.items(), key=lambda kv: kv[1]["t"])[:len(_armed) - _ARMED_LIMIT]:
                     _armed.pop(k, None)
         else:
             _armed.pop(client_id, None)
@@ -307,8 +364,9 @@ def cuda_peak() -> int:
         return 0
 
 
-def cuda_reset_peak() -> None:
-    if not CONFIG.reset_peak:
+def cuda_reset_peak(enabled: Optional[bool] = None) -> None:
+    """``enabled`` is the run's own setting; None means the server default."""
+    if not (CONFIG.reset_peak if enabled is None else enabled):
         return
     dev = _device()
     if dev is None:
@@ -319,8 +377,9 @@ def cuda_reset_peak() -> None:
         pass
 
 
-def cuda_sync() -> None:
-    if not CONFIG.sync_cuda:
+def cuda_sync(enabled: Optional[bool] = None) -> None:
+    """``enabled`` is the run's own setting; None means the server default."""
+    if not (CONFIG.sync_cuda if enabled is None else enabled):
         return
     dev = _device()
     if dev is None:
@@ -503,6 +562,8 @@ class RunRecord:
         # The browser that submitted the prompt. Every event about this
         # run goes to that socket only — see _send().
         self.client_id = client_id
+        # The submitter's measurement settings, frozen for the whole run.
+        self.config: Dict[str, Any] = client_config(client_id)
         self.workflow: Optional[str] = None
         self.started = time.time()
         self.ended: Optional[float] = None
@@ -539,6 +600,7 @@ class RunRecord:
             "peak_dev": max((n.dev_peak for n in self.nodes.values()), default=0),
             "bytes_out": sum(n.bytes_out for n in self.nodes.values()),
             "error": self.error,
+            "config": self.config,
         }
 
     def to_dict(self, with_samples: bool = True) -> Dict[str, Any]:
@@ -597,23 +659,28 @@ def state_payload(workflow: Optional[str] = None,
         runs = list(_history)
         if _current is not None:
             runs.append(_current)
+        # Only the caller's own runs: a summary carries the workflow
+        # path, and on a shared box that is somebody else's business.
+        # No client id, no runs.
+        cid = str(client_id) if client_id else None
+        runs = [r for r in runs if cid is not None and r.client_id == cid]
         if workflow:
             runs = [r for r in runs if r.workflow == workflow]
+        mine = _current is not None and cid is not None and _current.client_id == cid
         return {
             "config": {
                 # "enabled" is this client's own arming state, not a
-                # server-wide switch — see arm() for why.
+                # server-wide switch — see arm() for why. The rest are
+                # this client's settings too (defaults while unarmed).
                 "enabled": is_armed(client_id) if client_id else CONFIG.default_enabled,
-                "sync_cuda": CONFIG.sync_cuda,
-                "reset_peak": CONFIG.reset_peak,
-                "sample_hz": CONFIG.sample_hz_active,
+                **client_config(client_id),
             },
             "capabilities": {
                 "psutil": psutil is not None,
                 "cuda": _device() is not None,
                 "io": _io_supported,
             },
-            "current": _current.prompt_id if _current else None,
+            "current": _current.prompt_id if mine else None,
             "runs": [r.summary() for r in runs],
         }
 
@@ -698,7 +765,14 @@ class Sampler(threading.Thread):
                 with _lock:
                     run = _current
                 active = run is not None
-                hz = CONFIG.sample_hz_active if active else CONFIG.sample_hz_idle
+                # The running prompt's own rate. ComfyUI executes one
+                # prompt at a time (a single prompt_worker thread), and
+                # we only sample while a run is open, so at any moment
+                # exactly one client's rate is the one needed — a max
+                # over every armed client would oversample runs whose
+                # owner asked for less.
+                hz = (run.config.get("sample_hz", CONFIG.sample_hz_active)
+                      if active else CONFIG.sample_hz_idle)
                 interval = 1.0 / max(hz, 0.2)
 
                 # Only sample while a run is actually going. Between
@@ -973,9 +1047,10 @@ async def _wrapped_execute(*args, **kwargs):
         return await _orig_execute(*args, **kwargs)
 
     sampler = _sampler
+    cfg = run.config
     try:
-        cuda_sync()
-        cuda_reset_peak()
+        cuda_sync(cfg.get("sync_cuda"))
+        cuda_reset_peak(cfg.get("reset_peak"))
         cu0 = cuda_stats()
         r0 = rss()
         io0 = io_counters()
@@ -1000,7 +1075,7 @@ async def _wrapped_execute(*args, **kwargs):
         raise
     finally:
         try:
-            cuda_sync()
+            cuda_sync(cfg.get("sync_cuda"))
             dt = time.perf_counter() - t0
             cu1 = cuda_stats()
             r1 = rss()

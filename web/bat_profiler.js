@@ -113,6 +113,11 @@ const state = {
   // comes back still recording.
   config: { enabled: false, sync_cuda: true, reset_peak: true },
   wantArmed: false,
+  // Measurement settings this browser chose (GPU sync etc.). They are
+  // per client on the server and live only while armed, so the panel
+  // keeps its own copy and sends it with every /arm — a re-arm after a
+  // server restart then measures exactly as before.
+  measure: {},
   // Per-chart axis mode: "ceiling" (against the machine's limit) or
   // "fit" (against the data). Ceiling is right almost always; fit is
   // for a trace so far below the limit it has no visible shape.
@@ -132,6 +137,7 @@ function loadPrefs() {
     if (typeof p.hideCached === "boolean") state.hideCached = p.hideCached;
     if (typeof p.armed === "boolean") state.wantArmed = p.armed;
     if (p.chartScale) Object.assign(state.chartScale, p.chartScale);
+    if (p.measure && typeof p.measure === "object") Object.assign(state.measure, p.measure);
   } catch (e) { /* first run */ }
 }
 
@@ -141,6 +147,7 @@ function savePrefs() {
       sort: state.sort, desc: state.desc, hideCached: state.hideCached,
       armed: !!state.config.enabled,
       chartScale: state.chartScale,
+      measure: state.measure,
     }));
   } catch (e) { /* quota — prefs are not worth pruning for */ }
 }
@@ -294,6 +301,9 @@ async function fetchState() {
     const data = await res.json();
     state.capabilities = data.capabilities || {};
     state.config = data.config || state.config;
+    // Unarmed, the server only knows its defaults; show what arming
+    // will actually apply.
+    if (!state.config.enabled) Object.assign(state.config, state.measure);
     state.backendCurrent = data.current || null;
   } catch (e) { /* backend older than the panel — degrade quietly */ }
 }
@@ -325,12 +335,13 @@ async function setArmed(enabled) {
     const res = await api.fetchApi("/bat/profiler/arm", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_id: cid, enabled }),
+      body: JSON.stringify({ ...state.measure, client_id: cid, enabled }),
     });
     if (res.ok) {
       const data = await res.json();
       state.capabilities = data.capabilities || state.capabilities;
       state.config = data.config || state.config;
+      if (!state.config.enabled) Object.assign(state.config, state.measure);
       render();
     }
   } catch (e) {
@@ -372,13 +383,20 @@ api.addEventListener("status", () => {
 
 async function pushConfig(patch) {
   Object.assign(state.config, patch);
-  try {
-    await api.fetchApi("/bat/profiler/config", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(patch),
-    });
-  } catch (e) { /* ignore */ }
+  Object.assign(state.measure, patch);
+  savePrefs();
+  // This browser's settings only — the server keeps them per client and
+  // applies them from our next run. Unarmed, they wait for the next /arm.
+  const cid = clientId();
+  if (cid) {
+    try {
+      await api.fetchApi("/bat/profiler/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...patch, client_id: cid }),
+      });
+    } catch (e) { /* ignore */ }
+  }
   render();
 }
 
@@ -1363,7 +1381,8 @@ async function copyReport() {
       runCount: runsForTab().length,
       workflowName: state.wfName,
       system: systemStats,
-      config: state.config,
+      // What this run was measured with, not what the panel says now.
+      config: run.config || state.config,
     });
   } catch (e) {
     console.error("[BAT Profiler] report build failed:", e);
