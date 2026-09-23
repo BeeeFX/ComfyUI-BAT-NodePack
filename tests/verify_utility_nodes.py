@@ -209,6 +209,13 @@ def test_lists(bl):
     check("join lists", B.join([1, 2], [3]) == ([1, 2, 3],))
     check("join passes through a missing side", B.join(None, [9]) == ([9],))
 
+    # The executor hands an INPUT_IS_LIST node the whole ComfyUI list at once
+    # (and a plain output as a list of one).
+    LL = bl.BatListLengthList
+    check("List Length (list) takes the whole list", LL.INPUT_IS_LIST is True)
+    check("15 tiles count as 15", LL().length(["tile"] * 15) == (15,))
+    check("a single batch counts as 1", LL().length([[1, 2, 3]]) == (1,))
+
     try:
         import torch
     except ImportError:
@@ -702,6 +709,58 @@ def test_vace():
           torch.allclose(img[40], one[0]) and float(msk[40].max()) == 0.0
           and float(msk[41].min()) == 1.0)
 
+    # A plate with no mask used to be premultiplied to flat grey — gone.
+    plate = torch.rand(81, 8, 8, 3) * 0.5 + 0.25
+    img, msk = vb.VaceBatchTool().build(81, True, 127, plate_image=plate)
+    check("a plate without a mask keeps its pixels under premultiply",
+          torch.allclose(img, plate) and float(msk.min()) == 1.0)
+    km = torch.zeros(1, 8, 8)
+    km[0, :4] = 1.0
+    img, msk = vb.VaceBatchTool().build(81, True, 127, plate_image=plate,
+                                        mask_1=km, index_1=20)
+    check("...but a keyframe mask on it is still premultiplied",
+          torch.allclose(img[20, :4], torch.full((4, 8, 3), 127 / 255))
+          and torch.allclose(img[20, 4:], plate[20, 4:])
+          and torch.allclose(img[21], plate[21]))
+    pm = torch.zeros(81, 8, 8)
+    pm[:, :, :4] = 1.0
+    img, msk = vb.VaceBatchTool().build(81, True, 127, plate_image=plate, plate_mask=pm)
+    check("a plate WITH a mask premultiplies exactly as before",
+          torch.allclose(img[..., :4, :], torch.full((81, 8, 4, 3), 127 / 255))
+          and torch.allclose(img[..., 4:, :], plate[..., 4:, :]))
+    img, _ = vb.VaceBatchTool().build(81, False, 127, plate_image=plate)
+    check("premultiply off is unchanged", torch.allclose(img, plate))
+
+
+def test_ref_aligner():
+    print("\nref aligner preview sidecar")
+    try:
+        import torch
+    except ImportError:
+        print("  skip  (no torch)")
+        return
+    import tempfile
+    ui_ref = importlib.import_module("batpkg.bat_ui_ref")
+    ra = importlib.import_module("batpkg.bat_ref_aligner")
+    tmp = tempfile.mkdtemp(prefix="bat_ui_ref_")
+    orig = ui_ref._sidecar_dir
+    ui_ref._sidecar_dir = lambda: tmp
+    try:
+        out = ra.RefAligner().align(torch.rand(1, 32, 48, 3), torch.rand(1, 20, 20, 3),
+                                    0, 0, 1.0, 0.0, "edge_pixel", "128,128,128")
+        ui = out["ui"]
+        check("the base64 previews stay out of the history",
+              set(ui) == {"bat_ui"}, str(sorted(ui)))
+        full = ui_ref.load_ui(ui)
+        check("...and resolve to the dict the editor always got",
+              full is not None and full["plate_w"] == [48] and full["ref_h"] == [20]
+              and full["plate"][0] and full["reference"][0])
+        check("outputs unchanged in shape",
+              tuple(out["result"][0].shape) == (1, 32, 48, 3)
+              and tuple(out["result"][1].shape) == (1, 32, 48))
+    finally:
+        ui_ref._sidecar_dir = orig
+
 
 def main():
     bc, bl, bs = load_pack_modules()
@@ -712,6 +771,7 @@ def main():
     test_show(bs)
     test_batch_formats()
     test_vace()
+    test_ref_aligner()
     test_migrations()
     test_show_js()
     test_vace_js()

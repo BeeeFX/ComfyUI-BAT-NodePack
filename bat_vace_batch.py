@@ -1,5 +1,21 @@
+import logging
+
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger("[Bat_VaceBatchTool]")
+_warned_plate_no_mask = False
+
+
+def _note_plate_without_mask():
+    """Say once per session why a mask-less plate is no longer greyed out."""
+    global _warned_plate_no_mask
+    if _warned_plate_no_mask:
+        return
+    _warned_plate_no_mask = True
+    logger.info("plate_image has no plate_mask: the plate is kept as-is "
+                "(mask 1, not premultiplied). Wire a plate_mask to choose "
+                "what is regenerated.")
 
 
 class _AnyType(str):
@@ -136,6 +152,11 @@ class VaceBatchTool:
 
         images = torch.full((num_frames, H, W, 3), fc, dtype=torch.float32)
         masks = torch.ones((num_frames, H, W), dtype=torch.float32)
+        # Frames whose mask is only the all-ones default under a plate that
+        # came without a mask. premultiply skips them: it used to grey the
+        # whole plate out, so wiring a plate alone produced a batch with none
+        # of it left. The mask stays 1 (generate), the pixels stay the plate.
+        keep_plate = torch.zeros((num_frames,), dtype=torch.bool)
 
         # Plate: fill base sequence; hold last frame if plate is shorter
         if plate_image is not None:
@@ -144,6 +165,9 @@ class VaceBatchTool:
             images[:n] = p[:n]
             if p.shape[0] < num_frames:
                 images[p.shape[0]:] = p[-1:]
+            if plate_mask is None:
+                keep_plate[:] = True
+                _note_plate_without_mask()
         if plate_mask is not None:
             pm = _resize_mask(plate_mask, H, W).to(masks.dtype).cpu()
             n = min(pm.shape[0], num_frames)
@@ -166,6 +190,7 @@ class VaceBatchTool:
                 km = kf_mask.unsqueeze(0) if kf_mask.ndim == 2 else kf_mask
                 km = _resize_mask(km[:take], H, W).to(masks.dtype).cpu()
                 masks[idx:idx + km.shape[0]] = km
+                keep_plate[idx:idx + km.shape[0]] = False
             elif kf_img is not None:
                 # Image given without a mask → preserve frame (black mask).
                 #
@@ -178,6 +203,7 @@ class VaceBatchTool:
 
         if premultiply:
             m = masks.unsqueeze(-1).clamp(0.0, 1.0)
+            m[keep_plate] = 0.0
             images = images * (1.0 - m) + fc * m
 
         return (images, masks)

@@ -85,7 +85,7 @@ def _guarded(module, *names):
 
     One module that cannot import — a missing optional dependency, a syntax slip
     in a file being edited on the shared install — used to take the whole pack
-    down: ComfyUI marks the package IMPORT FAILED and all 43 nodes (and the
+    down: ComfyUI marks the package IMPORT FAILED and every node (and the
     profiler hooks) vanish, so every workflow using any BAT node breaks at once.
     Now only that module's nodes are missing, and the log names the reason.
     """
@@ -99,6 +99,7 @@ def _guarded(module, *names):
 
 
 (VideoGridSplit,) = _guarded("bat_video_grid_split", "VideoGridSplit")
+(BatGridMerge,) = _guarded("bat_grid_merge", "BatGridMerge")
 (VaceBatchTool,) = _guarded("bat_vace_batch", "VaceBatchTool")
 (VoltWanContextCalculator,) = _guarded("bat_wan_context_calculator", "VoltWanContextCalculator")
 VoltWanBatchFormat, VoltWanBatchCrop = _guarded(
@@ -133,9 +134,9 @@ BatGrowMask, BatErodeMask = _guarded("bat_mask_morph", "BatGrowMask", "BatErodeM
 BatShowAny, BatShowTensorShape = _guarded("bat_show", "BatShowAny", "BatShowTensorShape")
 BatConvertAny, BatAnyToString, BatNumberToString = _guarded(
     "bat_convert", "BatConvertAny", "BatAnyToString", "BatNumberToString")
-BatCompare, BatIndexSwitch, BatListLength, BatListIndex, BatListBatch = _guarded(
+BatCompare, BatIndexSwitch, BatListLength, BatListIndex, BatListBatch, BatListLengthList = _guarded(
     "bat_logic", "BatCompare", "BatIndexSwitch", "BatListLength", "BatListIndex",
-    "BatListBatch")
+    "BatListBatch", "BatListLengthList")
 
 # ─── Execution profiler ──────────────────────────────────────────────
 # Not a node: a sidebar panel that instruments *every* node in the graph
@@ -180,6 +181,7 @@ except Exception:
 # parameters, and links.
 NODE_CLASS_MAPPINGS = {
     "Bat_VideoGridSplit":       VideoGridSplit,
+    "Bat_GridMerge":            BatGridMerge,
     "Bat_VaceBatchTool":        VaceBatchTool,
     "Bat_WanContextCalculator": VoltWanContextCalculator,
     "Bat_WanBatchFormat":       VoltWanBatchFormat,
@@ -224,12 +226,14 @@ NODE_CLASS_MAPPINGS = {
     "Bat_ListLength":           BatListLength,
     "Bat_ListIndex":            BatListIndex,
     "Bat_ListBatch":            BatListBatch,
+    "Bat_ListLengthList":       BatListLengthList,
 }
 
 # Display names — bat emoji prefix so the nodes stand out as
 # personal-pack helpers in the right-click "Add Node" menu.
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_VideoGridSplit":       "🦇 Video Grid Split",
+    "Bat_GridMerge":            "🦇 Video Grid Merge",
     "Bat_VaceBatchTool":        "🦇 VACE Batch Tool",
     "Bat_WanContextCalculator": "🦇 WAN Context Calculator",
     "Bat_WanBatchFormat":       "🦇 WAN Batch Format",
@@ -273,6 +277,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_ListLength":           "🦇 List Length",
     "Bat_ListIndex":            "🦇 List Index",
     "Bat_ListBatch":            "🦇 List Batch",
+    "Bat_ListLengthList":       "🦇 List Length (list)",
 }
 
 # Drop whatever failed to import (see _guarded), so ComfyUI never sees a None

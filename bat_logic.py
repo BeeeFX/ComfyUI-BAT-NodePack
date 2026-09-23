@@ -234,6 +234,37 @@ class BatListLength:
         return (1,)
 
 
+class BatListLengthList:
+    """How many items a ComfyUI LIST carries (not the frames of one batch)."""
+
+    # 🦇 List Length runs once PER ITEM when handed a ComfyUI list (an output
+    # marked OUTPUT_IS_LIST, e.g. 🦇 Video Grid Split's tiles), so fifteen
+    # tiles gave fifteen frame counts instead of 15. INPUT_IS_LIST makes the
+    # executor pass the whole list in one call. Picking an item and joining
+    # lists are already core: "Get Item From List" and "Create List"
+    # (comfy_extras/nodes_toolkit.py) — length is the one core lacks.
+    INPUT_IS_LIST = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"value": (ANY, {
+            "tooltip": "A ComfyUI list. A plain (non-list) input counts as 1 — "
+                       "for frames in a batch use 🦇 List Length.",
+        })}}
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("length",)
+    FUNCTION = "length"
+    CATEGORY = "BAT/Logic"
+    DESCRIPTION = (
+        "Number of items in a ComfyUI list (e.g. the tiles from 🦇 Video Grid "
+        "Split). 🦇 List Length counts the frames of a batch instead."
+    )
+
+    def length(self, value=None):
+        return (len(value) if value is not None else 0,)
+
+
 class BatListIndex:
     """Pick item N out of a batch or list."""
 
