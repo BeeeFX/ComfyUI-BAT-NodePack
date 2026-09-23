@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from .bat_ui_ref import stash_ui
+
 
 def _first(img):
     """First frame of an IMAGE batch as (1,H,W,C)."""
@@ -192,8 +194,11 @@ class RefAligner:
             image = sampled.clamp(0, 1)
 
         mask = alpha
+        # The two previews are base64 images (up to ~1-2 MB a run), so they go
+        # to the sidecar rather than into ComfyUI's prompt history; the
+        # editor receives the same dict either way (web/bat_ui_ref.js).
         return {
-            "ui": {
+            "ui": stash_ui({
                 "plate": [_b64_jpeg(plate)],
                 # Reference goes back as RGBA PNG carrying `alpha_src` so
                 # the editor's preview shows the ref cut by the mask (or
@@ -205,6 +210,6 @@ class RefAligner:
                 "reference": [_b64_png_rgba(reference, alpha_src)],
                 "plate_w": [int(W)], "plate_h": [int(H)],
                 "ref_w": [int(rw)], "ref_h": [int(rh)],
-            },
+            }),
             "result": (image.cpu(), mask.cpu()),
         }

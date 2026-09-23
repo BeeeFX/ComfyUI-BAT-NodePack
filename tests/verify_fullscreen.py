@@ -580,6 +580,29 @@ def test_escape():
           "document.body.children.filter(function (c) { return c.className === 'bat-fs-overlay'; }).length", 0)
     check("and the editor is home", ctx, "t.root.parentNode === t.wrapper", True)
 
+    # Core's keybindHandler is a window keydown listener registered at startup,
+    # so it runs BEFORE ours, and it preventDefault()s every bare Escape (bound
+    # to Comfy.Graph.ExitSubgraph) unless isModalOpen() — which counts a
+    # rendered [role=dialog][aria-modal=true]. Model exactly that.
+    ctx2 = make_ctx()
+    ctx2.eval("""
+        __winKeys.push(function coreKeybindHandler(ev) {
+            if (ev.key !== 'Escape') return;
+            var modal = document.body.children.some(function (c) {
+                return c.getAttribute && c.getAttribute('role') === 'dialog'
+                    && c.getAttribute('aria-modal') === 'true';
+            });
+            if (!modal) ev.preventDefault();
+        });
+        var t = build(); t.handle.enter();
+    """)
+    check("the overlay declares itself a modal dialog", ctx2,
+          "document.body.children.filter(function (c) { return c.className === 'bat-fs-overlay'"
+          " && c.getAttribute('role') === 'dialog' && c.getAttribute('aria-modal') === 'true'; }).length", 1)
+    ctx2.eval("pressKey('Escape', false);")
+    check("Escape still closes it with core's keybinding handler in front", ctx2,
+          "document.body.children.filter(function (c) { return c.className === 'bat-fs-overlay'; }).length", 0)
+
 
 def test_one_at_a_time():
     print("\none editor maximised at a time")
@@ -621,6 +644,15 @@ def test_roto_escape_is_releasable():
     if not ok:
         FAILURES.append("bat_roto.js: a no-op Escape still calls preventDefault, "
                         "so it would trap the artist in fullscreen")
+    # ...and a key it DOES use must stop there: core's window keybinding
+    # handler ignores defaultPrevented, so a bubbling Delete also ran
+    # "Delete Selected Items" and removed the (focus-selected) Roto node.
+    ok = ("const consume = (e) => { e.preventDefault(); e.stopPropagation(); };" in src
+          and "if (handled) consume(e);" in src)
+    print(f"  {'ok  ' if ok else 'FAIL'} roto stops propagation of every key it handles")
+    if not ok:
+        FAILURES.append("bat_roto.js: handled keys bubble to core's keybindings "
+                        "(Delete would delete the selected Roto node)")
 
 
 def test_all_six_are_wired():

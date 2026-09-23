@@ -12,10 +12,10 @@ Self-contained: image/sequence helpers live here; video decoding reuses this
 pack's bat_video_loader.
 """
 
+import asyncio
 import io
 import os
 import re
-import glob
 import logging
 from collections import OrderedDict
 
@@ -25,7 +25,11 @@ from PIL import Image
 
 import server
 
-from .bat_video_loader import probe_video, load_frames
+from .bat_loader import read_still
+from .bat_sequence import SequenceHandler
+from .bat_video_loader import (THUMB_DECODE_SLOTS, _fingerprint, _tensor_nbytes,
+                               frame_cache_budget, load_frames, path_allowed,
+                               probe_video)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +38,9 @@ VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
 
 _FRAME_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
 _FRAME_CACHE_MAX = 8
+
+# What the routes will open, checked on the resolved file (see path_allowed).
+_ALLOWED_EXTS = {e.lstrip(".") for e in IMG_EXTS + VIDEO_EXTS}
 
 
 # ─── Path / sequence helpers ──────────────────────────────────────────────────
@@ -75,22 +82,17 @@ def _sequence_patterns(names):
 
 
 def find_sequence_files(pattern_path):
-    """All files on disk matching a name.####.ext pattern, frame-sorted."""
-    pattern_path = pattern_path.replace("\\", "/")
-    m = re.search(r"#+", pattern_path)
-    if not m:
-        return []
-    pad = m.group(0)
-    glob_pat = pattern_path.replace(pad, "*")
-    found = [f.replace("\\", "/") for f in glob.glob(glob_pat)]
-    escaped = re.escape(pattern_path)
-    rx = re.compile("^" + escaped.replace(re.escape(pad), rf"\d{{{len(pad)}}}") + "$",
-                    re.IGNORECASE)
-    return sorted(f for f in found if rx.match(f))
+    """All files on disk matching a name.####.ext pattern, frame-sorted.
+
+    The loader's matcher rather than a copy of it: this one globbed the whole
+    path unescaped (a `[v2]` folder matched nothing) and took a `#` in a folder
+    name for frame padding.
+    """
+    return SequenceHandler.find_sequence_files(pattern_path)
 
 
 def _source_type(path):
-    if "#" in path:
+    if SequenceHandler.detect_sequence_pattern(path):
         return "sequence"
     if path.lower().endswith(VIDEO_EXTS):
         return "video"
@@ -133,8 +135,10 @@ def _load_image_file(path):
                 return np.ascontiguousarray(arr[:, :, :3]).astype(np.float32)
             except Exception:
                 raise RuntimeError(f"Could not read EXR {path}: {e}")
-    img = Image.open(path).convert("RGB")
-    return np.asarray(img, dtype=np.float32) / 255.0
+    # The loader's still reader, so a 16-bit PNG/TIFF keeps its depth (and a
+    # 16-bit greyscale one isn't clipped to white).
+    rgba, scale = read_still(path)
+    return rgba[:, :, :3].astype(np.float32) / scale
 
 
 def resolve_frame_file(path, frame_index):
@@ -162,6 +166,16 @@ def is_float_source(path, frame_index=0):
     if not f:
         return False
     return os.path.splitext(f)[1].lower() in (".exr", ".hdr", ".tif", ".tiff")
+
+
+def _frame_target(path, frame_index):
+    """The file whose bytes decide `frame_index` of `path`: the resolved frame
+    of a sequence (not its first file, which is what IS_CHANGED used to stat),
+    or the file itself."""
+    try:
+        return resolve_frame_file(path, frame_index) or path
+    except (TypeError, ValueError):
+        return path
 
 
 def load_one_frame(path, frame_index):
@@ -222,17 +236,8 @@ class BatFramePicker:
     @classmethod
     def IS_CHANGED(cls, path, frame_index, linear_to_srgb):
         p = _strip_path(path)
-        mt = 0.0
-        try:
-            # For a sequence pattern, stat the first matching file.
-            stat_target = p
-            if _source_type(p) == "sequence":
-                files = find_sequence_files(p)
-                stat_target = files[0] if files else p
-            mt = os.path.getmtime(stat_target)
-        except OSError:
-            pass
-        return f"{p}|{frame_index}|{linear_to_srgb}|{mt}"
+        target = _frame_target(p, frame_index)
+        return f"{p}|{frame_index}|{linear_to_srgb}|{target}|{_fingerprint(target)}"
 
     def load(self, path, frame_index, linear_to_srgb=False):
         path = _strip_path(path)
@@ -241,7 +246,12 @@ class BatFramePicker:
         if _source_type(path) != "sequence" and not os.path.isfile(path):
             raise FileNotFoundError(f"Bat_FramePicker: not a file: {path!r}")
 
-        key = (path, int(frame_index), bool(linear_to_srgb))
+        # The file's fingerprint is part of the key. Without it a re-rendered
+        # frame re-ran this node (IS_CHANGED moved) and then got the OLD
+        # tensor straight back out of this cache.
+        target = _frame_target(path, frame_index)
+        key = (path, int(frame_index), bool(linear_to_srgb), target,
+               _fingerprint(target))
         cached = _FRAME_CACHE.get(key)
         if cached is not None:
             _FRAME_CACHE.move_to_end(key)
@@ -271,8 +281,14 @@ class BatFramePicker:
 
         tensor = torch.from_numpy(arr).unsqueeze(0).contiguous()  # (1,H,W,3)
         _FRAME_CACHE[key] = tensor
-        while len(_FRAME_CACHE) > _FRAME_CACHE_MAX:
-            _FRAME_CACHE.popitem(last=False)
+        # By count AND bytes: eight float32 4K frames is ~800 MB, which no
+        # cache-clear in ComfyUI reaches — so it shrinks with free RAM, on the
+        # same budget as 🦇 Video Loader's cache (frame_cache_budget).
+        budget = frame_cache_budget()
+        total = sum(_tensor_nbytes(t) for t in _FRAME_CACHE.values())
+        while _FRAME_CACHE and (len(_FRAME_CACHE) > _FRAME_CACHE_MAX or total > budget):
+            _key, victim = _FRAME_CACHE.popitem(last=False)
+            total -= _tensor_nbytes(victim)
         return (tensor,)
 
 
@@ -289,14 +305,20 @@ async def bat_frame_picker_getpath(request):
         return server.web.Response(status=204)
 
     path = os.path.abspath(_strip_path(raw))
-    if not os.path.isdir(path):
-        return server.web.json_response([])
-
     valid_extensions = query.get("extensions")
     exts = (
         set(e.strip().lower() for e in valid_extensions.split(",") if e.strip())
         if valid_extensions else None
     )
+    # Off the event loop (a listing on a network mount can take seconds).
+    return server.web.json_response(
+        await asyncio.to_thread(_list_dir, path, exts))
+
+
+def _list_dir(path, exts):
+    """The body of /bat/frame-picker/getpath."""
+    if not os.path.isdir(path) or not path_allowed(path):
+        return []
 
     items = []
     file_names = []
@@ -314,7 +336,7 @@ async def bat_frame_picker_getpath(request):
                 pass
     except Exception as e:
         logger.error(f"[Bat FramePicker] getpath error: {e}")
-        return server.web.json_response([])
+        return []
 
     # Collapse numbered stills into sequence patterns as selectable entries.
     items.extend(_sequence_patterns(file_names))
@@ -338,7 +360,7 @@ async def bat_frame_picker_getpath(request):
     # Sequence patterns ("name.####.ext") aren't real files — keep them at 0 so
     # they group together, as before.
     items.sort(key=lambda f: mtimes.get(f, 0.0) if "#" not in f else 0.0)
-    return server.web.json_response(items)
+    return items
 
 
 @server.PromptServer.instance.routes.get("/bat/frame-picker/info")
@@ -346,13 +368,20 @@ async def bat_frame_picker_info(request):
     path = _strip_path(request.rel_url.query.get("path", ""))
     if not path:
         return server.web.json_response({"ok": False, "error": "no path"})
+    return server.web.json_response(await asyncio.to_thread(_info, path))
+
+
+def _info(path):
+    """The body of /bat/frame-picker/info. Counting a sequence lists its folder."""
     t = _source_type(path)
-    if t != "sequence" and not os.path.isfile(path):
-        return server.web.json_response({"ok": False, "error": "not a file"})
+    # A refusal reads exactly like a missing file.
+    if not path_allowed(path, _ALLOWED_EXTS) or (
+            t != "sequence" and not os.path.isfile(path)):
+        return {"ok": False, "error": "not a file"}
     frames = count_frames(path)
     if not frames:
-        return server.web.json_response({"ok": False, "error": "no frames found", "type": t})
-    return server.web.json_response({"ok": True, "type": t, "frames": frames})
+        return {"ok": False, "error": "no frames found", "type": t}
+    return {"ok": True, "type": t, "frames": frames}
 
 
 @server.PromptServer.instance.routes.get("/bat/frame-picker/frame")
@@ -368,14 +397,33 @@ async def bat_frame_picker_frame(request):
     except ValueError:
         max_w = 256
 
-    if not path or (_source_type(path) != "sequence" and not os.path.isfile(path)):
-        return server.web.Response(status=404, text="bad path")
+    if not path:
+        return server.web.Response(status=404, text="not found")
     try:
-        arr = load_one_frame(path, frame)
+        body = await asyncio.to_thread(_frame_jpeg, path, frame, max_w)
     except Exception as e:
-        return server.web.Response(status=500, text=f"decode error: {e}")
+        # Logged, not echoed: the exception text names paths and permissions.
+        logger.debug("[Bat FramePicker] thumbnail failed for %s: %s", path, e)
+        return server.web.Response(status=500, text="could not decode frame")
+    if body is None:
+        return server.web.Response(status=404, text="not found")
+    return server.web.Response(body=body, content_type="image/jpeg")
 
-    if path.lower().endswith(".exr"):
+
+def _frame_jpeg(path, frame, max_w):
+    """The body of /bat/frame-picker/frame: JPEG bytes, or None when refused.
+
+    This route used to decode ANY image on disk it was pointed at. It now opens
+    only what the node itself would load — an allowed extension on the RESOLVED
+    file, inside BAT_STRICT_PATHS — and answers everything else as not found.
+    """
+    target = _frame_target(path, frame)
+    if not path_allowed(target, _ALLOWED_EXTS) or not os.path.isfile(target):
+        return None
+    with THUMB_DECODE_SLOTS:
+        arr = load_one_frame(path, frame)
+
+    if target.lower().endswith(".exr"):
         arr = _linear_to_srgb(arr)
     img = Image.fromarray(np.clip(arr * 255.0, 0, 255).astype(np.uint8))
     if img.width > max_w:
@@ -383,4 +431,4 @@ async def bat_frame_picker_frame(request):
         img = img.resize((max_w, h), Image.BILINEAR)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
-    return server.web.Response(body=buf.getvalue(), content_type="image/jpeg")
+    return buf.getvalue()

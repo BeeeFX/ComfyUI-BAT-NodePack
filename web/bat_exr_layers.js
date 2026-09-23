@@ -22,8 +22,30 @@ import { api } from "../../scripts/api.js";
 
 const NODE_TYPES = new Set(["Bat_ExrLayer", "Bat_CryptomatteMatte"]);
 
-/** Layer names last reported per node id. */
+/**
+ * Layer names last reported, keyed by the id the backend saw — the node's
+ * EXECUTION id, which for a node inside a subgraph is its path ("12:5"), not
+ * its local `node.id`. Insertion order is kept most-recent-last.
+ */
 const known = new Map();
+
+/** Names for `node`: an exact id match, else the latest subgraph path ending in it. */
+function namesFor(node) {
+    const id = String(node.id);
+    if (known.has(id)) return known.get(id);
+    const suffix = `:${id}`;
+    for (const [key, names] of [...known].reverse()) {
+        if (key.endsWith(suffix)) return names;
+    }
+    return [];
+}
+
+// Where the last press landed. Under Nodes 2.0 the button widget's callback
+// gets no event (WidgetButton.vue calls callback(undefined)), and a ContextMenu
+// without one opens at the window's top-left corner. Capture phase, so nothing
+// that stops propagation further down can hide the press from us.
+let lastPointerDown = null;
+document.addEventListener("pointerdown", (e) => { lastPointerDown = e; }, true);
 
 function setLayerName(node, value) {
     const w = node.widgets?.find((x) => x.name === "layer_name");
@@ -38,7 +60,7 @@ function setLayerName(node, value) {
 }
 
 function pickLayer(node, event) {
-    const names = known.get(String(node.id)) || [];
+    const names = namesFor(node);
     if (!names.length) {
         // Nothing to offer yet. Say why, rather than opening an empty menu.
         app.extensionManager?.toast?.add?.({
@@ -51,7 +73,7 @@ function pickLayer(node, event) {
         return;
     }
     new LiteGraph.ContextMenu(names, {
-        event,
+        event: event || lastPointerDown || undefined,
         title: "Layer",
         scale: Math.max(1, app.canvas?.ds?.scale || 1),
         callback: (value) => setLayerName(node, value),
@@ -64,7 +86,9 @@ app.registerExtension({
     setup() {
         api.addEventListener("bat-layers", ({ detail }) => {
             if (!detail || detail.node == null) return;
-            known.set(String(detail.node), Array.isArray(detail.layers) ? detail.layers : []);
+            const key = String(detail.node);
+            known.delete(key);                      // re-insert as most recent
+            known.set(key, Array.isArray(detail.layers) ? detail.layers : []);
             const node = app.graph?.getNodeById?.(detail.node);
             node?.setDirtyCanvas(true, true);
         });
@@ -91,6 +115,12 @@ app.registerExtension({
         const onRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
             known.delete(String(this.id));
+            // A node inside a subgraph was reported under its path.
+            if (this.graph && this.graph !== app.graph) {
+                for (const key of [...known.keys()]) {
+                    if (key.endsWith(`:${this.id}`)) known.delete(key);
+                }
+            }
             return onRemoved ? onRemoved.apply(this, arguments) : undefined;
         };
     },

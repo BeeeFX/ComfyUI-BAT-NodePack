@@ -49,22 +49,127 @@ const KEY = "_batLifecycle";
  * imgW/imgH, and shapes drew against a bogus reference. Including the workflow
  * identity makes the key unique across graphs.
  *
+ * The identity is the root graph's UUID. `LGraph.serialize()` writes it out as
+ * the workflow's top-level `id` and `_configureBase()` restores it on load, so
+ * it is stable across reloads of the same workflow and distinct between
+ * workflows. (This used to read `graph.extra.workflow_id`, which nothing — core
+ * or this pack — ever sets, so every key fell through to the page path and the
+ * collision above was still there.)
+ *
  * `app` is imported lazily (inside the call) so this module stays usable in
  * contexts where the ComfyUI app module isn't loaded.
  */
 export function batWorkflowKey(app) {
     try {
-        const g = app?.graph;
-        const id = g?.extra?.workflow_id || g?.extra?.workflowId
-                || g?.extra?.ds?.workflow_id || "";
+        const g = app?.graph;           // the root graph (app.graph === app.rootGraph)
+        const id = g?.rootGraph?.id ?? g?.id;
         if (id) return String(id);
     } catch (_) { /* fall through */ }
     try { return String(window.location?.pathname || "_"); } catch (_) { return "_"; }
 }
 
-/** Build a workflow-scoped, node-scoped localStorage key. */
+/**
+ * Build a workflow-scoped, node-scoped localStorage key.
+ *
+ * Node ids are only unique within one graph, and every subgraph numbers its
+ * own nodes, so a node inside a subgraph also folds in that subgraph's id —
+ * the same scoping `execKey()` below uses. Root-graph nodes keep the plain
+ * form. The node's OWN root graph is preferred over `app.graph` when the node
+ * is attached, so the key never follows whichever workflow happens to be active.
+ */
 export function batNodeCacheKey(app, prefix, node) {
-    return `${prefix}_${batWorkflowKey(app)}_${node?.id ?? "_"}`;
+    let wf = null, sub = "";
+    try {
+        const g = node?.graph;
+        const root = g?.rootGraph;
+        if (root?.id) wf = String(root.id);
+        if (g && root && g !== root && g.id) sub = `${g.id}_`;
+    } catch (_) { /* detached node: fall back to the app's graph */ }
+    return `${prefix}_${wf ?? batWorkflowKey(app)}_${sub}${node?.id ?? "_"}`;
+}
+
+// ─── localStorage budget for the preview caches ─────────────────────────────
+//
+// Every editor keeps a JPEG thumbnail per node so a reopened workflow shows its
+// plate before the next run. Those are 50–300 KB each, and they share the
+// origin's ~5 MB localStorage with ComfyUI's own unsaved-workflow drafts —
+// which, when a write hits the quota, evict the user's OLDEST DRAFTS to make
+// room (workflowDraftStoreV2.handleQuotaExceeded). Unbounded thumbnails would
+// quietly cost people their draft recovery. Since the caches became
+// per-workflow (batNodeCacheKey) they are no longer bounded by the node-id
+// range either, so they get an explicit budget: least-recently-written first
+// out once the total passes CACHE_BUDGET_CHARS.
+
+const CACHE_INDEX_KEY = "bat_cache_lru";
+/** Characters (UTF-16 units) BAT may hold — well under half the quota. */
+const CACHE_BUDGET_CHARS = 1_500_000;
+
+/**
+ * Prefixes of the per-node caches that were keyed by the page path before
+ * batNodeCacheKey used the workflow UUID ("bat_roto_preview_/_14"). Those
+ * keys can never be read again. Grade keyed on the bare node id.
+ */
+const LEGACY_PATH_PREFIXES = [
+    "bat_advblend_view_", "bat_advblend_preview_", "bat_animcrop_preview_",
+    "bat_animgrade_preview_", "bat_bracket_view_", "bat_bracket_preview_",
+    "bat_merge_view_", "bat_hdrcomp_preview_", "bat_hdrcomp_view_",
+    "bat_layered_view_", "bat_rescale_view_", "bat_rescale_src_",
+    "bat_roto_preview_", "bat_sec_plate_", "bat_vc_preview_", "bat_vc_view_",
+    "bat_framehold_tok_",
+];
+
+let legacySwept = false;
+
+/** Drop the orphaned path-scoped and id-only keys, once per page load. */
+function sweepLegacyCacheKeys() {
+    if (legacySwept) return;
+    legacySwept = true;
+    try {
+        const stale = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (!k) continue;
+            const path = LEGACY_PATH_PREFIXES.find((p) => k.startsWith(p));
+            if (path && k.charAt(path.length) === "/") stale.push(k);
+            else if (/^bat_grade_preview_(\d+|_)$/.test(k)) stale.push(k);
+        }
+        for (const k of stale) localStorage.removeItem(k);
+    } catch (_) { /* storage disabled — nothing to sweep */ }
+}
+
+function readCacheIndex() {
+    try {
+        const v = JSON.parse(localStorage.getItem(CACHE_INDEX_KEY) || "[]");
+        return Array.isArray(v)
+            ? v.filter((e) => e && typeof e.k === "string" && Number.isFinite(e.n))
+            : [];
+    } catch (_) { return []; }
+}
+
+/**
+ * localStorage.setItem for a per-node preview cache, within the pack's budget.
+ * Returns false when the value could not be stored (quota, storage disabled) —
+ * callers treat the cache as a convenience, never as state.
+ */
+export function batCacheSet(key, value) {
+    sweepLegacyCacheKeys();
+    try {
+        const size = key.length + value.length;
+        const index = readCacheIndex().filter((e) => e.k !== key);
+        let total = size;
+        for (const e of index) total += e.n;
+        while (total > CACHE_BUDGET_CHARS && index.length) {
+            const old = index.shift();
+            try { localStorage.removeItem(old.k); } catch (_) {}
+            total -= old.n;
+        }
+        localStorage.setItem(key, value);
+        index.push({ k: key, n: size });
+        localStorage.setItem(CACHE_INDEX_KEY, JSON.stringify(index));
+        return true;
+    } catch (_) {
+        return false;
+    }
 }
 
 function bag(node) {
@@ -221,15 +326,13 @@ export function registerCleanup(nodeType) {
  *
  * One residual side effect
  * ------------------------
- * Roto / AnimatedCrop / AnimatedGrade stamp the plate's imgW/imgH/frameCount
- * into their `state` JSON widget from inside the ingest, so a replay writes
- * them too. In the case that matters — undoing something that happened AFTER
- * the run — the widget already holds those numbers and the write is
- * byte-identical, so the ChangeTracker sees no diff. Undoing back to BEFORE
- * that node's first run does stamp them onto a state that lacked them, which
- * marks the workflow modified and can cost one extra undo step. The values are
- * correct metadata about the plate on screen (they are what makes shapes draw
- * at the right relative scale), so this is left as-is deliberately rather than
+ * Roto / AnimatedCrop / AnimatedGrade keep the plate's imgW/imgH/frameCount in
+ * `node.properties` (they used to stamp them into the serialised `state` JSON,
+ * which put them in the cache key and re-ran the node after its first run). A
+ * replay therefore rewrites a property, not a prompt input. Undoing back to
+ * BEFORE a node's first run does add that property, which marks the workflow
+ * modified and can cost one extra undo step. The values are correct metadata
+ * about the plate on screen, so this is left as-is deliberately rather than
  * papered over with a suppress-persist flag whose lifetime cannot be defined:
  * the ingests settle asynchronously, so there is no honest moment to clear it.
  *

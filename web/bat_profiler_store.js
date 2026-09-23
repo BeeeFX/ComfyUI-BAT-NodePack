@@ -180,6 +180,7 @@ export class ProfilerStore {
         ended: null,
         status: "running",
         baseline: summary.baseline || {},
+        config: summary.config || null,
         nodes: {},
         order: [],
         samples: [],
@@ -241,6 +242,7 @@ export class ProfilerStore {
     run.ended = summary.ended || Date.now() / 1000;
     run.status = summary.status || "ok";
     if (summary.error) run.error = summary.error;
+    if (summary.config) run.config = summary.config;
     this.markDirty(wfKey);
     this.flush();   // run boundaries are cheap and worth persisting at once
     return run;

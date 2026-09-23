@@ -25,11 +25,11 @@ all of them behind the canvas. See ``web/bat_sec_segmenter.js``.
 import base64
 from io import BytesIO
 
-import numpy as np
 from PIL import Image
 
 from . import bat_sec_advanced as adv
 from . import bat_sec_runtime as rt
+from .bat_ui_ref import stash_ui
 
 # Preview strip pushed back to the editor after a run, so scrubbing
 # frame_index_select re-previews without re-running a multi-minute
@@ -67,8 +67,9 @@ class BatSecSegmenter:
                 "auto_unload_model": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Free the 4B model after each run. Leave on unless you're "
-                               "iterating — off keeps it resident so the next run skips the "
-                               "~30s load, at the cost of the VRAM.",
+                               "iterating — off keeps it loaded so the next run skips the "
+                               "~30s build. ComfyUI can still move it to RAM when another "
+                               "model needs the VRAM, and 'Unload models' frees the VRAM.",
                 }),
                 # Appended rather than slotted next to frame_index_select: ComfyUI
                 # stores widget values as a positional array, so inserting in the
@@ -87,8 +88,9 @@ class BatSecSegmenter:
             "optional": {
                 "input_mask": ("MASK", {
                     "tooltip": "Optional mask to seed the object instead of clicking it, applied "
-                               "on the selected frame. Points or a bbox override it; positive "
-                               "points outside it are dropped.",
+                               "on the selected frame. Positive points inside it (or a bbox) "
+                               "override it; positive points outside it are dropped, and with "
+                               "none left the mask alone is used.",
                 }),
                 "advanced": ("SEC_ADVANCED", {
                     "tooltip": "Optional 🦇 SeC Advanced Params node. Unconnected = defaults.",
@@ -136,10 +138,10 @@ device, tracking direction and the rest.
 
         strip = []
         for i in range(0, count, stride):
-            arr = (frames[i].detach().cpu().float().clamp(0, 1).numpy() * 255.0 + 0.5).astype(np.uint8)
-            if arr.ndim == 3 and arr.shape[-1] > 3:
-                arr = arr[..., :3]
-            img = Image.fromarray(arr, "RGB")
+            # Same RGB coercion the segmentation itself uses: a grey or
+            # grey+alpha batch used to segment fine and then crash HERE,
+            # throwing away the finished run.
+            img = Image.fromarray(rt.frame_to_rgb_uint8(frames[i]), "RGB")
             if max(img.size) > PREVIEW_MAX_DIM:
                 r = PREVIEW_MAX_DIM / max(img.size)
                 img = img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.BILINEAR)
@@ -174,6 +176,8 @@ device, tracking direction and the rest.
             use_flash_attn=settings["use_flash_attn"],
             allow_mask_overlap=settings["allow_mask_overlap"],
             auto_download=settings["auto_download"],
+            memory_required=rt.inference_memory_estimate(
+                frames.shape[0], settings["offload_video_to_cpu"]),
         )
 
         try:
@@ -199,10 +203,15 @@ device, tracking direction and the rest.
                 offload_video_to_cpu=settings["offload_video_to_cpu"],
             )
         finally:
+            # Ours must be the last reference to go: release() can only give
+            # the memory back once nothing else holds the model.
+            model = None
             if auto_unload_model:
                 rt.release(cache_key)
 
         return {
-            "ui": self._preview_payload(frames),
+            # The strip is up to 240 JPEGs (15-20 MB); kept out of the prompt
+            # history via a sidecar file that web/bat_ui_ref.js resolves.
+            "ui": stash_ui(self._preview_payload(frames)),
             "result": (masks, rt.draw_mask_overlay(frames, masks, mask_preview)),
         }

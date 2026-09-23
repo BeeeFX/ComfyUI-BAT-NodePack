@@ -38,7 +38,9 @@ import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batReplayLastExecution } from "./bat_lifecycle.js";
+import {
+    batReplayLastExecution, batTrack, batNodeCacheKey, batCacheSet, batPreviewWillReplay,
+} from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_HDRTonalComposite";
 const MAX_HDR_VERSIONS = 8;   // must match MAX_HDR_VERSIONS in the .py
@@ -375,15 +377,18 @@ function blurMap(src, w, h, radius) {
 }
 
 // ── preview cache (JPEG only — see the note in bat_grade.js) ─────────────
-const cacheKey = (node) => `bat_hdrcomp_preview_${node?.id ?? "_"}`;
-function saveCache(node, d) { try { localStorage.setItem(cacheKey(node), JSON.stringify(d)); } catch (_) {} }
+// Workflow-scoped: a bare node.id is only unique within one graph, so another
+// shot's composite with the same id restored THIS shot's plate.
+const cacheKey = (node) => batNodeCacheKey(app, "bat_hdrcomp_preview", node);
+function saveCache(node, d) { try { batCacheSet(cacheKey(node), JSON.stringify(d)); } catch (_) {} }
 function loadCache(node) {
     try { const r = localStorage.getItem(cacheKey(node)); return r ? JSON.parse(r) : null; }
     catch (_) { return null; }
 }
-const viewKey = (node) => `bat_hdrcomp_view_${node?.id ?? "_"}`;
+const viewKey = (node) => batNodeCacheKey(app, "bat_hdrcomp_view", node);
 
 function buildPreview(node) {
+    const track = batTrack(node);
     const root = document.createElement("div");
     root.style.cssText = `position:relative; display:flex; flex-direction:column;
         background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; overflow:hidden;`;
@@ -414,7 +419,15 @@ function buildPreview(node) {
 
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
-    const saved = (() => { try { return JSON.parse(localStorage.getItem(viewKey(node)) || "{}") || {}; } catch (_) { return {}; } })();
+    // The saved view (mode, exposure, display transform) is read by
+    // restoreView() from the deferred restore, not here: this runs inside
+    // onNodeCreated, before a loaded node has its real id, so a read here
+    // looked under the wrong key and a reopened workflow never got it back.
+    const readView = () => {
+        try { return JSON.parse(localStorage.getItem(viewKey(node)) || "{}") || {}; }
+        catch (_) { return {}; }
+    };
+    const saved = {};
     const state = {
         plate: null,       // SourceBuffer, display-referred plate
         hdr: null,         // SourceBuffer, scene-linear HDR
@@ -757,7 +770,13 @@ function buildPreview(node) {
         reset.addEventListener("click", () => { state.exposure = 0; slider.value = "0"; commit(); });
         for (const e of [slider, reset, vtSel]) e.addEventListener("pointerdown", (ev) => ev.stopPropagation());
         refresh();
-        return { el, refresh };
+        // Push restored state back into the controls.
+        function sync() {
+            slider.value = String(state.exposure);
+            vtSel.value = state.viewTransform;
+            refresh();
+        }
+        return { el, refresh, sync };
     })();
     root.appendChild(bar.el);
 
@@ -767,7 +786,10 @@ function buildPreview(node) {
         e.stopPropagation(); state.holding = true; applyComposite();
     });
     const release = () => { if (state.holding) { state.holding = false; applyComposite(); } };
-    window.addEventListener("pointerup", release);
+    // Tracked: a bare window listener outlived the node and kept this whole
+    // closure — both decoded tiles and every per-pixel buffer — alive, once
+    // per node ever built (and an undo rebuilds every node).
+    track.listener(window, "pointerup", release);
     canvas.addEventListener("pointerleave", () => { probe.style.display = "none"; release(); });
 
     // Value probe.
@@ -873,7 +895,21 @@ function buildPreview(node) {
     // Restore something to look at on workflow reopen. Only the plate JPEG is
     // cached — the two 16-bit tiles are a few hundred KB each and localStorage
     // is a ~5MB origin-wide budget shared with every other BAT node's cache.
+    function restoreView() {
+        const v = readView();
+        if (VIEWS.some(x => x[0] === v.view)) state.view = v.view;
+        if (Number.isFinite(v.exposure)) state.exposure = v.exposure;
+        if (VIEW_TRANSFORMS.some(x => x[0] === v.viewTransform)) state.viewTransform = v.viewTransform;
+        bar.sync();
+        schedule();
+    }
+
     node._batHdrCompRestore = () => {
+        restoreView();      // the view comes back whether or not a replay does
+        // A replay of this session's last run is coming with both 16-bit
+        // tiles. This JPEG's decode could land after it and, having no HDR
+        // tile of its own, blank the composite back to "plate only".
+        if (batPreviewWillReplay(node)) return;
         const c = loadCache(node);
         if (!c?.jpeg) return;
         node._batHdrCompIngest({ plate_jpeg: [c.jpeg], ...(c.meta ? {

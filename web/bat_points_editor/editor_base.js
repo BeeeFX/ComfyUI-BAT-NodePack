@@ -7,9 +7,13 @@
 // Fix: imgData also stores origWidth/origHeight, and _reloadBgImage
 // honours them when restoring coord space.
 
-import { addMiddleClickPan, captureVideoFrame, chainCallback, makeUUID, watchImageInputs } from './utility.js';
+import { addMiddleClickPan, captureVideoFrame, chainCallback, isVueNodesMode, makeUUID, watchImageInputs } from './utility.js';
 
 import { markBatWidget } from "../bat_paste_guard.js";
+
+// Routes through api (not bare "/upload/image", "/view") so a ComfyUI hosted
+// under a subpath, or with the Comfy-User header, still resolves them.
+const { api } = window.comfyAPI.api;
 export function createEditorStylesheet(id, className) {
   let styleTag = document.head.querySelector(`#${id}`)
   if (!styleTag) {
@@ -289,10 +293,13 @@ export class BaseEditorCanvas {
     this.onDataChanged();
   };
 
-  processImage = (img, { resize = true } = {}) => {
+  // `coord` ({width, height}) overrides the coord space when `img` is itself a
+  // downscaled preview — the Points Editor's post-run plate arrives capped at
+  // 1024 px with the true size alongside (bg_w / bg_h).
+  processImage = (img, { resize = true, coord = null } = {}) => {
     // Capture original dimensions BEFORE any downscale, so reloading
     // from the cached (downscaled) copy can restore the right coord space.
-    const origWidth = img.width, origHeight = img.height;
+    const origWidth = coord?.width ?? img.width, origHeight = coord?.height ?? img.height;
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
@@ -311,7 +318,7 @@ export class BaseEditorCanvas {
 
     const onStored = () => {
       if (resize) {
-        this.handleImageLoad(img, canvas);
+        this.handleImageLoad(img, canvas, coord);
       } else {
         this.bgImage = canvas;
         this.render();
@@ -332,7 +339,7 @@ export class BaseEditorCanvas {
         formData.append('image', blob, filename);
         formData.append('type', 'temp');
         formData.append('overwrite', 'true');
-        fetch('/upload/image', { method: 'POST', body: formData })
+        api.fetchApi('/upload/image', { method: 'POST', body: formData })
           .then(r => r.json())
           .then(result => {
             if (gen !== this._uploadGeneration) return;
@@ -367,7 +374,7 @@ export class BaseEditorCanvas {
       const mimeType = imgData.type || 'image/png';
       img.src = `data:${mimeType};base64,${imgData.base64}`;
     } else if (imgData.filename) {
-      img.src = `/view?filename=${encodeURIComponent(imgData.filename)}&type=temp&no-cache=${Date.now()}`;
+      img.src = api.apiURL(`/view?filename=${encodeURIComponent(imgData.filename)}&type=temp&no-cache=${Date.now()}`);
     }
   };
 
@@ -515,6 +522,24 @@ export class BaseEditorCanvas {
 
     markBatWidget(element);
 
+    // Nodes 1.0: DOM widgets sit in an overlay beside the <canvas>, and the
+    // app only routes file drags to node.onDragOver/onDragDrop from the
+    // canvas's own dragover listener. A drag over the editor therefore never
+    // reached the node — nothing even cancelled dragover, so the browser's
+    // default file drop ran instead. Handle it on the element. Nodes 2.0
+    // already routes it (LGraphNode.vue @dragover/@drop -> app.dragOverNode),
+    // and handling it here too would bypass that path's own cleanup.
+    element.addEventListener("dragover", (e) => {
+      if (isVueNodesMode() || !node.onDragOver(e)) return;
+      e.preventDefault();
+    });
+    element.addEventListener("drop", (e) => {
+      if (isVueNodesMode() || !node.onDragOver(e)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      node.onDragDrop(e);
+    });
+
     node[editorKey] = node.addDOMWidget(nodeData.name, `${editorClass.name}Widget`, element, {
       serialize: false, hideOnZoom: false,
       getMinHeight: () => node[heightKey] || 550,
@@ -567,7 +592,7 @@ export class BaseEditorCanvas {
       if (imgData.base64) {
         img.src = `data:${imgData.type || 'image/png'};base64,${imgData.base64}`;
       } else if (imgData.filename) {
-        img.src = `/view?filename=${encodeURIComponent(imgData.filename)}&type=temp&no-cache=${Date.now()}`;
+        img.src = api.apiURL(`/view?filename=${encodeURIComponent(imgData.filename)}&type=temp&no-cache=${Date.now()}`);
       }
     };
 
@@ -669,10 +694,15 @@ export class BaseEditorCanvas {
       let bg_image = message["bg_image"];
       if (Array.isArray(bg_image)) bg_image = bg_image[0];
       if (bg_image) {
+        // bg_w/bg_h: the plate's true size. Absent from older servers, which
+        // sent the plate at full resolution — then the image's own size is it.
+        const one = (v) => (Array.isArray(v) ? v[0] : v);
+        const w = Number(one(message.bg_w)) || 0, h = Number(one(message.bg_h)) || 0;
+        const coord = w && h ? { width: w, height: h } : null;
         const img = new Image();
         img.src = `data:image/jpeg;base64,${bg_image}`;
         img.onload = () => {
-          if (this.editor) this.editor.processImage(img);
+          if (this.editor) this.editor.processImage(img, { coord });
         };
       }
     });

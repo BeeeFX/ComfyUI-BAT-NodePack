@@ -200,6 +200,11 @@ class BatBatchFormat:
         elif mode == "specific_num_frames":
             if auto_target_frames:
                 target = _nearest_valid_num_frames(current_frames, stride, offset, minimum, round_up)
+                # This node only pads, never trims: a nearer grid point BELOW
+                # the input would clamp to zero pad and leave the batch on an
+                # off-grid length. Take the next one up instead.
+                if target < current_frames:
+                    target = _nearest_valid_num_frames(current_frames, stride, offset, minimum, True)
             else:
                 target = int(target_num_frames)
             pad_count = max(0, target - current_frames)
@@ -217,6 +222,12 @@ class BatBatchFormat:
             extra = max(0, int(pad_frames))
             target = _nearest_valid_num_frames(
                 current_frames + extra, stride, offset, minimum, round_up)
+            # "Nearest" may still not go below the input itself: nothing here
+            # trims, so such a target used to become a zero pad and the batch
+            # left on an off-grid length (83 stayed 83 on WAN).
+            if target < current_frames:
+                target = _nearest_valid_num_frames(
+                    current_frames, stride, offset, minimum, True)
             pad_count = max(0, target - current_frames)
 
         if pad_count <= 0:

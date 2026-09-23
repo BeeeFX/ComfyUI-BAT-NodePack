@@ -13,8 +13,8 @@ behavioural changes — see the block comments at each site:
   2. bbox + points are sent to SAM2 in ONE call so the box survives
      (``_apply_prompts``). Upstream's two-call version silently dropped it.
   3. RGBA / grayscale / 4-channel frame batches are coerced to RGB instead of
-     raising inside ``Image.fromarray`` (``frames_to_pil``).
-  4. Frame bytes are rounded rather than truncated (``frames_to_pil``).
+     raising inside ``Image.fromarray`` (``frame_to_rgb_uint8``).
+  4. Frame bytes are rounded rather than truncated (``frame_to_rgb_uint8``).
 """
 
 import gc
@@ -30,11 +30,36 @@ from safetensors.torch import load_file
 
 import folder_paths
 
+from . import bat_interrupt as _interrupt
+
 # Vendored SeC stack. Imported lazily inside the loader — importing
 # modeling_sec at module scope drags transformers + the whole SAM2 tree into
 # every ComfyUI startup, which costs seconds even when no SeC node is used.
 
 MODEL_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bat_sec", "model_config")
+
+
+def _register_sams_folder():
+    """Make ``models/sams`` a known folder type.
+
+    ComfyUI core does not register ``sams`` — only other packs (Impact, SAM
+    loaders) do. Without this, a stock install could never see a checkpoint:
+    discovery raised KeyError, so the node downloaded 7GB and then reported it
+    missing, on every run. Appends to an existing registration rather than
+    replacing it, so other packs' extra paths survive.
+    """
+    try:
+        target = os.path.join(folder_paths.models_dir, "sams")
+        if "sams" in folder_paths.folder_names_and_paths:
+            folder_paths.add_model_folder_path("sams", target)
+        else:
+            folder_paths.folder_names_and_paths["sams"] = (
+                [target], set(folder_paths.supported_pt_extensions))
+    except Exception as e:  # never let this take the pack down at import
+        print(f"[Bat SeC] could not register the models/sams folder: {e}")
+
+
+_register_sams_folder()
 
 # Single-file checkpoints, highest priority first. The order sets which one a
 # fresh node defaults to when several are present.
@@ -225,10 +250,46 @@ def _manual_instructions(target_dir=None):
 # ── device ──────────────────────────────────────────────────────────────────
 
 
+def _comfy_default_device():
+    """The device ComfyUI itself runs on, narrowed to what this stack supports.
+
+    Honours ``--cpu`` and the GPU ComfyUI picked. The vendored SeC/SAM2 stack is
+    only exercised on CUDA (ROCm included) and CPU, so any other backend (MPS,
+    XPU, DirectML) runs on CPU — as "auto" always did there — rather than
+    failing mid-run.
+    """
+    try:
+        import comfy.model_management as mm
+        dev = torch.device(mm.get_torch_device())
+    except Exception:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if dev.type == "cuda":
+        return f"cuda:{dev.index if dev.index is not None else torch.cuda.current_device()}"
+    if dev.type != "cpu":
+        print(f"[Bat SeC] ComfyUI runs on '{dev}', which the SeC stack doesn't support — using CPU")
+    return "cpu"
+
+
+def _bf16_supported(device):
+    """Whether ``device`` runs bf16 natively. Pre-Ampere NVIDIA and RDNA2-or-older
+    AMD emulate it (slowly, and without flash-attn), so a bf16 checkpoint is
+    better run as fp16 there — same weights, native kernels."""
+    try:
+        import comfy.model_management as mm
+        if getattr(mm, "FORCE_FP32", False):
+            return True  # --force-fp32 is about ComfyUI's own models; leave ours alone
+        return bool(mm.should_use_bf16(torch.device(device)))
+    except Exception:
+        try:
+            return torch.cuda.get_device_properties(torch.device(device)).major >= 8
+        except Exception:
+            return True
+
+
 def resolve_device(device):
     """``auto``/``cpu``/``gpuN`` -> a torch device string."""
     if device == "auto":
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
+        return _comfy_default_device()
     if device == "cpu":
         return "cpu"
     if device.startswith("gpu"):
@@ -263,8 +324,110 @@ def resolve_device(device):
 # Merging the loader into the node removes the constraint: "reload" is just a
 # cache miss. Load fresh, keep it keyed by everything that affects
 # construction, and on unload drop the reference and let Python free it.
+#
+# The cache entry is a ComfyUI ModelPatcher, and ComfyUI — not this module —
+# moves the weights. The model is built in RAM; load_models_gpu() then evicts
+# whatever else is resident to make room before SeC lands on the GPU, and
+# ComfyUI's own free_memory() / "Unload models" can push SeC back to RAM when
+# another model needs the VRAM. Before this, SeC was invisible to ComfyUI: a
+# resident Flux/SDXL made the ~7GB load OOM, and with auto-unload off SeC was
+# pinned in VRAM where nothing could evict it. The patcher is the only strong
+# reference to the model, so dropping it from the cache still frees it.
 _MODEL_CACHE = {}
 _CACHE_LOCK = threading.RLock()
+
+# VRAM SeC needs beyond its weights, so ComfyUI evicts enough up front: SAM2's
+# per-frame features and memory bank plus the MLLM's attention over ~13 frames
+# of image tokens on a scene change. A generous estimate, not a limit.
+_INFERENCE_VRAM = 3 * 1024 ** 3
+# SAM2 holds every frame as a 1024x1024 fp32 RGB tensor — on the GPU unless
+# offload_video_to_cpu is on.
+_FRAME_VRAM = 1024 * 1024 * 3 * 4
+
+
+def inference_memory_estimate(num_frames, offload_video_to_cpu=True):
+    """Bytes of VRAM a run needs on top of the weights (for load_models_gpu)."""
+    return _INFERENCE_VRAM + (0 if offload_video_to_cpu else int(num_frames) * _FRAME_VRAM)
+
+
+class _SeCHolder(torch.nn.Module):
+    """The nn.Module ComfyUI's ModelPatcher manages.
+
+    ModelPatcher assigns ``model.device`` on every load and offload, but SeCModel
+    is a transformers PreTrainedModel whose ``device`` is a read-only property.
+    The holder owns SeC as a submodule — moving the holder moves SeC — and
+    carries a plain ``device`` attribute for the patcher to write.
+    """
+
+    def __init__(self, sec):
+        super().__init__()
+        self.sec = sec
+        self.device = torch.device("cpu")
+
+
+def _model_management():
+    """comfy.model_management, or None outside ComfyUI (tests)."""
+    try:
+        import comfy.model_management as mm
+        import comfy.model_patcher  # noqa: F401  (imported for _make_entry)
+        return mm
+    except Exception:
+        return None
+
+
+def _make_entry(model, device):
+    """Wrap a freshly built (CPU-resident) model for the cache."""
+    holder = _SeCHolder(model)
+    mm = _model_management()
+    if mm is None:
+        return holder
+    import comfy.model_patcher
+
+    load_device = torch.device(device)
+    # unet_offload_device() is RAM, or the GPU itself under --highvram /
+    # --gpu-only — the same place ComfyUI parks its own diffusion models.
+    offload_device = torch.device("cpu") if load_device.type == "cpu" else mm.unet_offload_device()
+    return comfy.model_patcher.CoreModelPatcher(holder, load_device=load_device, offload_device=offload_device)
+
+
+def _load_entry(entry, device, memory_required):
+    """Have ComfyUI put a cached model on its device; returns the SeC model."""
+    if isinstance(entry, _SeCHolder):  # no ComfyUI (tests): move it ourselves
+        entry.to(device)
+        return entry.sec
+
+    mm = _model_management()
+    # force_full_load: SeC's layers are plain torch modules without ComfyUI's
+    # weight-casting hooks, so a partial "lowvram" load would leave some weights
+    # in RAM under GPU inputs and fail mid-run. Full load makes ComfyUI evict
+    # other models instead; if SeC still doesn't fit, it OOMs as it always did.
+    mm.load_models_gpu([entry], memory_required=memory_required, force_full_load=True)
+    if getattr(entry.model, "model_lowvram", False):
+        # Only --novram gets here: ComfyUI loads partially regardless.
+        raise RuntimeError(
+            "ComfyUI loaded the SeC model only partially (--novram?). SeC can't "
+            "stream weights; run it on the CPU via 🦇 SeC Advanced Params instead."
+        )
+    return entry.model.sec
+
+
+def _unload_entry(entry):
+    """Take one cached model off ComfyUI's loaded list (weights back to RAM)."""
+    if isinstance(entry, _SeCHolder):
+        return
+    try:
+        _model_management().unload_model_and_clones(
+            entry, unload_additional_models=False, all_devices=True)
+    except Exception as e:
+        print(f"[Bat SeC] ComfyUI could not unload the model cleanly: {e}")
+
+
+def _empty_cache():
+    mm = _model_management()
+    if mm is not None:
+        mm.soft_empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _cache_key(spec, device, use_flash_attn, allow_mask_overlap):
@@ -276,10 +439,13 @@ def unload_all(reason=""):
     with _CACHE_LOCK:
         if _MODEL_CACHE:
             print(f"[Bat SeC] unloading {len(_MODEL_CACHE)} cached model(s){f' ({reason})' if reason else ''}")
+        entries = list(_MODEL_CACHE.values())
         _MODEL_CACHE.clear()
+    for entry in entries:
+        _unload_entry(entry)
+    del entries
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
 
 
 def _register_dtype_hooks(model, torch_dtype):
@@ -351,10 +517,8 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
     # SAM2 takes is "non_overlap_masks".
     config.hydra_overrides_extra = [f"++model.non_overlap_masks={'false' if allow_mask_overlap else 'true'}"]
 
-    if device.startswith("cuda"):
-        gc.collect()
-        torch.cuda.empty_cache()
-
+    # Built in RAM whatever the target: ComfyUI moves it onto the GPU in
+    # get_model(), after evicting other models to make room.
     if spec["is_single_file"]:
         state_dict = load_file(spec["path"])
         if spec["precision"] == "fp8":
@@ -371,14 +535,18 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
 
             with init_empty_weights():
                 model = SeCModel(config, use_flash_attn=use_flash_attn)
+            # dtype explicitly: without it, accelerate casts each value to the
+            # meta param's dtype (float32), which built a ~15GB fp32 copy on
+            # the CPU next to the 7GB state_dict before the final .to().
+            # Integer tensors are left alone by accelerate.
             for name, param in state_dict.items():
-                set_module_tensor_to_device(model, name, device="cpu", value=param)
+                set_module_tensor_to_device(model, name, device="cpu", value=param, dtype=torch_dtype)
         except (ImportError, RuntimeError):
             model = SeCModel(config, use_flash_attn=use_flash_attn)
             model.load_state_dict(state_dict, strict=True)
 
         del state_dict
-        model = model.eval().to(device=device, dtype=torch_dtype)
+        model = model.eval().to(dtype=torch_dtype)
     else:
         load_kwargs = {
             "config": config,
@@ -386,8 +554,6 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
             "use_flash_attn": use_flash_attn,
             "low_cpu_mem_usage": True,
         }
-        if device.startswith("cuda"):
-            load_kwargs["device_map"] = {"": device}
         model = SeCModel.from_pretrained(spec["path"], **load_kwargs).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(spec["config_path"], trust_remote_code=True)
@@ -400,12 +566,13 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
 
 
 def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap=True,
-              auto_download=True):
-    """Load ``model_file`` (or return the cached instance).
+              auto_download=True, memory_required=0):
+    """Load ``model_file`` (or reuse the cached instance) onto its device.
 
     Downloads the default checkpoint first if nothing is installed and
     ``auto_download`` is set, so the node works on a fresh machine with nothing
-    wired to it.
+    wired to it. ``memory_required`` is the run's VRAM on top of the weights
+    (:func:`inference_memory_estimate`), so ComfyUI frees enough for both.
 
     Returns ``(model, cache_key)``. Pass the key to :func:`release` to unload.
     """
@@ -454,6 +621,9 @@ def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap
     if resolved_device == "cpu" and torch_dtype != torch.float32:
         print(f"[Bat SeC] CPU inference needs float32 — converting from {precision.upper()} on load")
         torch_dtype = torch.float32
+    elif torch_dtype == torch.bfloat16 and not _bf16_supported(resolved_device):
+        print(f"[Bat SeC] {resolved_device} has no native bf16 — running the BF16 checkpoint as FP16")
+        torch_dtype = torch.float16
 
     if torch_dtype == torch.float32 and use_flash_attn:
         # Flash Attention 2 has no fp32 kernel.
@@ -462,9 +632,11 @@ def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap
     key = _cache_key(spec, resolved_device, use_flash_attn, allow_mask_overlap)
 
     with _CACHE_LOCK:
-        model = _MODEL_CACHE.get(key)
-        if model is not None:
-            return model, key
+        entry = _MODEL_CACHE.get(key)
+        if entry is not None:
+            # Possibly offloaded to RAM by ComfyUI since the last run; this
+            # brings it back (a no-op when it is still resident).
+            return _load_or_drop(key, entry, resolved_device, memory_required), key
 
         # Only one SeC model fits in VRAM at a time in practice, and holding a
         # stale one just to lose the next load to OOM is a bad trade.
@@ -481,26 +653,45 @@ def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap
               f"{'' if use_flash_attn else ' (flash-attn off)'}")
 
         try:
-            model = _build_model(spec, resolved_device, torch_dtype, use_flash_attn, allow_mask_overlap)
+            entry = _make_entry(
+                _build_model(spec, resolved_device, torch_dtype, use_flash_attn, allow_mask_overlap),
+                resolved_device)
         except Exception as e:
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _empty_cache()
             raise RuntimeError(f"Failed to load SeC model '{label}': {e}") from e
 
-        _MODEL_CACHE[key] = model
+        _MODEL_CACHE[key] = entry
+        model = _load_or_drop(key, entry, resolved_device, memory_required)
         print(f"[Bat SeC] ready on {resolved_device}")
         return model, key
 
 
+def _load_or_drop(key, entry, device, memory_required):
+    """_load_entry, but a model that failed to load (OOM) leaves the cache —
+    otherwise ~7GB would sit in RAM after a failed run even with auto-unload on."""
+    try:
+        return _load_entry(entry, device, memory_required)
+    except BaseException:
+        del entry
+        release(key)
+        raise
+
+
 def release(key):
-    """Unload one cached model."""
+    """Unload one cached model.
+
+    Drop every reference to the model returned by :func:`get_model` first —
+    memory only comes back once the last one is gone.
+    """
     with _CACHE_LOCK:
-        if _MODEL_CACHE.pop(key, None) is None:
-            return
+        entry = _MODEL_CACHE.pop(key, None)
+    if entry is None:
+        return
+    _unload_entry(entry)
+    del entry
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
 
 
 # ── prompt parsing ──────────────────────────────────────────────────────────
@@ -614,10 +805,15 @@ def clip_to_frame(points, width, height):
     if points is None or len(points) == 0:
         return None, []
 
-    inside = [(x, y) for x, y in points if 0 <= x < width and 0 <= y < height]
+    # The editor clamps drags to [0, coordWidth] INCLUSIVE, so a point pushed
+    # onto the right/bottom edge arrives at exactly x == width. That's a click
+    # on the last pixel, not an out-of-frame one: pull it in (as the bbox
+    # clamp does) instead of dropping it.
+    inside = [(x if x < width else width - 1, y if y < height else height - 1)
+              for x, y in points if 0 <= x <= width and 0 <= y <= height]
     problems = [
         f"point ({x:.0f}, {y:.0f}) is outside the {width}x{height} frame"
-        for x, y in points if not (0 <= x < width and 0 <= y < height)
+        for x, y in points if not (0 <= x <= width and 0 <= y <= height)
     ]
     if not inside:
         return None, problems
@@ -699,62 +895,90 @@ def draw_mask_overlay(frames, masks, mode=MASK_PREVIEW_DEFAULT):
 
     Always allocates: the result is a second float32 batch the size of the input,
     which on a long 4K clip is gigabytes, and ComfyUI gives no way to skip the
-    work when the output socket is unconnected.
+    work when the output socket is unconnected. That one batch is the whole
+    cost — the blend runs in chunks into the preallocated output. (Done as one
+    whole-batch expression it peaked at ~3.6x the input from its temporaries.)
     """
     rgb, alpha = parse_preview_mode(mode)
 
-    plate = frames.detach().float()
-    if plate.shape[-1] < 3:
-        plate = plate[..., :1].repeat(1, 1, 1, 3)
-    elif plate.shape[-1] > 3:
-        plate = plate[..., :3]  # IMAGE outputs are RGB; drop any alpha
+    plate = frames.detach()
+    channels = plate.shape[-1]
+    n, h, w = plate.shape[0], plate.shape[1], plate.shape[2]
+    out = torch.empty((n, h, w, 3), dtype=torch.float32, device=plate.device)
+    colour = torch.tensor(rgb, dtype=torch.float32, device=plate.device).view(1, 1, 1, 3)
 
-    # [N,H,W] -> [N,H,W,1] so it broadcasts across colour. Masks are binary here,
-    # but keeping this a per-pixel blend means a soft mask would feather correctly
-    # instead of hard-thresholding.
-    coverage = masks.detach().float().clamp(0, 1).unsqueeze(-1).to(plate.device)
-    weight = coverage * alpha
-
-    colour = torch.tensor(rgb, dtype=plate.dtype, device=plate.device).view(1, 1, 1, 3)
-    return (plate * (1.0 - weight) + colour * weight).clamp(0.0, 1.0)
+    chunk = 16
+    for i in range(0, n, chunk):
+        j = min(i + chunk, n)
+        src = plate[i:j].float()
+        if channels < 3:
+            src = src[..., :1].expand(-1, -1, -1, 3)
+        elif channels > 3:
+            src = src[..., :3]  # IMAGE outputs are RGB; drop any alpha
+        # [n,H,W] -> [n,H,W,1] so it broadcasts across colour. Masks are binary
+        # here, but keeping this a per-pixel blend means a soft mask would
+        # feather correctly instead of hard-thresholding.
+        weight = masks[i:j].detach().float().clamp(0, 1).unsqueeze(-1).to(plate.device) * alpha
+        torch.lerp(src, colour.expand_as(src), weight, out=out[i:j])
+        out[i:j].clamp_(0.0, 1.0)
+    return out
 
 
 # ── frames ──────────────────────────────────────────────────────────────────
 
 
-def frames_to_pil(frames):
-    """ComfyUI IMAGE batch -> list of RGB PIL images.
+def frame_to_rgb_uint8(frame):
+    """One ``[H,W,C]`` (or ``[H,W]``) IMAGE frame -> ``[H,W,3]`` uint8 numpy.
 
     CHANGE vs upstream (3/4 and 4/4): upstream did
     ``Image.fromarray((t*255).clamp(0,255).byte().numpy(), mode='RGB')``, which
     (a) raised for any batch that wasn't exactly 3-channel — RGBA and
     single-channel batches are both common upstream of a segmenter — and
     (b) truncated instead of rounding, biasing every pixel down by up to 1 LSB.
+    Shared with the node's preview strip, which had the same 3-channel-only bug.
     """
-    out = []
+    arr = frame.detach().cpu().float()
+    if arr.ndim == 2:
+        arr = arr.unsqueeze(-1)
+    channels = arr.shape[-1]
+    if channels < 3:
+        arr = arr[..., :1].repeat(1, 1, 3)  # grey (or grey+alpha) -> RGB
+    elif channels > 3:
+        arr = arr[..., :3]  # drop alpha
+    return (arr.clamp(0, 1) * 255.0 + 0.5).to(torch.uint8).numpy()
+
+
+def iter_frames_pil(frames):
+    """ComfyUI IMAGE batch -> RGB PIL images, one at a time."""
     for i in range(frames.shape[0]):
-        arr = frames[i].detach().cpu().float()
-        if arr.ndim == 2:
-            arr = arr.unsqueeze(-1)
-        channels = arr.shape[-1]
-        if channels < 3:
-            arr = arr[..., :1].repeat(1, 1, 3)  # grey (or grey+alpha) -> RGB
-        elif channels > 3:
-            arr = arr[..., :3]  # drop alpha
-        arr = (arr.clamp(0, 1) * 255.0 + 0.5).to(torch.uint8).numpy()
-        out.append(Image.fromarray(arr, mode="RGB"))
-    return out
+        yield Image.fromarray(frame_to_rgb_uint8(frames[i]), mode="RGB")
 
 
-def write_frames(pil_images):
+def frames_to_pil(frames):
+    """ComfyUI IMAGE batch -> list of RGB PIL images (see frame_to_rgb_uint8)."""
+    return list(iter_frames_pil(frames))
+
+
+def write_frames(pil_images, on_frame=None):
     """Write frames to a private temp dir as JPEGs for SAM2's file-based loader.
 
     SAM2 sorts by ``int(basename)``, hence the zero-padded numeric names. The
     directory is per-call so concurrent jobs can't clobber each other.
+
+    Takes any iterable: ``segment`` streams :func:`iter_frames_pil` through
+    here so only one full-res PIL frame is alive at a time, instead of the
+    whole clip for the length of the run. ``on_frame`` runs after each write
+    (cancel check + progress). A cancelled write removes the partial dir.
     """
     temp_dir = tempfile.mkdtemp(prefix="bat_sec_frames_")
-    for i, img in enumerate(pil_images):
-        img.save(os.path.join(temp_dir, f"{i:05d}.jpg"), "JPEG", quality=95)
+    try:
+        for i, img in enumerate(pil_images):
+            img.save(os.path.join(temp_dir, f"{i:05d}.jpg"), "JPEG", quality=95)
+            if on_frame is not None:
+                on_frame()
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
     return temp_dir
 
 
@@ -800,12 +1024,31 @@ def _apply_prompts(model, state, frame_idx, object_id, points, labels, bbox, mas
     return init_mask
 
 
+def _progress_bar(total):
+    """ComfyUI's node progress bar, or None outside ComfyUI (tests)."""
+    try:
+        from comfy.utils import ProgressBar
+        return ProgressBar(total)
+    except Exception:
+        return None
+
+
+def _pass_length(start_idx, span, num_frames, reverse):
+    """Frames one propagate_in_video pass will yield — mirrors its range()."""
+    if reverse:
+        return start_idx - max(start_idx - span, 0) + 1 if start_idx > 0 else 0
+    return min(start_idx + span, num_frames - 1) - start_idx + 1
+
+
 def _collect(masks_tensor, seen, model, state, start_idx, max_frames, reverse,
-             init_mask, mllm_memory_size, overwrite):
+             init_mask, mllm_memory_size, overwrite, on_frame=None):
     """Run one propagation pass, writing straight into ``masks_tensor``.
 
     Writing into a pre-allocated tensor rather than accumulating a dict of
     per-frame masks is what keeps this from spiking ~600-800MB on long clips.
+
+    ``on_frame`` runs once per yielded frame: the Cancel button only sets a
+    flag, so without a poll here a multi-minute pass could not be stopped.
     """
     for frame_idx, obj_ids, logits in model.propagate_in_video(
         state,
@@ -815,6 +1058,8 @@ def _collect(masks_tensor, seen, model, state, start_idx, max_frames, reverse,
         init_mask=init_mask,
         mllm_memory_size=mllm_memory_size,
     ):
+        if on_frame is not None:
+            on_frame()
         if not overwrite and frame_idx in seen:
             continue
         if len(obj_ids) == 0:
@@ -964,11 +1209,34 @@ def segment(
             print(f"[Bat SeC] dropped {len(points) - len(keep)} positive point(s) outside input_mask")
         points = points[keep] if keep else None
         labels = labels[keep] if keep else None
+        # SAM2 discards a frame's mask prompt as soon as points land on it, so
+        # negatives alone would replace the whole mask with a clicks-only
+        # prompt that has nothing to include. With no positive left, the mask
+        # IS the prompt.
+        if labels is not None and not (labels == 1).any():
+            print(f"[Bat SeC] no positive point inside input_mask — ignoring "
+                  f"{len(labels)} negative point(s) and seeding from the mask alone")
+            points = labels = None
+
+    # propagate_in_video treats max_frame_num_to_track as "frames BEYOND
+    # the start frame" (it iterates start..start+max inclusive), so -1 has
+    # to become the full length, not length-1.
+    span = num_frames if max_frames_to_track < 0 else max_frames_to_track
+
+    # One bar for the whole node: writing the JPEGs, then every propagated
+    # frame (both passes when bidirectional).
+    directions = {"bidirectional": (False, True), "backward": (True,)}.get(tracking_direction, (False,))
+    pbar = _progress_bar(num_frames + sum(
+        _pass_length(annotation_frame_idx, span, num_frames, rev) for rev in directions))
+
+    def tick():
+        _interrupt.check()
+        if pbar is not None:
+            pbar.update(1)
 
     video_dir = None
     try:
-        pil_images = frames_to_pil(frames)
-        video_dir = write_frames(pil_images)
+        video_dir = write_frames(iter_frames_pil(frames), on_frame=tick)
 
         try:
             offload_state_to_cpu = str(model.device) == "cpu"
@@ -988,17 +1256,12 @@ def segment(
         if init_mask is None:
             raise RuntimeError("SeC produced no initial mask from the supplied prompt.")
 
-        # propagate_in_video treats max_frame_num_to_track as "frames BEYOND
-        # the start frame" (it iterates start..start+max inclusive), so -1 has
-        # to become the full length, not length-1.
-        span = num_frames if max_frames_to_track < 0 else max_frames_to_track
-
         masks_tensor = torch.zeros(num_frames, height, width, dtype=torch.float32)
         seen = set()
 
         if tracking_direction == "bidirectional":
             _collect(masks_tensor, seen, model, state, annotation_frame_idx, span,
-                     False, init_mask, mllm_memory_size, overwrite=True)
+                     False, init_mask, mllm_memory_size, overwrite=True, on_frame=tick)
 
             # A backward pass needs a clean state: the forward pass left every
             # frame in frames_already_tracked, which would make the re-seed a
@@ -1008,10 +1271,11 @@ def segment(
                 model, state, annotation_frame_idx, object_id, points, labels, bbox_coords, mask_prompt,
             )
             _collect(masks_tensor, seen, model, state, annotation_frame_idx, span,
-                     True, init_mask, mllm_memory_size, overwrite=False)
+                     True, init_mask, mllm_memory_size, overwrite=False, on_frame=tick)
         else:
             _collect(masks_tensor, seen, model, state, annotation_frame_idx, span,
-                     tracking_direction == "backward", init_mask, mllm_memory_size, overwrite=True)
+                     tracking_direction == "backward", init_mask, mllm_memory_size,
+                     overwrite=True, on_frame=tick)
 
         if len(seen) < num_frames:
             missing = num_frames - len(seen)

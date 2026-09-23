@@ -10,7 +10,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
-import { makeBatPathWidget } from "./bat_path_widget.js";
+import { installBatPathWidget, makeBatPathWidget } from "./bat_path_widget.js";
 import { batTrack } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 
@@ -38,7 +38,9 @@ function makeGridWidget() {
     sizeWrap.style.cssText = "display:flex;align-items:center;gap:6px;margin-left:auto;";
     const slider = document.createElement("input");
     slider.type = "range"; slider.min = "48"; slider.max = "200";
-    slider.value = localStorage.getItem("bat-frame-cell") || "96";
+    let cell = null;
+    try { cell = localStorage.getItem("bat-frame-cell"); } catch (_) { /* storage disabled */ }
+    slider.value = cell || "96";
     sizeWrap.append(document.createTextNode("size"), slider);
     bar.append(label, sizeWrap);
 
@@ -46,7 +48,10 @@ function makeGridWidget() {
     grid.style.cssText = "flex:1;overflow-y:auto;padding:8px;display:grid;gap:6px;align-content:start;";
     const applyCell = () => { grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${slider.value}px, 1fr))`; };
     applyCell();
-    slider.addEventListener("input", () => { applyCell(); localStorage.setItem("bat-frame-cell", slider.value); });
+    slider.addEventListener("input", () => {
+        applyCell();
+        try { localStorage.setItem("bat-frame-cell", slider.value); } catch (_) { /* storage disabled */ }
+    });
 
     root.append(bar, grid);
     return { element: root, grid, label };
@@ -168,11 +173,10 @@ app.registerExtension({
             const orig = this.widgets[pathIdx];
             const config = nodeData.input?.required?.path;
             const opts = (config && config[1]) || {};
-            const pathW = makeBatPathWidget({
+            const pathW = installBatPathWidget(this, pathIdx, makeBatPathWidget({
                 name: "path", value: orig.value || "", options: opts,
                 route: PATH_ROUTE, title: "Frame Source",
-            });
-            this.widgets[pathIdx] = pathW;
+            }));
 
             const preview = makeGridWidget();
             // Dual-mode sizing — the contact-sheet grid is flex:1 inside a

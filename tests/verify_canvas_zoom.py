@@ -32,6 +32,12 @@ Five claims:
    `changeScale`'s early-out on an unchanged value means a nudge in the wrong
    direction does nothing at all.
 
+6. **Under Nodes 2.0 the default stays at stock 10%.** Vue nodes have no LOD
+   or culling, so a lower floor paints every node's DOM. The default is a
+   function of the renderer (re-resolved on every read of an unset setting),
+   an explicit value is honoured in both renderers, and switching renderer
+   re-applies the floor.
+
 Also asserted: ``max_scale`` is left alone. Zooming in was never the ask, and
 the deep-zoom end is where rendering gets expensive.
 
@@ -98,15 +104,49 @@ STUBS = r"""
         };
     }
 
+    // Only values the artist set explicitly live here — like the frontend's
+    // settingStore.settingValues. An unset setting reads as its default,
+    // which the store resolves on every read when it is a function.
     globalThis.__settingValues = {};
     globalThis.__dirty = 0;
+    globalThis.__vue = false;
+    globalThis.__listeners = {};
+
+    // Imported from bat_node_layout.js in the real file (import stripped).
+    function vueNodesEnabled() { return !!globalThis.__vue; }
+
+    function __resolve(s) {
+        var d = s.defaultValue;
+        return typeof d === "function" ? d() : d;
+    }
+    function __setting(id) {
+        return (globalThis.__ext.settings || []).filter(function (x) {
+            return x.id === id;
+        })[0];
+    }
 
     var app = {
         canvas: null,                 // as it is when extensions register
-        ui: { settings: { getSettingValue: function (id) {
-                  return globalThis.__settingValues[id];
-              } } },
+        ui: { settings: {
+            getSettingValue: function (id) {
+                var v = globalThis.__settingValues[id];
+                if (v !== undefined) return v;
+                var s = __setting(id);
+                return s ? __resolve(s) : undefined;
+            },
+            addEventListener: function (type, fn) {
+                (globalThis.__listeners[type] = globalThis.__listeners[type] || []).push(fn);
+            },
+        } },
         registerExtension: function (ext) { globalThis.__ext = ext; },
+    };
+
+    // The renderer switch: store first, then the legacy "<id>.change" event,
+    // in that order, as settingStore.applySettingLocally does.
+    globalThis.__setVue = function (on) {
+        globalThis.__vue = !!on;
+        (globalThis.__listeners["Comfy.VueNodes.Enabled.change"] || [])
+            .forEach(function (fn) { fn({ detail: { value: !!on } }); });
     };
 
     // Bring the canvas up the way ComfyUI does: after registration, before
@@ -119,21 +159,17 @@ STUBS = r"""
         return app.canvas;
     };
 
-    // What addSetting() does at registration time.
+    // What addSetting() does at registration time: onChange(get(id)) —
+    // the default is read, not stored.
     globalThis.__registerSettings = function () {
         (globalThis.__ext.settings || []).forEach(function (s) {
-            var v = globalThis.__settingValues[s.id];
-            if (v === undefined) v = s.defaultValue;
-            globalThis.__settingValues[s.id] = v;
-            if (s.onChange) s.onChange(v, undefined);
+            if (s.onChange) s.onChange(app.ui.settings.getSettingValue(s.id), undefined);
         });
     };
 
     globalThis.__setSetting = function (id, v) {
-        var s = (globalThis.__ext.settings || []).filter(function (x) {
-            return x.id === id;
-        })[0];
-        var old = globalThis.__settingValues[id];
+        var s = __setting(id);
+        var old = app.ui.settings.getSettingValue(id);
         globalThis.__settingValues[id] = v;
         if (s && s.onChange) s.onChange(v, old);
     };
@@ -178,7 +214,10 @@ def test_setting_shape():
             name: globalThis.__ext.name,
             n: (globalThis.__ext.settings || []).length,
             id: s.id, type: s.type,
-            cat: s.category, def: s.defaultValue,
+            cat: s.category,
+            defIsFn: typeof s.defaultValue === "function",
+            def: typeof s.defaultValue === "function" ? s.defaultValue() : s.defaultValue,
+            tipNodes2: (s.tooltip || "").includes("Nodes 2.0"),
             attrs: s.attrs || null,
             hasOnChange: typeof s.onChange === "function",
             hasSetup: typeof globalThis.__ext.setup === "function",
@@ -198,9 +237,12 @@ def test_setting_shape():
           and got["attrs"].get("step", 0) > 0, got)
     check("category nests under a top-level panel and a sub-group",
           isinstance(got["cat"], list) and len(got["cat"]) >= 2, got)
-    check("default is 5% — half of core's floor",
+    check("default is 5% on the classic canvas — half of core's floor",
           got["def"] == 5, got)
+    check("the default is a function, so it can follow the renderer",
+          got["defIsFn"], got)
     check("setting carries a tooltip", got["hasTooltip"], got)
+    check("the tooltip says what Nodes 2.0 does", got["tipNodes2"], got)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +339,62 @@ def test_raise_floor_recovers_view():
 
 
 # ---------------------------------------------------------------------------
+# 6. Nodes 2.0 keeps stock 10% unless the artist asked for more
+# ---------------------------------------------------------------------------
+
+def test_nodes2_default():
+    ctx = js_context()
+    got = jrun(ctx, """
+        globalThis.__setVue(true);            // 2.0 already on at load
+        globalThis.__registerSettings();
+        globalThis.__makeCanvas();
+        globalThis.__ext.setup();
+        const ds = app.canvas.ds;
+        for (let i = 0; i < 200; i++) ds.changeDeltaScale(1 / 1.1);
+        return { min: ds.min_scale, floor: ds.scale };
+    """)
+    check("Nodes 2.0, setting untouched: the floor stays at stock 10%",
+          abs(got["min"] - 0.1) < 1e-9 and abs(got["floor"] - 0.1) < 1e-9, got)
+
+    ctx = js_context()
+    got = jrun(ctx, """
+        globalThis.__setVue(true);
+        globalThis.__settingValues["BAT.Canvas.MinZoom"] = 2;   // set earlier
+        globalThis.__registerSettings();
+        globalThis.__makeCanvas();
+        globalThis.__ext.setup();
+        const at2 = app.canvas.ds.min_scale;
+        globalThis.__setVue(false);
+        const classic = app.canvas.ds.min_scale;
+        return { at2, classic };
+    """)
+    check("an explicit value is honoured under Nodes 2.0 too, not clamped",
+          abs(got["at2"] - 0.02) < 1e-9 and abs(got["classic"] - 0.02) < 1e-9, got)
+
+    ctx = js_context()
+    got = jrun(ctx, """
+        globalThis.__registerSettings();
+        globalThis.__makeCanvas();
+        globalThis.__ext.setup();                       // classic: 5%
+        const ds = app.canvas.ds;
+        for (let i = 0; i < 200; i++) ds.changeDeltaScale(1 / 1.1);
+        const parked = ds.scale;
+        const dirty0 = globalThis.__dirty;
+        globalThis.__setVue(true);                      // switch to 2.0 live
+        const on = { min: ds.min_scale, scale: ds.scale,
+                     redrawn: globalThis.__dirty > dirty0 };
+        globalThis.__setVue(false);                     // and back
+        return { parked, on, back: ds.min_scale };
+    """)
+    check("switching to Nodes 2.0 live raises the default floor and pulls the view up",
+          abs(got["parked"] - 0.05) < 1e-9
+          and abs(got["on"]["min"] - 0.1) < 1e-9
+          and abs(got["on"]["scale"] - 0.1) < 1e-9 and got["on"]["redrawn"], got)
+    check("switching back restores the classic 5% default",
+          abs(got["back"] - 0.05) < 1e-9, got)
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     try:
@@ -310,6 +408,7 @@ def main():
     test_setup_applies_default()
     test_live_change()
     test_raise_floor_recovers_view()
+    test_nodes2_default()
 
     print()
     if _failures:

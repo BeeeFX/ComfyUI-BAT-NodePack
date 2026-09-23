@@ -4,7 +4,7 @@
 
 # 🦇 ComfyUI-BAT-NodePack
 
-[![43 nodes](https://img.shields.io/badge/nodes-43-13b8ad?style=flat-square)](#all-nodes)
+[![45 nodes](https://img.shields.io/badge/nodes-45-13b8ad?style=flat-square)](#all-nodes)
 [![Last commit](https://img.shields.io/github/last-commit/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square&label=updated)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/commits/main/)
 [![GitHub stars](https://img.shields.io/github/stars/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/stargazers)
 [![MIT license](https://img.shields.io/github/license/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](LICENSE)
@@ -30,7 +30,7 @@ For EXRs, **EXR Layer** selects passes and **Cryptomatte Matte** builds masks fr
 
 ### Keyframed adjustments and masks
 
-**Animated Crop**, **Animated Grade**, and **Roto** put keyframes on the node. **Uncrop** places a processed crop back into its source frame.
+**Animated Crop**, **Animated Grade**, and **Roto** put keyframes on the node, each with its own easing (linear, ease in/out, hold). **Uncrop** places a processed crop back into its source frame.
 
 ![Full workflow connecting Loader, Animated Crop, Animated Grade, Uncrop, and Video Combine](docs/assets/bat-animated-crop-grade.png)
 
@@ -79,6 +79,7 @@ Names match the Add Node menu; the 🦇 prefix is omitted here.
 | **BAT Frame Picker** | Choose a frame from a contact sheet. |
 | **Framehold** | Hold one frame across a batch. |
 | **Video Grid Split** | Split video into overlapping grid regions. |
+| **Video Grid Merge** | Reassemble Grid Split tiles, feathering the overlaps. |
 | **Batch Format** | Match frame counts for supported video models. |
 
 ### Crop, animation, and masks
@@ -97,10 +98,10 @@ Names match the Add Node menu; the 🦇 prefix is omitted here.
 
 | Node | Use it to… |
 | --- | --- |
-| **Grade** | Adjust blackpoint, lift, gain, and gamma. |
+| **Grade** | Adjust blackpoint, lift, gain, and gamma, Nuke-style. |
 | **Advanced Blend** | Blend images; mix tone and detail separately. |
 | **Layered Images** | Composite up to eight masked layers. |
-| **Rescale** | Resize while comparing at a fixed viewing size. |
+| **Rescale** | Resize image and mask while comparing at a fixed viewing size. |
 | **Exposure Bracket** | Prepare exposures for LTX HDR reconstruction. |
 | **Exposure Merge** | Merge reconstructed passes into linear HDR. |
 | **HDR Tonal Composite** | Blend reconstructed shadows and highlights into a shot. |
@@ -146,11 +147,14 @@ The HDR nodes work with a separate LTX reconstruction workflow. Export their lin
 | **List Length** | Count items or frames. |
 | **List Index** | Select an item or frame. |
 | **List Batch** | Join lists or image batches. |
+| **List Length (list)** | Count the items in a ComfyUI list, e.g. Grid Split's tiles. |
+
+To pick or join items of a ComfyUI list, use core's **Get Item From List** and **Create List**.
 
 **Also included, without adding a node:**
 
 - **BAT Profiler:** per-node timing and memory in the sidebar.
-- **Canvas zoom:** a wider zoom range under **Settings → 🦇 BAT → Canvas**.
+- **Canvas zoom:** a wider zoom range under **Settings → 🦇 BAT → Canvas** (Nodes 2.0 keeps the stock floor unless you change it).
 - **Run selected outputs:** **Alt+Enter** queues selected output branches.
 - **Larger editors:** maximise an editor; **Esc** exits.
 

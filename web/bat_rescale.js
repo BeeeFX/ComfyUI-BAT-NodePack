@@ -47,10 +47,12 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import {
-    batTrack, isNodeAlive, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay,
+    batTrack, isNodeAlive, batNodeCacheKey, batCacheSet, batReplayLastExecution,
+    batPreviewWillReplay,
 } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Rescale";
@@ -77,6 +79,38 @@ const clampWipe = (w) => Math.max(WIPE_MARGIN, Math.min(1 - WIPE_MARGIN,
 // immediate. Only ever one request in flight; a change during it re-fires on
 // completion, so a slow render costs latency and never responsiveness.
 const TRUTH_DEBOUNCE_MS = 80;
+
+/* ==========================================================================
+ * `ringing` in workflows saved before it existed
+ * ==========================================================================
+ *
+ * `ringing` was appended after `preview_frame`, but the viewer's DOM widget
+ * comes after both, and until addBatDOMWidget set `widget.serialize = false`
+ * it only had `options.serialize: false` (which keeps it out of the API
+ * prompt, not out of widgets_values). So every earlier save ends
+ * [..., preview_frame, <viewer value>], and positional restore hands that
+ * trailing "" / null to `ringing`: a combo value not in its list, which fails
+ * validation the moment the workflow is queued.
+ *
+ * Repaired after configure. A save that carries `widgets_values_named`
+ * answers the question exactly — no "ringing" key means it predates the
+ * widget. Otherwise anything that is not one of the options is taken as the
+ * stray viewer value. Both land on "off", the behaviour those workflows were
+ * saved with.
+ */
+export const RINGING_OPTIONS = ["off", "negative", "local"];
+
+export function repairLegacyRinging(node, info) {
+    const w = node?.widgets?.find((x) => x.name === "ringing");
+    if (!w) return false;
+    const named = info?.widgets_values_named;
+    const predates = !!named && typeof named === "object"
+        && !Object.prototype.hasOwnProperty.call(named, "ringing");
+    const opts = Array.isArray(w.options?.values) ? w.options.values : RINGING_OPTIONS;
+    if (!predates && opts.includes(w.value)) return false;
+    w.value = "off";
+    return true;
+}
 
 
 /* ==========================================================================
@@ -204,7 +238,7 @@ function loadJson(key, fallback) {
     } catch (_) { return fallback; }
 }
 function saveJson(key, value) {
-    try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
+    try { batCacheSet(key, JSON.stringify(value)); } catch (_) {}
 }
 
 
@@ -215,7 +249,10 @@ function saveJson(key, value) {
 function buildViewer(node) {
     const track = batTrack(node);
 
-    const saved = loadJson(viewKey(node), {});
+    // View state starts at its defaults and is read in _batRescaleRestore:
+    // this runs inside onNodeCreated, before a loaded node has its real id, so
+    // a read here looked under the wrong key and never found anything.
+    const saved = {};
     const state = {
         // Source identity, filled in by a run (or restored from localStorage).
         token: null,
@@ -378,6 +415,7 @@ function buildViewer(node) {
             target: Number(val("target", 1024)),
             megapixels: Number(val("megapixels", 1)),
             filter: String(val("filter", "lanczos")),
+            ringing: String(val("ringing", "off")),
             multiple_of: Number(val("multiple_of", 1)),
             ref_h: state.refH || null,
             ref_w: state.refW || null,
@@ -511,7 +549,7 @@ function buildViewer(node) {
         return JSON.stringify([
             state.token, currentFrame(), v.roi, v.outW, v.outH,
             state.magnify, p.mode, p.scale, p.target, p.megapixels,
-            p.filter, p.multiple_of, p.ref_h, p.ref_w,
+            p.filter, p.ringing, p.multiple_of, p.ref_h, p.ref_w,
         ]);
     }
 
@@ -577,7 +615,9 @@ function buildViewer(node) {
 
         let res;
         try {
-            res = await fetch("/bat/rescale/render", {
+            // fetchApi, not a bare fetch: it resolves the route against
+            // ComfyUI's base URL, so a subpath-hosted server still answers.
+            res = await api.fetchApi("/bat/rescale/render", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
@@ -1173,7 +1213,7 @@ function buildViewer(node) {
 
     node._batRescaleWatch = () => {
         for (const name of ["mode", "scale", "target", "megapixels", "filter",
-                            "multiple_of"]) {
+                            "ringing", "multiple_of"]) {
             const w = W(name);
             if (!w || w._batRescaleHooked) continue;
             w._batRescaleHooked = true;
@@ -1221,6 +1261,9 @@ function buildViewer(node) {
         state.frames = Number(one(msg.frames)) || 1;
         state.srcW = Number(one(msg.src_w)) || state.srcW;
         state.srcH = Number(one(msg.src_h)) || state.srcH;
+        // match_reference's target size. 0 = no reference connected.
+        state.refW = Number(one(msg.ref_w)) || 0;
+        state.refH = Number(one(msg.ref_h)) || 0;
         state.liveBatch = true;      // fresh run: the batch is in Comfy's cache
         const anchor = Number(one(msg.preview_frame));
         state.anchorFrame = Number.isFinite(anchor) ? anchor : null;
@@ -1235,6 +1278,7 @@ function buildViewer(node) {
             saveJson(cacheKey(node), {
                 thumb, token: state.token, frames: state.frames,
                 src_w: state.srcW, src_h: state.srcH,
+                ref_w: state.refW || 0, ref_h: state.refH || 0,
                 anchor: state.anchorFrame,
             });
         }
@@ -1245,6 +1289,19 @@ function buildViewer(node) {
     };
 
     node._batRescaleRestore = async () => {
+        // The view (zoom, pan, wipe, compare, magnify) is restored whatever
+        // happens below — a replay brings the picture back, not the framing.
+        const view = loadJson(viewKey(node), null);
+        if (view) {
+            state.zoom = view.zoom === undefined ? null : view.zoom;
+            state.cx = view.cx ?? null;
+            state.cy = view.cy ?? null;
+            state.wipe = clampWipe(view.wipe ?? 0.5);
+            state.compare = view.compare ?? "wipe";
+            state.magnify = view.magnify ?? "pixels";
+            paintChrome();
+            draw();
+        }
         // A full-res draft replayed from this session's last run beats the
         // cached thumbnail; both this decode and the token revalidation below
         // would otherwise land on top of it.
@@ -1254,6 +1311,8 @@ function buildViewer(node) {
         state.frames = Number(cached.frames) || 1;
         state.srcW = Number(cached.src_w) || 0;
         state.srcH = Number(cached.src_h) || 0;
+        state.refW = Number(cached.ref_w) || 0;
+        state.refH = Number(cached.ref_h) || 0;
         state.anchorFrame = Number.isFinite(Number(cached.anchor))
             ? Number(cached.anchor) : null;
         try { await loadThumb(cached.thumb); } catch (_) {}
@@ -1264,7 +1323,7 @@ function buildViewer(node) {
         // viewer comes back fully — truth layer included — with no re-run.
         if (!cached.token) return;
         try {
-            const r = await fetch(`/bat/rescale/info?token=${encodeURIComponent(cached.token)}`);
+            const r = await api.fetchApi(`/bat/rescale/info?token=${encodeURIComponent(cached.token)}`);
             const j = await r.json();
             if (!isNodeAlive(node) || !j?.ok) return;
             state.token = cached.token;
@@ -1272,6 +1331,7 @@ function buildViewer(node) {
             state.srcW = Number(j.src_w) || state.srcW;
             state.srcH = Number(j.src_h) || state.srcH;
             state.liveBatch = !!j.live_batch;
+            if (j.ref_w && j.ref_h) { state.refW = Number(j.ref_w); state.refH = Number(j.ref_h); }
             if (Number.isFinite(Number(j.frame))) state.anchorFrame = Number(j.frame);
             paintChrome();
             requestTruth(true);
@@ -1281,8 +1341,9 @@ function buildViewer(node) {
     /* ---- reference input ------------------------------------------------- */
 
     // match_reference needs the reference plate's size to show the output
-    // resolution before a run. Nothing in the frontend knows an image's size,
-    // so the readout says so rather than guessing.
+    // resolution. Nothing in the frontend knows an image's size, so each run
+    // reports it (ref_w / ref_h in the ingest above); until the first run the
+    // readout shows the source size rather than guessing.
     node._batRescaleRefSize = (h, w) => { state.refH = h; state.refW = w; draw(); };
 
     /* ---- keep up with the panel ------------------------------------------ */
@@ -1331,6 +1392,13 @@ app.registerExtension({
             // Deferred: node.id is only final once litegraph has finished
             // constructing, and every localStorage key here is scoped by it.
             setTimeout(() => this._batRescaleRestore?.(), 0);
+            return r;
+        };
+
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            repairLegacyRinging(this, info);
             return r;
         };
 

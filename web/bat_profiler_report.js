@@ -165,6 +165,10 @@ export function buildReport({ run, runCount, workflowName, system, config }) {
   const rssPeak = peakOf(samples, "ram");
   const vramPeak = peakOf(samples, "vram");
   const resPeak = peakOf(samples, "res");
+  // Whole card (mem_get_info). Under DynamicVRAM the torch figures above
+  // leave out model weights, so this is the one the headroom check uses.
+  const devPeak = peakOf(samples, "dev");
+  const cardPeak = devPeak.v > vramPeak.v ? devPeak : vramPeak;
   const t0 = samples.length ? samples[0].t : run.started;
 
   // ── verdict ───────────────────────────────────────────────────────
@@ -188,6 +192,14 @@ export function buildReport({ run, runCount, workflowName, system, config }) {
               "          (SIGKILL raises nothing) or a hard crash.";
   } else if (run.status === "error") {
     verdict = "ENDED IN ERROR.";
+    const e = run.error;
+    if (e) {
+      const who = run.titles?.[e.node_id];
+      verdict += `\n          Failed in node ${e.node_id} — ` +
+                 (who && who !== e.class_type ? `${who} (${e.class_type})` : (e.class_type || "?")) +
+                 (e.exception_type ? `\n          ${e.exception_type}: ` : "\n          ") +
+                 String(e.message || "").split("\n")[0].slice(0, 300);
+    }
   } else if (run.status === "interrupted") {
     verdict = "INTERRUPTED.";
   } else {
@@ -217,6 +229,10 @@ export function buildReport({ run, runCount, workflowName, system, config }) {
   L.push(`  VRAM      ${fmtB(vramMax)} total` +
          (vramPeak.v ? `   peak allocated ${fmtB(vramPeak.v)} (${pct(vramPeak.v, vramMax)})` +
                        `  at +${fmtT(vramPeak.t - t0)}` : ""));
+  if (devPeak.v) {
+    L.push(`            whole device peaked ${fmtB(devPeak.v)} (${pct(devPeak.v, vramMax)})` +
+           ` — includes model weights and other processes.`);
+  }
   if (resPeak.v) {
     L.push(`            torch reserved peaked ${fmtB(resPeak.v)} (${pct(resPeak.v, vramMax)})` +
            ` — reserved, not allocated, is what the driver actually holds.`);
@@ -245,12 +261,12 @@ export function buildReport({ run, runCount, workflowName, system, config }) {
 
   // ── headroom warning ──────────────────────────────────────────────
   const ramTight = ramMax && ramPeak.v / ramMax > 0.92;
-  const vramTight = vramMax && vramPeak.v / vramMax > 0.92;
+  const vramTight = vramMax && cardPeak.v / vramMax > 0.92;
   if (ramTight || vramTight) {
     L.push("HEADROOM");
     if (ramTight) L.push(`  ! System RAM reached ${pct(ramPeak.v, ramMax)} of the machine. ` +
                          `This is what the OOM killer watches.`);
-    if (vramTight) L.push(`  ! VRAM reached ${pct(vramPeak.v, vramMax)} of the card.`);
+    if (vramTight) L.push(`  ! VRAM reached ${pct(cardPeak.v, vramMax)} of the card.`);
     L.push("");
   }
 

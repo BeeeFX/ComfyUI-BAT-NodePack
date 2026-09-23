@@ -13,6 +13,11 @@
         "-slicecrc", "1",
         "-pix_fmt", "{pix_fmt}"
     ],
+    "yuv_video_args": [
+        "-vf", "scale=out_color_matrix=bt709:out_range=tv",
+        "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709"
+    ],
     "audio_args": ["-c:a", "flac"],
     "widgets": {
         "slices":  {"type": "COMBO", "default": "16", "label": "Slices",

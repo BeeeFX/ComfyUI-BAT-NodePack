@@ -58,7 +58,7 @@
  * grouping happens in a modal instead of inline, which is the trade.
  */
 
-import { app } from "/scripts/app.js";
+import { app } from "../../scripts/app.js";
 
 const NODE_TYPE = "Bat_BypassSwitch";
 const LOG = "[Bat_BypassSwitch]";
@@ -769,6 +769,15 @@ function duplicateSwitch(node) {
     return null;
 }
 
+/** Does any other switch in this graph hold a preset with this id? */
+function presetIdShared(node, presetId) {
+    for (const other of node.graph?.nodes || node.graph?._nodes || []) {
+        if (!other || other === node || other.type !== NODE_TYPE) continue;
+        if (readState(other).presets.some((p) => p.id === presetId)) return true;
+    }
+    return false;
+}
+
 /**
  * Repaint the ⚠ markers once the graph has finished loading.
  *
@@ -1334,8 +1343,10 @@ function openEditDialog(node, draftIn) {
                             p.nodes = captured.nodes.slice();
                             p.groups = captured.groups.slice();
                             // Re-selecting is the documented cure for a pasted
-                            // copy, so stop calling it one.
-                            delete node._bswDuplicate;
+                            // copy — but the copy is *detected* by shared preset
+                            // ids, so new targets alone would be flagged again
+                            // on the next load. Give it an id of its own.
+                            if (presetIdShared(node, p.id)) p.id = uid("p");
                         }
                         openEditDialog(node, draft);
                     },
@@ -1399,6 +1410,9 @@ function openEditDialog(node, draftIn) {
             const saved = normaliseState(draft);
             asOneUndoStep(node, () => {
                 writeState(node, saved);
+                // Still a copy only while some toggle still shares an id
+                // with the original (i.e. has not been re-selected yet).
+                if (node._bswDuplicate) node._bswDuplicate = !!duplicateSwitch(node);
                 // Normalisation can switch a toggle off — moving a second
                 // active toggle into an exclusive group, for one — and a
                 // toggle that says "off" while its nodes are still enabled is

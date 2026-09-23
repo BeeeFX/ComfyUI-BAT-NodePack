@@ -108,9 +108,11 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
+import { batTrack, registerCleanup, batNodeCacheKey, batCacheSet, isNodeAlive, batReplayLastExecution,
+         batPreviewWillReplay } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 import { blendTile, makeBlurCache, paintView, neutralHigh } from "./bat_blend_core.js";
 
@@ -263,6 +265,40 @@ function repairNode(node) {
     }
 }
 
+/**
+ * Call `onChange` whenever `node.showAdvanced` is assigned, from anywhere.
+ *
+ * The header's own click refreshes it directly, but Nodes 2.0 has a second
+ * switch — the Vue node footer's advanced-inputs button assigns
+ * `node.showAdvanced` itself (LGraphNode.vue) — and that left the header
+ * reading "▸ Advanced" over an expanded section.
+ *
+ * Wraps the frontend's own accessor in an instance-level one rather than
+ * replacing it, so the reactive state it writes keeps working. Only installed
+ * when that accessor exists: on a frontend where `showAdvanced` is a plain
+ * property, shadowing it would change what gets stored, and a stale caret is
+ * the lesser problem.
+ */
+function watchShowAdvanced(node, onChange) {
+    let desc = null;
+    for (let o = Object.getPrototypeOf(node); o && !desc; o = Object.getPrototypeOf(o)) {
+        desc = Object.getOwnPropertyDescriptor(o, "showAdvanced") || null;
+    }
+    if (!desc || typeof desc.get !== "function" || typeof desc.set !== "function") return;
+    if (Object.getOwnPropertyDescriptor(node, "showAdvanced")) return;
+    try {
+        Object.defineProperty(node, "showAdvanced", {
+            configurable: true,
+            enumerable: !!desc.enumerable,
+            get() { return desc.get.call(this); },
+            set(v) {
+                desc.set.call(this, v);
+                try { onChange(); } catch (_) {}
+            },
+        });
+    } catch (_) { /* non-configurable: keep the frontend's behaviour as-is */ }
+}
+
 // ── the preview ──────────────────────────────────────────────────────────
 
 /** Amplification steps for the Detail / Diff views. See the note in render(). */
@@ -356,7 +392,14 @@ function buildPreview(node) {
     const track = batTrack(node);
 
     const root = document.createElement("div");
-    root.style.cssText = `position:relative; display:flex; flex-direction:column;
+    // Focusable, so the wheel can be ours under Nodes 2.0: TransformPane
+    // forwards every wheel to the graph unless the target sits inside a
+    // `[data-capture-wheel]` element that holds focus (useCanvasInteractions).
+    // attachZoomControl marks `root` (its `scope`) and a click in the picture
+    // focuses it; from then the wheel zooms the preview. No key is handled
+    // here, so none is stopped — Delete, Escape and the rest still reach core.
+    root.tabIndex = 0;
+    root.style.cssText = `position:relative; display:flex; flex-direction:column; outline:none;
         background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; overflow:hidden;`;
 
     // The Advanced switch. A DOM button rather than a litegraph widget — see
@@ -400,10 +443,16 @@ function buildPreview(node) {
         node.setDirtyCanvas?.(true, true);
     });
     node._batRefreshAdvBar = refreshAdvBar;
+    watchShowAdvanced(node, refreshAdvBar);
     root.appendChild(advBar);
 
     const stage = document.createElement("div");
     stage.style.cssText = "position:relative; flex:1 1 auto; min-height:0; display:flex; background:#000;";
+    // Capture phase: hold-to-compare and the zoom control both stop
+    // pointerdown, and focus has to follow the click regardless.
+    stage.addEventListener("pointerdown", () => {
+        try { root.focus({ preventScroll: true }); } catch (_) {}
+    }, true);
     // The VISIBLE canvas is sized to its CSS box; the draft tile and the
     // server's full-resolution PNG are both drawn into it through the same
     // zoom/pan transform. See the "Two layers" note at the top.
@@ -469,11 +518,17 @@ function buildPreview(node) {
     const off = document.createElement("canvas");
     const offCtx = off.getContext("2d", { willReadFrequently: true });
 
-    const viewKey = batNodeCacheKey(app, "bat_advblend_view", node);
-    const saved = (() => {
-        try { return JSON.parse(localStorage.getItem(viewKey) || "{}") || {}; }
+    // Keys are built when USED. This runs inside onNodeCreated, where a node
+    // being loaded still has id -1 and no graph, so a key built here was the
+    // same for every Advanced Blend node: they restored (and overwrote) one
+    // another's plates and view. The restore re-reads the view once the id is
+    // final.
+    const viewKey = () => batNodeCacheKey(app, "bat_advblend_view", node);
+    const readSaved = () => {
+        try { return JSON.parse(localStorage.getItem(viewKey()) || "{}") || {}; }
         catch (_) { return {}; }
-    })();
+    };
+    const saved = readSaved();
 
     const state = {
         a: null, b: null,          // full-resolution SourceBuffers
@@ -513,6 +568,10 @@ function buildPreview(node) {
         needsRun: false,
         // Measured round trip for a server render, used to pace the requests.
         serverMs: 0,
+        // The execution id this node's frame is cached under server-side, and
+        // the token of the run whose tiles are on screen. The server renders
+        // only for that run; a restored thumbnail has none and asks for nothing.
+        serverId: null, serverRun: null,
     };
     node._batAdvBlendState = state;
 
@@ -523,8 +582,11 @@ function buildPreview(node) {
 
     function saveView() {
         try {
-            localStorage.setItem(viewKey, JSON.stringify({
+            localStorage.setItem(viewKey(), JSON.stringify({
                 view: state.view, amp: state.amp, dispZoom: state.dispZoom,
+                // Read back on load but was never written, so the drag
+                // setting reset to Full on every reopen.
+                quality: state.quality,
             }));
         } catch (_) { /* quota / disabled storage — still works this session */ }
     }
@@ -771,6 +833,10 @@ function buildPreview(node) {
         if (msg.id === jobId) {
             state.blendMs = msg.ms;
             state.tw = msg.w; state.th = msg.h;
+            // The worker only ever blends the full tile. Without this, a drag on
+            // Half left the level at 1 and the probe indexed the half-size mip
+            // with full-tile coordinates: wrong A/B values, then a TypeError.
+            state.draftLevel = 0;
             if (off.width !== msg.w || off.height !== msg.h) {
                 off.width = msg.w; off.height = msg.h;
             }
@@ -919,7 +985,7 @@ function buildPreview(node) {
 
     async function requestFull() {
         if (!isNodeAlive(node) || !state.tw || state.holding) return;
-        if (node.id == null) return;
+        if (node.id == null || !state.serverRun) return;
         const region = visibleRegion();
         if (!region) return;
 
@@ -935,12 +1001,16 @@ function buildPreview(node) {
         paintBadge();
         const started = performance.now();
         try {
-            const res = await fetch("/bat/advanced_blend/render", {
+            const res = await fetch(api.apiURL("/bat/advanced_blend/render"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 signal: ctl.signal,
                 body: JSON.stringify({
-                    node_id: String(node.id),
+                    // The id Python cached the frame under. `node.id` is only
+                    // the local part inside a subgraph, so it is the fallback
+                    // for a payload that predates the field.
+                    node_id: state.serverId ?? String(node.id),
+                    run: state.serverRun,
                     roi: [region.world.x, region.world.y, region.world.w, region.world.h],
                     out_w: region.outW, out_h: region.outH,
                     view: state.view, amp: state.amp,
@@ -1226,7 +1296,7 @@ function buildPreview(node) {
     let zoomCtl = null;
     try {
         zoomCtl = attachZoomControl({
-            wrap: stage, canvas, state,
+            wrap: stage, canvas, state, scope: root,
             onChange: () => {
                 saveView();
                 // A pan or zoom changes which region the full layer should
@@ -1316,7 +1386,7 @@ function buildPreview(node) {
     };
 
     // ── ingest ───────────────────────────────────────────────────────────
-    const cacheKey = batNodeCacheKey(app, "bat_advblend_preview", node);
+    const cacheKey = () => batNodeCacheKey(app, "bat_advblend_preview", node);
 
     async function decodePlate(tile, jpeg, which) {
         if (tile && hdrSupported()) {
@@ -1341,6 +1411,10 @@ function buildPreview(node) {
 
     node._batAdvBlendIngest = async (msg) => {
         const one = (v) => (Array.isArray(v) ? v[0] : v);
+        const sid = one(msg.node_id);
+        state.serverId = sid != null ? String(sid) : null;
+        const run = one(msg.run);
+        state.serverRun = typeof run === "string" && run ? run : null;
         state.meta = {
             w: Number(one(msg.w)) || 0,
             h: Number(one(msg.h)) || 0,
@@ -1364,6 +1438,24 @@ function buildPreview(node) {
         state.aMips = state.a ? ladder(state.a) : null;
         state.bMips = state.b ? ladder(state.b) : null;
 
+        // The mask BEFORE the worker is seeded. The seed takes whatever
+        // maskFor() returns, and when it ran first that was the PREVIOUS run's
+        // mask: a newly wired mask was ignored by the draft, a removed one kept
+        // applying.
+        const maskB64 = one(msg.mask_png);
+        state.mask = null;
+        if (maskB64) {
+            const mimg = new Image();
+            await new Promise((res, rej) => {
+                mimg.onload = res; mimg.onerror = rej;
+                mimg.src = `data:image/png;base64,${maskB64}`;
+            });
+            state.maskImg = mimg;
+        } else {
+            state.maskImg = null;
+        }
+        if (!isNodeAlive(node)) return;
+
         // Hand the full tile to the worker. Copies, not transfers: the main
         // thread still needs these for the reduced settings, the A/B views and
         // the mask rasteriser. One 8MB copy per execution, against a repaint
@@ -1385,19 +1477,6 @@ function buildPreview(node) {
             }
         }
 
-        const maskB64 = one(msg.mask_png);
-        state.mask = null;
-        if (maskB64) {
-            const mimg = new Image();
-            await new Promise((res, rej) => {
-                mimg.onload = res; mimg.onerror = rej;
-                mimg.src = `data:image/png;base64,${maskB64}`;
-            });
-            state.maskImg = mimg;
-        } else {
-            state.maskImg = null;
-        }
-
         blurs.clear();
         // A new execution means new content, possibly a different frame of the
         // batch entirely. The render on screen is not a moment out of date, it
@@ -1412,19 +1491,30 @@ function buildPreview(node) {
         // node's thumbnail cache, so stashing them there would evict the caches
         // that actually need to survive a reload.
         if (jpegA && jpegB) {
-            try {
-                localStorage.setItem(cacheKey, JSON.stringify({
-                    jpeg_a: jpegA, jpeg_b: jpegB, meta: state.meta,
-                }));
-            } catch (_) { /* quota — the preview repopulates on the next run */ }
+            // Within the pack's budget; a refusal just means the preview
+            // repopulates on the next run.
+            batCacheSet(cacheKey(), JSON.stringify({
+                jpeg_a: jpegA, jpeg_b: jpegB, meta: state.meta,
+            }));
         }
 
         schedule(false);
     };
 
     node._batAdvBlendRestore = () => {
+        const sv = readSaved();
+        if (VIEWS.some((v) => v[0] === sv.view)) state.view = sv.view;
+        if (AMP_STEPS.includes(sv.amp)) state.amp = sv.amp;
+        if (Number.isFinite(sv.dispZoom)) state.dispZoom = sv.dispZoom;
+        if (DRAFT_LEVELS.some((q) => q[0] === sv.quality)) {
+            state.quality = sv.quality; qualSel.value = sv.quality;
+        }
+        refreshBar();
+        // A replay of this session's run is coming, and it is the better
+        // picture: the thumbnail's async decode could otherwise land after it.
+        if (state.a || batPreviewWillReplay(node)) return;
         let c = null;
-        try { c = JSON.parse(localStorage.getItem(cacheKey) || "null"); } catch (_) {}
+        try { c = JSON.parse(localStorage.getItem(cacheKey()) || "null"); } catch (_) {}
         if (!c?.jpeg_a || !c?.jpeg_b) return;
         node._batAdvBlendIngest({
             jpeg_a: [c.jpeg_a], jpeg_b: [c.jpeg_b],

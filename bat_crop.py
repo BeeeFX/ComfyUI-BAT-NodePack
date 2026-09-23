@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from .bat_ui_ref import stash_ui
+
 
 def _first(img):
     return img[0:1] if img is not None and img.shape[0] > 1 else img
@@ -23,10 +25,15 @@ def _first(img):
 
 def _make_crop_grid(x, y, w, h, H, W, angle_deg, n, device, dtype):
     """Build a (n, h, w, 2) sampling grid that maps the output pixels of a
-    rotated rect (centre (x+w/2, y+h/2), rotated by `angle_deg`) back into
-    normalised source coords for grid_sample (align_corners=True)."""
-    cx = x + w / 2.0
-    cy = y + h / 2.0
+    rotated rect (rotated by `angle_deg` about its centre) back into
+    normalised source coords for grid_sample (align_corners=True).
+
+    align_corners=True puts pixel INDEX k at k, so the rect's centre is
+    x + (w-1)/2, not the edge-space x + w/2. The latter sampled every rotated
+    crop half a pixel right and down (a shift plus a bilinear blur), and the
+    Crop→Uncrop round trip didn't land back where it started."""
+    cx = x + (w - 1) / 2.0
+    cy = y + (h - 1) / 2.0
     a = math.radians(float(angle_deg))
     cos_t, sin_t = math.cos(a), math.sin(a)
     ys, xs = torch.meshgrid(
@@ -85,7 +92,9 @@ def _rotated_crop(image, x, y, w, h, angle_deg, fill="black"):
         cov = F.grid_sample(ones, grid, mode="bilinear",
                             padding_mode="zeros", align_corners=True)
         out = out + (1.0 - cov) * _GRAY_VALUE
-    return out.permute(0, 2, 3, 1).clamp(0, 1).contiguous()
+    # No clamp: bilinear sampling can't overshoot the source range, and a
+    # [0,1] clamp here clipped HDR plates the moment the crop was rotated.
+    return out.permute(0, 2, 3, 1).contiguous()
 
 
 def _rotated_crop_mask(mask, x, y, w, h, angle_deg, fill="black"):
@@ -156,7 +165,10 @@ def _broadcast_mask_to_n(mask, n):
 
 
 def _rotated_rect_mask(H, W, cx, cy, rw, rh, angle_deg, n, device, dtype):
-    """Per-pixel mask on (n, H, W) for a rotated rect of size (rw,rh) at (cx,cy)."""
+    """Per-pixel mask on (n, H, W) for a rotated rect of size (rw,rh) at (cx,cy).
+
+    (cx, cy) is in pixel-INDEX space — x + (w-1)/2 for a rect at x — the same
+    centre _make_crop_grid samples about."""
     a = math.radians(float(angle_deg))
     cos_t, sin_t = math.cos(a), math.sin(a)
     ys, xs = torch.meshgrid(
@@ -400,8 +412,8 @@ class BatCrop:
             if constrain_to_canvas:
                 x, y = constrain_rotated_rect(x, y, w, h, angle, W, H)
             cropped = _rotated_crop(image, x, y, w, h, angle, outside_fill)
-            cx = x + w / 2.0
-            cy = y + h / 2.0
+            cx = x + (w - 1) / 2.0
+            cy = y + (h - 1) / 2.0
             rect_mask = _rotated_rect_mask(H, W, cx, cy, w, h, angle, n,
                                            device, dtype)
             if in_mask is not None:
@@ -419,7 +431,10 @@ class BatCrop:
         if out_w != w or out_h != h:
             nchw = cropped.permute(0, 3, 1, 2)
             nchw = F.interpolate(nchw, size=(out_h, out_w), mode="bicubic", align_corners=False)
-            out_image = nchw.permute(0, 2, 3, 1).clamp(0, 1).contiguous()
+            # Clamp bicubic overshoot to the crop's OWN range, not [0,1] —
+            # the latter clipped every HDR value above 1.
+            out_image = nchw.permute(0, 2, 3, 1).clamp(
+                cropped.amin().item(), cropped.amax().item()).contiguous()
             # Mask follows the same snap-resize as the image.
             m_nchw = cropped_mask.unsqueeze(1).to(torch.float32)
             m_nchw = F.interpolate(m_nchw, size=(out_h, out_w), mode="bilinear", align_corners=False)
@@ -443,9 +458,11 @@ class BatCrop:
         }
 
         return {
-            "ui": {
+            # Sidecar, not inline: a 1024px JPEG per run would otherwise sit in
+            # the prompt history for the life of the server (bat_ui_ref.py).
+            "ui": stash_ui({
                 "preview": [_b64_jpeg(_first(image))],
                 "w": [int(W)], "h": [int(H)],
-            },
+            }),
             "result": (out_image, crop_info, cropped_mask, rect_mask),
         }

@@ -51,6 +51,65 @@ const STEP = 1.2;
 
 const clampZoom = (z) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
 
+/* ── Middle-drag pan under Nodes 2.0 ────────────────────────────────────────
+ *
+ * On a Vue node the canvas's own middle-button listeners never run:
+ * TransformPane forwards every middle-button pointerdown/move/up to the graph
+ * canvas in the CAPTURE phase and stops it there (GraphCanvas.vue
+ * forwardPanEvent → useCanvasInteractions.forwardEventToCanvas), so a
+ * middle-drag over the picture panned the whole graph. The only listener that
+ * runs before TransformPane's is one on `window`, capture phase. So: one such
+ * router per page (not per node — a per-instance window listener is the
+ * accumulating leak bat_lifecycle.js exists to prevent), which finds the
+ * zoom-controlled canvas under the press through a marker attribute + WeakMap,
+ * drives that instance's pan, and stops the pointerdown/move/up sequence
+ * while the pan is live. It only claims presses inside a Vue node (`.lg-node`):
+ * under Nodes 1.0, and in fullscreen, nothing sits in front and the canvas's
+ * own listeners handle it exactly as before.
+ */
+const ZOOM_CANVAS_ATTR = "data-bat-zoom-canvas";
+const PANS = new WeakMap();        // canvas → { begin, move, end }
+let routedPan = null;              // { pan, pointerId } while a routed drag is live
+let routerInstalled = false;
+
+function installPanRouter() {
+    if (routerInstalled) return;
+    // No window (a headless harness, a worker): there is no TransformPane to
+    // route around either, and the canvas's own listeners still pan.
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") return;
+    routerInstalled = true;
+    const claim = (e) => { e.preventDefault(); e.stopPropagation(); };
+    try {
+        window.addEventListener("pointerdown", (e) => {
+            if (e.button !== 1 || routedPan) return;
+            const c = e.target?.closest?.(`[${ZOOM_CANVAS_ATTR}]`);
+            if (!c || !c.closest(".lg-node")) return;
+            const pan = PANS.get(c);
+            if (!pan) return;
+            routedPan = { pan, pointerId: e.pointerId };
+            pan.begin(e);
+            claim(e);
+        }, true);
+        window.addEventListener("pointermove", (e) => {
+            if (!routedPan || e.pointerId !== routedPan.pointerId) return;
+            routedPan.pan.move(e);
+            claim(e);
+        }, true);
+        const up = (e) => {
+            if (!routedPan || e.pointerId !== routedPan.pointerId) return;
+            const { pan } = routedPan;
+            routedPan = null;
+            pan.end(e);
+            claim(e);
+        };
+        window.addEventListener("pointerup", up, true);
+        window.addEventListener("pointercancel", up, true);
+    } catch (e) {
+        globalThis.console?.error?.("[BAT.zoom] could not install the pan router:", e);
+        routerInstalled = false;
+    }
+}
+
 /**
  * @param {object}   opts
  * @param {HTMLElement} opts.wrap      canvas wrapper (position:relative)
@@ -58,9 +117,25 @@ const clampZoom = (z) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
  * @param {object}   opts.state        editor state object (gets .dispZoom/.panX/.panY)
  * @param {Function} opts.onChange     called after any view change (→ render)
  * @param {string}   [opts.corner]     "tl"|"tr"|"bl"|"br" (default "bl")
+ * @param {HTMLElement} [opts.scope]   the element that holds keyboard focus
+ *                                     while the artist works in the editor
+ *                                     (default `wrap`) — see below
  * @returns {{setZoom:Function, getZoom:Function, resetView:Function, refresh:Function}}
  */
-export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl" }) {
+export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl", scope = null }) {
+    // Nodes 2.0: TransformPane forwards every wheel event to the graph in the
+    // CAPTURE phase (GraphCanvas.vue → useCanvasInteractions.forwardEventToCanvas)
+    // and stops it there, so the canvas listener below never ran — the wheel
+    // zoomed the graph instead. The one exemption is a target inside a
+    // `[data-capture-wheel="true"]` element that contains the focused element.
+    // So mark the element the editor focuses: after one click in the editor the
+    // wheel is ours, before it the graph still pans over the node, which is the
+    // frontend's own convention. Inert under Nodes 1.0 and inert if nothing
+    // inside `scope` ever takes focus — only an editor that focuses itself
+    // gains wheel zoom here; one that doesn't would have to take focus first,
+    // and then stop its keys reaching core's Delete binding (see bat_roto.js).
+    try { (scope || wrap)?.setAttribute?.("data-capture-wheel", "true"); } catch (_) {}
+
     if (typeof state.dispZoom !== "number" || !isFinite(state.dispZoom)) {
         state.dispZoom = 1;
     }
@@ -213,10 +288,7 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
     // don't filter on e.button, so without this a middle-click would also
     // start a draw. Left/right buttons fall straight through untouched.
     let pan = null;
-    canvas.addEventListener("pointerdown", (e) => {
-        if (e.button !== 1) return;         // middle button only
-        e.preventDefault();
-        e.stopPropagation();
+    const beginPan = (e) => {
         const r = canvas.getBoundingClientRect();
         pan = {
             startX: e.clientX, startY: e.clientY,
@@ -229,23 +301,42 @@ export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl"
         canvas.style.cursor = "grabbing";
         armBatPasteGuard();
         try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
-    }, true);
-    canvas.addEventListener("pointermove", (e) => {
+    };
+    const movePan = (e) => {
         if (!pan) return;
-        e.preventDefault();
-        e.stopPropagation();
         state.panX = pan.baseX + (e.clientX - pan.startX) * pan.sx;
         state.panY = pan.baseY + (e.clientY - pan.startY) * pan.sy;
         onChange?.();
-    }, true);
-    const endPan = (e) => {
+    };
+    const finishPan = (e) => {
         if (!pan) return;
-        e.stopPropagation();
         // Re-arm: the paste arrives on release, not on press.
         armBatPasteGuard();
         try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
         canvas.style.cursor = pan.prevCursor || "";
         pan = null;
+    };
+    // Nodes 2.0 reaches the three above through the window router instead.
+    try { canvas.setAttribute(ZOOM_CANVAS_ATTR, ""); } catch (_) {}
+    PANS.set(canvas, { begin: beginPan, move: movePan, end: finishPan });
+    installPanRouter();
+
+    canvas.addEventListener("pointerdown", (e) => {
+        if (e.button !== 1) return;         // middle button only
+        e.preventDefault();
+        e.stopPropagation();
+        beginPan(e);
+    }, true);
+    canvas.addEventListener("pointermove", (e) => {
+        if (!pan) return;
+        e.preventDefault();
+        e.stopPropagation();
+        movePan(e);
+    }, true);
+    const endPan = (e) => {
+        if (!pan) return;
+        e.stopPropagation();
+        finishPan(e);
     };
     canvas.addEventListener("pointerup", endPan, true);
     canvas.addEventListener("pointercancel", endPan, true);

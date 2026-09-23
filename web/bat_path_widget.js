@@ -157,9 +157,22 @@ function openPathSearch(event, widget, node) {
     return true;
 }
 
+// Extra height for the optional subtitle line (Nodes 2.0 only — see below).
+const SUBTITLE_H = 14;
+
 function drawPathWidget(ctx, node, widgetWidth, y, H) {
     const m = 15;
-    const showText = app.canvas.ds.scale >= 0.5;
+    // The zoom cut-off is a Nodes 1.0 economy. Under 2.0 this is painted once
+    // into the widget's own canvas and NOT repainted on zoom (a CSS transform
+    // doesn't fire WidgetLegacy's ResizeObserver), so a node mounted zoomed
+    // out kept a blank pill after zooming back in.
+    const showText = !!LiteGraph.vueNodesMode || app.canvas.ds.scale >= 0.5;
+    // Under 2.0 the node's summary line lives inside the widget (the node's
+    // onDrawForeground is never called there), so the pill takes the top of
+    // the row and the subtitle the strip below it.
+    const subtitle = (this._batSubtitle && LiteGraph.vueNodesMode)
+        ? this._batSubtitle() : null;
+    if (this._batSubtitle && LiteGraph.vueNodesMode) H -= SUBTITLE_H;
     // See the note at the top: `widget.width` is unpinned, so the width handed
     // in is the node's own on the graph canvas and the container's in the
     // parameters panel — which is what we want in both places.
@@ -196,6 +209,17 @@ function drawPathWidget(ctx, node, widgetWidth, y, H) {
     const avail = rowWidth - (showLabel ? labelWidth + gap : 0);
     ctx.fillText(fitTail(ctx, val, avail), textRight, y + H * 0.7);
     ctx.restore();
+
+    const [subText, subColour] = subtitle || [];
+    if (subText) {
+        ctx.save();
+        ctx.font = "10px monospace";
+        ctx.fillStyle = subColour || LiteGraph.WIDGET_SECONDARY_TEXT_COLOR;
+        ctx.textAlign = "right";
+        ctx.fillText(fitTail(ctx, subText, width - m * 2), width - m - 5,
+                     y + H + SUBTITLE_H - 3);
+        ctx.restore();
+    }
 }
 
 /**
@@ -207,9 +231,13 @@ function drawPathWidget(ctx, node, widgetWidth, y, H) {
  * @param {object}  spec.options the input's options dict (bat_path_extensions)
  * @param {string}  spec.route   the /getpath route to autocomplete against
  * @param {string}  spec.title   heading shown on the search popup
+ * @param {Function} [spec.subtitle] () => [text, colour]: a one-line summary
+ *                   drawn under the pill under Nodes 2.0 only, where a node's
+ *                   own onDrawForeground (the 1.0 place for it) never runs
  */
 export function makeBatPathWidget({ name = "path", value = "", options = {},
-                                    route = "/bat/getpath", title = "Path" } = {}) {
+                                    route = "/bat/getpath", title = "Path",
+                                    subtitle = null } = {}) {
     const w = {
         name,
         type: "BAT.PATH",
@@ -217,6 +245,7 @@ export function makeBatPathWidget({ name = "path", value = "", options = {},
         options: options || {},
         _batRoute: route,
         _batTitle: title,
+        _batSubtitle: subtitle,
         draw: drawPathWidget,
         mouse(event, pos, node) {
             // pointerdown only: `mouse` also receives moves and wheel events,
@@ -225,7 +254,27 @@ export function makeBatPathWidget({ name = "path", value = "", options = {},
             if (event.type !== "pointerdown") return false;
             return openPathSearch(event, this, node);
         },
-        computeSize() { return [200, LiteGraph.NODE_WIDGET_HEIGHT]; },
+        computeSize() {
+            const extra = (this._batSubtitle && LiteGraph.vueNodesMode) ? SUBTITLE_H : 0;
+            return [200, LiteGraph.NODE_WIDGET_HEIGHT + extra];
+        },
     };
     return unpinWidgetWidth(w);
+}
+
+/**
+ * Put a path widget into `node.widgets[index]` and return the widget that is
+ * actually there.
+ *
+ * Unpinning has to happen AFTER insertion. The frontend adopts a plain-object
+ * widget when it lands in node.widgets (widgetMap.ts adoptConcreteWidget), and
+ * that descriptor merge keeps BaseWidget's own `width` field in place of the
+ * accessor unpinWidgetWidth installed — so an unpin done in makeBatPathWidget
+ * alone is silently undone and the pill pins to whatever width last drew it.
+ */
+export function installBatPathWidget(node, index, widget) {
+    node.widgets[index] = widget;
+    const live = node.widgets[index] || widget;
+    unpinWidgetWidth(live);
+    return live;
 }

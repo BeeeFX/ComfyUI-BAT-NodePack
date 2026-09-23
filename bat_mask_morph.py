@@ -83,9 +83,106 @@ def _torch_disc(radius: int, shape: str, device) -> torch.Tensor:
     return ((yy * yy + xx * xx) <= (radius * radius + 0.5)).to(torch.float32)
 
 
+# ─── large-radius disc ───────────────────────────────────────────────────────
+#
+# cv2 morphs a non-rectangular kernel by visiting every tap, so the disc costs
+# O(r²) per pixel: 1080p, one frame, r=64 ≈ 0.4–1.1 s, r=128 ≈ 1.4–4 s,
+# r=256 ≈ 6–20 s (the square stays ~15–50 ms at any radius — it is separable).
+# Two EXACT replacements, both reproducing cv2's MORPH_ELLIPSE output bit for
+# bit (tests/verify_mask_morph.py checks thousands of random cases):
+#
+# * binary masks — a distance transform, cost independent of the radius;
+# * soft masks — the disc split into its rows: dilating by row half-width w
+#   is built up incrementally from w-1 (two maxima), then each kernel row
+#   contributes one shifted maximum. O(r) per pixel instead of O(r²).
+#
+# The obvious shortcut — iterating a small disc — is NOT used: its polygonal
+# shape differs from the true disc by up to 0.07 (r=16) … 0.65 (r=256) on a
+# feathered edge, which is a visibly different matte.
+#
+# Below these radii the plain kernel is still the fastest, so small grows —
+# the default is 4 — go through exactly the code they always did.
+_EDT_MIN_RADIUS = 24
+_ROWS_MIN_RADIUS = 48
+# "Binary" allows this much slop, so a mask that went through a resize or a
+# float round-trip still takes the fast path (its output is then exactly 0/1).
+_BINARY_TOL = 1e-3
+
+
+def _is_near_binary(arr: np.ndarray) -> bool:
+    return bool(np.all((arr <= _BINARY_TOL) | (arr >= 1.0 - _BINARY_TOL)))
+
+
+def _ellipse_half_widths(radius: int) -> list:
+    """Half-width of each row of cv2's MORPH_ELLIPSE (2r+1) kernel, top to
+    bottom. Read off the real kernel so the fast paths can't drift from it."""
+    k = _kernel(radius, "disc")
+    return [(int(row.sum()) - 1) // 2 for row in k]
+
+
+def _dilate_binary_edt(fg: np.ndarray, radius: int) -> np.ndarray:
+    """Exact binary dilation of `fg` (H, W bool) by the MORPH_ELLIPSE kernel.
+
+    That kernel is not a Euclidean disc: row dy spans |dx| <= round(√(r²-dy²)),
+    i.e. (|dx|-½)² + dy² <= r². So distances are taken on a grid doubled in
+    both axes, with each foreground pixel widened to a 3-sample horizontal
+    run: from a query sample, the nearest sample of a pixel dx columns away is
+    2|dx|-1 half-steps off (0 in the same column), which makes the threshold
+    at 2r exactly the kernel's membership test. DIST_MASK_PRECISE is exact.
+    Outside the frame counts as background, as BORDER_CONSTANT 0 did.
+    """
+    h, w = fg.shape
+    if not fg.any():
+        return np.zeros((h, w), dtype=bool)
+    src = np.ones((2 * h - 1, 2 * w + 1), dtype=np.uint8)
+    even = src[0::2]
+    even[:, 0:-1:2][fg] = 0
+    even[:, 1::2][fg] = 0
+    even[:, 2::2][fg] = 0
+    dist = cv2.distanceTransform(src, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    return dist[0::2, 1::2] <= 2 * radius
+
+
+def _morph_disc_rows(frame: np.ndarray, radius: int, grow: bool) -> np.ndarray:
+    """Exact MORPH_ELLIPSE dilate/erode of one float32 frame, O(r) per pixel."""
+    half = _ellipse_half_widths(radius)
+    bv = 0.0 if grow else 1.0
+    red = np.maximum if grow else np.minimum
+    h, w = frame.shape
+    r = radius
+    p = cv2.copyMakeBorder(frame, r, r, r, r, cv2.BORDER_CONSTANT, value=bv)
+    row = p[:, r:r + w].copy()   # running row dilation, half-width `cur`
+    out = np.full((h, w), bv, dtype=np.float32)
+    cur = 0
+    for hw in sorted(set(half)):
+        while cur < hw:
+            cur += 1
+            red(row, p[:, r - cur:r - cur + w], out=row)
+            red(row, p[:, r + cur:r + cur + w], out=row)
+        for i, k_hw in enumerate(half):
+            if k_hw == hw:
+                red(out, row[i:i + h], out=out)
+    return out
+
+
 def _morph_cv2(batch: np.ndarray, radius: int, shape: str, grow: bool) -> np.ndarray:
     """Dilate (grow) or erode every frame in a (N, H, W) float32 array."""
     n, h, w = batch.shape
+    if shape == "disc" and radius >= _EDT_MIN_RADIUS and _is_near_binary(batch):
+        out = np.empty_like(batch)
+        for i in range(n):
+            fg = batch[i] > 0.5
+            # Erosion is the complement of dilating the background; outside
+            # the frame then counts as foreground, as borderValue 1.0 did.
+            hit = _dilate_binary_edt(fg, radius) if grow else ~_dilate_binary_edt(~fg, radius)
+            out[i] = hit
+        return out
+    if shape == "disc" and radius >= _ROWS_MIN_RADIUS:
+        out = np.empty_like(batch)
+        for i in range(n):
+            out[i] = _morph_disc_rows(batch[i], radius, grow)
+        return out
+
     kernel = _kernel(radius, shape)
     op = cv2.dilate if grow else cv2.erode
     # Process each frame independently. Stacking into one tall image would
@@ -115,23 +212,31 @@ def _morph_torch(batch: torch.Tensor, radius: int, shape: str, grow: bool) -> to
             return F.max_pool2d(x, size, stride=1, padding=pad).squeeze(1)
         return (-F.max_pool2d(-x, size, stride=1, padding=pad)).squeeze(1)
 
-    # Disc: unfold into (N, k*k, H*W) patches, mask out-of-element taps to
-    # -inf (grow) / +inf (erode), then reduce. One big op, no Python loop.
-    if grow:
-        xp = F.pad(x, (pad, pad, pad, pad), value=0.0)
-    else:
-        xp = F.pad(x, (pad, pad, pad, pad), value=1.0)
-    patches = F.unfold(xp, kernel_size=size)  # (N, k*k, H*W)
-    n, _, l = patches.shape
-    patches = patches.view(n, size * size, l)
-    flat = elem.reshape(-1).to(torch.bool)  # (k*k,)
-    if grow:
-        patches = patches.masked_fill(~flat[None, :, None], float("-inf"))
-        red = patches.max(dim=1).values
-    else:
-        patches = patches.masked_fill(~flat[None, :, None], float("inf"))
-        red = patches.min(dim=1).values
-    return red.view(batch.shape)
+    # Disc: reduce row by row. This used to unfold into (N, k*k, H*W) patches,
+    # which is k² copies of the batch — ~9 GB for one 1080p frame at r=16, so
+    # any real radius ran out of memory. Instead build the horizontal max of
+    # half-width w incrementally from w-1 and take one shifted max per kernel
+    # row: the same taps (the element above), a few frames of memory.
+    # Erode is the same thing on the negated mask (min = -max(-x)).
+    xp = F.pad(x, (pad, pad, pad, pad), value=0.0 if grow else 1.0)
+    if not grow:
+        xp = -xp
+    h, w = batch.shape[-2], batch.shape[-1]
+    half = [(int(v) - 1) // 2 for v in elem.sum(dim=1).tolist()]
+    row = xp[..., :, pad:pad + w].clone()
+    out = None
+    cur = 0
+    for hw in sorted(set(half)):
+        while cur < hw:
+            cur += 1
+            row = torch.maximum(row, xp[..., :, pad - cur:pad - cur + w])
+            row = torch.maximum(row, xp[..., :, pad + cur:pad + cur + w])
+        for i, k_hw in enumerate(half):
+            if k_hw == hw:
+                part = row[..., i:i + h, :]
+                out = part.clone() if out is None else torch.maximum(out, part)
+    red = out if grow else -out
+    return red.reshape(batch.shape)
 
 
 def _feather(batch: np.ndarray, radius: float) -> np.ndarray:

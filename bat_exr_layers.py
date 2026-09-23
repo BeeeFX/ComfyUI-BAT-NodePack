@@ -32,8 +32,10 @@ def _publish_names(unique_id, names):
     if not unique_id:
         return
     try:
-        server.PromptServer.instance.send_sync(
-            "bat-layers", {"node": unique_id, "layers": list(names)})
+        # To the client that queued the run, not every tab on the server.
+        instance = server.PromptServer.instance
+        instance.send_sync("bat-layers", {"node": unique_id, "layers": list(names)},
+                           getattr(instance, "client_id", None))
     except Exception as exc:                       # headless / API run
         logger.debug("[Bat_ExrLayer] could not publish layer names: %s", exc)
 
@@ -262,20 +264,24 @@ class BatCryptomatteMatte:
             return (self._preview(primary), mask)
 
         # Sum coverage wherever a rank's id channel matches one of the targets.
-        # Vectorised over the whole batch: the ids are the same every frame but
-        # the pixels they cover are not, so the mask has to be built per frame.
-        for tid in target_ids:
-            for rank in group:
-                for pair in range(0, rank.shape[-1] - 1, 2):
-                    ident = rank[..., pair]
-                    cover = rank[..., pair + 1]
-                    # Exact float equality would be right in principle — these
-                    # are bit patterns reinterpreted as floats — but a 16-bit
-                    # half EXR quantises them, so compare with a tolerance
-                    # relative to the magnitude rather than an absolute one.
-                    hit = torch.isclose(ident, torch.full_like(ident, tid),
-                                        rtol=1e-5, atol=0.0)
-                    mask += torch.where(hit, cover, torch.zeros_like(cover))
+        # The ids are the same every frame but the pixels they cover are not,
+        # so the mask is built per frame — one frame at a time, which keeps the
+        # temporaries to a single [H, W] plane. Done batch-wide, every pass
+        # allocated four full-batch tensors (full_like, isclose, zeros_like,
+        # where): ~830 MB apiece on 100 frames of 2K.
+        for f in range(frames):
+            out = mask[f]
+            for tid in target_ids:
+                # Exact float equality would be right in principle — these
+                # are bit patterns reinterpreted as floats — but a 16-bit
+                # half EXR quantises them, so compare with a tolerance
+                # relative to the magnitude rather than an absolute one
+                # (isclose with rtol=1e-5, atol=0).
+                tol = 1e-5 * abs(tid)
+                for rank in group:
+                    for pair in range(0, rank.shape[-1] - 1, 2):
+                        hit = (rank[f, ..., pair] - tid).abs_().le_(tol)
+                        out.addcmul_(rank[f, ..., pair + 1], hit)
 
         mask.clamp_(0.0, 1.0)
         return (self._preview(primary), mask)

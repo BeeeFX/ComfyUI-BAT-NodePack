@@ -132,7 +132,11 @@ which is the only honest way to judge sharpening.
 """
 
 import base64
+import contextlib
 import logging
+import math
+import threading
+import uuid
 from io import BytesIO
 
 import numpy as np
@@ -141,6 +145,12 @@ from PIL import Image
 
 from . import bat_interrupt as _interrupt
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
+
+try:
+    import comfy.model_management as _mm
+except Exception:            # imported outside ComfyUI (tests): CPU throughout
+    _mm = None
 
 logger = logging.getLogger("[Bat_AdvancedBlend]")
 
@@ -154,7 +164,7 @@ def _num(value, default: float, lo: float, hi: float) -> float:
     directions: neither can assume its input is sane. The endpoint is reachable
     over HTTP, and a saved workflow can carry impossible values — an early build
     of this node shifted them on copy/paste and wrote NaN into a radius, which
-    reaches `_blur` as `int(round(nan))` and raises mid-render. A silently
+    reached `_blur` as `int(round(nan))` and raised mid-render. A silently
     defaulted radius is a far better outcome than a traceback halfway through a
     queue, and the frontend repairs the node on load anyway.
     """
@@ -199,6 +209,118 @@ PREVIEW_TILE_DIM = 768
 # batch processed whole would need tens of GB. Chunking bounds it without
 # changing the result — every operation here is per-frame.
 CHUNK_FRAMES = 8
+
+
+# ---------------------------------------------------------------------------
+# Where the frame loop computes
+# ---------------------------------------------------------------------------
+#
+# ComfyUI hands IMAGE tensors over on the CPU (`intermediate_device()`), and the
+# loop used to compute wherever they arrived — so every Gaussian ran on the CPU:
+# 3.2s for one radius-128 blur of a 4K frame, ~20 minutes for a 300-frame clip at
+# split 32. Each chunk now goes to ComfyUI's torch device, is computed there and
+# comes straight back into the preallocated outputs on the intermediate device.
+# `--cpu` makes get_torch_device() the CPU, so that is respected for free.
+
+def _compute_devices(fallback):
+    """(compute, storage) devices for the frame loop.
+
+    Outside ComfyUI both are `fallback` (the input's device), which is exactly
+    the old behaviour.
+    """
+    if _mm is None:
+        return fallback, fallback
+    try:
+        return torch.device(_mm.get_torch_device()), torch.device(_mm.intermediate_device())
+    except Exception as exc:
+        logger.debug("no ComfyUI device (%s); computing on %s", exc, fallback)
+        return fallback, fallback
+
+
+def _chunk_frames(device, frame_bytes: int, copies: int, cap: int) -> int:
+    """Frames per chunk that fit in `device`'s FREE memory, at most `cap`.
+
+    Free, not total: the models ComfyUI keeps resident stay resident, and a
+    blend does not get to evict the checkpoint the next sampler needs. If not
+    even one frame fits, the chunk OOMs and `_on_device()` finishes the job on
+    the CPU.
+    """
+    if device.type == "cpu" or _mm is None:
+        return cap
+    try:
+        free = int(_mm.get_free_memory(device))
+    except Exception:
+        return cap
+    return max(1, min(cap, int(free * 0.6) // max(1, frame_bytes * copies)))
+
+
+def _on_device(fn, device, fallback, what):
+    """Run `fn(device)`, retrying once on `fallback` if the device can't.
+
+    OOM is the expected case; an operator the backend lacks (DirectML, an older
+    MPS) is the other. Either way a blend is never worth failing a render over
+    when the CPU can still do it. Returns (result, device actually used).
+    """
+    try:
+        return fn(device), device
+    except Exception as exc:
+        cancelled = getattr(_mm, "InterruptProcessingException", None)
+        if device == fallback or (cancelled is not None and isinstance(exc, cancelled)):
+            raise
+        logger.warning("%s did not run on %s (%s); finishing on %s",
+                       what, device, str(exc).splitlines()[0][:200], fallback)
+        try:
+            if _mm is not None:
+                _mm.soft_empty_cache()
+        except Exception:
+            pass
+        return fn(fallback), fallback
+
+
+_tf32_lock = threading.Lock()
+_tf32_depth = 0
+_tf32_saved = None
+
+
+@contextlib.contextmanager
+def _exact_conv(t: torch.Tensor):
+    """Full-float32 cuDNN convolutions for the duration, on CUDA only.
+
+    cuDNN convolutions default to TF32 on Ampere and later — a 10-bit mantissa,
+    ~5e-4 relative. That lands straight in the band split (high = x - blur(x)),
+    which is the one signal this node exists to judge, and it alone would put
+    the render outside the preview's 1e-4 parity. Counted, because the preview
+    endpoint blurs from a worker thread while a run may be blurring too: a
+    plain save/restore pair could interleave and leave TF32 off for the rest of
+    the session.
+    """
+    global _tf32_depth, _tf32_saved
+    if not t.is_cuda:
+        yield
+        return
+    armed = False
+    try:
+        with _tf32_lock:
+            if _tf32_depth == 0:
+                _tf32_saved = torch.backends.cudnn.allow_tf32
+                torch.backends.cudnn.allow_tf32 = False
+            _tf32_depth += 1
+            armed = True
+    except Exception as exc:
+        # Some code mixed torch's old and new precision APIs, which makes the
+        # legacy flag unreadable. Leave it alone rather than fail the blend.
+        logger.debug("could not disable TF32 for the blur (%s)", exc)
+    try:
+        yield
+    finally:
+        if armed:
+            with _tf32_lock:
+                _tf32_depth -= 1
+                if _tf32_depth == 0:
+                    try:
+                        torch.backends.cudnn.allow_tf32 = _tf32_saved
+                    except Exception:
+                        pass
 
 BLEND_MODES = [
     "over", "add", "multiply", "screen", "overlay",
@@ -315,13 +437,18 @@ def _resize(img: torch.Tensor, out_h: int, out_w: int, filt: str) -> torch.Tenso
         return img[:, ys][:, :, xs]
 
     out = img
+    # `.contiguous()` before each matmul is the difference between one large
+    # GEMM and a slow batched path over the strided view: measured on CPU, a
+    # 1080p->4K lanczos conform went from several seconds a frame to a fraction
+    # of one (4-30x across runs), for the same arithmetic. The transposed
+    # weight matrix is fine as a view.
     if w != out_w:
         mx = _resample_matrix(w, out_w, filt, img.device, img.dtype)
         # (N,H,W,C) -> (N,H,C,W) @ (W,out_w) -> (N,H,C,out_w) -> back
-        out = (out.movedim(2, -1) @ mx.transpose(0, 1)).movedim(-1, 2)
+        out = (out.movedim(2, -1).contiguous() @ mx.transpose(0, 1)).movedim(-1, 2)
     if h != out_h:
         my = _resample_matrix(h, out_h, filt, img.device, img.dtype)
-        out = (out.movedim(1, -1) @ my.transpose(0, 1)).movedim(-1, 1)
+        out = (out.movedim(1, -1).contiguous() @ my.transpose(0, 1)).movedim(-1, 1)
     return out
 
 
@@ -342,6 +469,21 @@ def _gauss_kernel(radius: int, sigma: float, device, dtype) -> torch.Tensor:
     return k / k.sum()
 
 
+def _kernel_radius(radius: float) -> int:
+    """Half-width, in taps, of the Gaussian for a widget radius.
+
+    Round half UP, with a floor of one tap for any positive radius. Mirrored by
+    `blurRGB()` in web/bat_blend_core.js, which has to agree exactly. Python's
+    own `round()` is half-to-even and JS's `Math.round` is half-up, so the two
+    used to disagree at every .5 radius — and `round(0.5) == 0` made the
+    widget's own minimum split_radius a silent no-op: no blur, an empty high
+    band, and high_mix doing nothing at all.
+    """
+    if not radius > 0.0:
+        return 0
+    return max(1, int(math.floor(radius + 0.5)))
+
+
 def _blur(x: torch.Tensor, radius: float) -> torch.Tensor:
     """Separable Gaussian on an (N,H,W,C) tensor, reflect-padded.
 
@@ -351,26 +493,27 @@ def _blur(x: torch.Tensor, radius: float) -> torch.Tensor:
     """
     if radius <= 0.0:
         return x
-    r = int(round(radius))
+    r = _kernel_radius(radius)
     if r <= 0:
         return x
     sigma = max(radius / 2.0, 0.5)
 
     c = x.shape[-1]
     v = x.movedim(-1, 1)                                    # (N,C,H,W)
-    for axis in (3, 2):
-        rr = min(r, max(v.shape[axis] - 1, 0))
-        if rr <= 0:
-            continue
-        k = _gauss_kernel(rr, sigma, v.device, v.dtype)
-        if axis == 3:
-            v = torch.nn.functional.pad(v, (rr, rr, 0, 0), mode="reflect")
-            v = torch.nn.functional.conv2d(v, k.view(1, 1, 1, -1).expand(c, 1, 1, -1),
-                                           groups=c)
-        else:
-            v = torch.nn.functional.pad(v, (0, 0, rr, rr), mode="reflect")
-            v = torch.nn.functional.conv2d(v, k.view(1, 1, -1, 1).expand(c, 1, -1, 1),
-                                           groups=c)
+    with _exact_conv(v):
+        for axis in (3, 2):
+            rr = min(r, max(v.shape[axis] - 1, 0))
+            if rr <= 0:
+                continue
+            k = _gauss_kernel(rr, sigma, v.device, v.dtype)
+            if axis == 3:
+                v = torch.nn.functional.pad(v, (rr, rr, 0, 0), mode="reflect")
+                v = torch.nn.functional.conv2d(
+                    v, k.view(1, 1, 1, -1).expand(c, 1, 1, -1), groups=c)
+            else:
+                v = torch.nn.functional.pad(v, (0, 0, rr, rr), mode="reflect")
+                v = torch.nn.functional.conv2d(
+                    v, k.view(1, 1, -1, 1).expand(c, 1, -1, 1), groups=c)
     return v.movedim(1, -1)
 
 
@@ -885,34 +1028,53 @@ class BatAdvancedBlend:
         # copy at the same time — a full-size tensor of chunks plus a full-size
         # result, for each of three outputs, so the cat alone roughly doubled
         # peak. Measured 6.11 GB on a 25-frame 2K pair.
+        dev, store = _compute_devices(a.device)
         shape = (n, out_h, out_w, 3)
-        stub = torch.zeros((1, 1, 1, 3), dtype=a.dtype, device=a.device)
-        out    = torch.empty(shape, dtype=a.dtype, device=a.device) if want[0] else stub
-        detail = torch.empty(shape, dtype=a.dtype, device=a.device) if want[1] else stub
-        diff   = torch.empty(shape, dtype=a.dtype, device=a.device) if want[2] else stub
+        stub = torch.zeros((1, 1, 1, 3), dtype=a.dtype, device=store)
+        out    = torch.empty(shape, dtype=a.dtype, device=store) if want[0] else stub
+        detail = torch.empty(shape, dtype=a.dtype, device=store) if want[1] else stub
+        diff   = torch.empty(shape, dtype=a.dtype, device=store) if want[2] else stub
 
-        for i in range(0, n, CHUNK_FRAMES):
+        # ~16 frame-sized float32 buffers are live at the peak of _core: the
+        # two conformed plates, their pre-blurs, both bands of both, the band
+        # mixes and the three outputs.
+        step = _chunk_frames(dev, out_h * out_w * 3 * 4, 16, CHUNK_FRAMES)
+
+        def run_chunk(i, j, device):
+            ac = _resize(a[i:j].to(device), out_h, out_w, resize_filter)
+            bc = _resize(b[i:j].to(device), out_h, out_w, resize_filter)
+            p["mask_chunk"] = self._mask_chunk(
+                None if m is None else m[i:j].to(device), out_h, out_w)
+            return self._core(ac, bc, p), ac, bc
+
+        i = 0
+        while i < n:
             # Once per chunk: a flag read, and the difference between Cancel
             # working and the artist waiting out the whole clip.
             _interrupt.check()
-            j = min(i + CHUNK_FRAMES, n)
-            ac = _resize(a[i:j], out_h, out_w, resize_filter)
-            bc = _resize(b[i:j], out_h, out_w, resize_filter)
-            p["mask_chunk"] = self._mask_chunk(
-                None if m is None else m[i:j], out_h, out_w)
-            o, d, df = self._core(ac, bc, p)
+            j = min(i + step, n)
+            ((o, d, df), ac, bc), used = _on_device(
+                lambda device: run_chunk(i, j, device), dev, store, "the blend")
+            if used != dev:
+                # It fell back: the rest of the clip goes the same way rather
+                # than paying for a failed attempt on every chunk.
+                dev, step = used, CHUNK_FRAMES
             if want[0]: out[i:j] = o
             if want[1]: detail[i:j] = d
             if want[2]: diff[i:j] = df
             del o, d, df
             if pv_a is None and i <= idx < j:
-                # .clone(), not a view: a view keeps the whole chunk alive, and
-                # a chunk of 8 conformed 4K frames is 800MB.
-                pv_a = ac[idx - i:idx - i + 1].clone()
-                pv_b = bc[idx - i:idx - i + 1].clone()
+                # A copy, not a view: a view keeps the whole chunk alive — a
+                # chunk of 8 conformed 4K frames is 800MB, and on the GPU.
+                pv_a = ac[idx - i:idx - i + 1].to(store, copy=True)
+                pv_b = bc[idx - i:idx - i + 1].to(store, copy=True)
+            del ac, bc
+            p["mask_chunk"] = None
+            i = j
 
         ui = self._preview_payload(pv_a, pv_b, m, idx, out_w, out_h, n, unique_id)
-        return {"ui": ui, "result": (out, detail, diff)}
+        # Megabytes of tiles: kept out of the prompt history (bat_ui_ref.py).
+        return {"ui": stash_ui(ui), "result": (out, detail, diff)}
 
     # ------------------------------------------------------------------
     def _preview_payload(self, a_conf, b_conf, mask, idx,
@@ -940,6 +1102,9 @@ class BatAdvancedBlend:
         # Hand the conformed frame to the full-resolution preview service. This
         # copy is what makes that layer possible at all, and it is the feature's
         # real cost — see CACHE_MAX_BYTES.
+        # This run's token: the full-resolution endpoint only renders for a
+        # client holding it — see _run_matches().
+        run = uuid.uuid4().hex
         if unique_id is not None:
             try:
                 mk = None
@@ -949,7 +1114,8 @@ class BatAdvancedBlend:
                     mk = None if mk is None else mk[..., 0]
                 _cache_put(str(unique_id), a_conf, b_conf, mk,
                            {"w": int(out_w), "h": int(out_h),
-                            "frames": int(frames), "frame": int(idx)})
+                            "frames": int(frames), "frame": int(idx),
+                            "run": run})
             except Exception as exc:
                 # The draft layer does not depend on this, so a failure here
                 # costs the full layer and nothing else.
@@ -965,6 +1131,13 @@ class BatAdvancedBlend:
             "frames": [int(frames)],
             "preview_frame": [int(idx)],
         }
+        # The key the frame was cached under, for the full-resolution request.
+        # Not `node.id` on the client: inside a subgraph the executed id is the
+        # path ("12:5") and the node only knows its own local part, so every
+        # request missed the cache and the full layer silently never appeared.
+        if unique_id is not None:
+            ui["node_id"] = [str(unique_id)]
+            ui["run"] = [run]
 
         t_a = hdr_tile(af, PREVIEW_TILE_DIM, sample="area")
         t_b = hdr_tile(bf, PREVIEW_TILE_DIM, sample="area")
@@ -1075,17 +1248,32 @@ def _cache_get(node_id):
         return entry
 
 
+def _run_matches(entry, body):
+    """May this request render from `entry`? Only with the entry's run token.
+
+    The cache is keyed by execution id, which is unique within ONE workflow:
+    two open workflows that both have a node 7 share the slot, so after a tab
+    switch the full layer painted the other workflow's frame over this one's
+    draft. The token names the run whose tiles the client holds. No token — a
+    thumbnail restored from localStorage, or an older client — renders nothing.
+    Shared with Bat_LayeredImages.
+    """
+    run = body.get("run") if isinstance(body, dict) else None
+    return (entry is not None and isinstance(run, str) and bool(run)
+            and run == (entry.get("meta") or {}).get("run"))
+
+
 def _blur_margin(p):
     """Pixels of context an ROI needs so its interior matches a full-frame render.
 
-    `_blur` uses a kernel of half-width `round(radius)`, and `_core` chains at
-    most two of them per plate — the pre-blur, then the band split — so the
-    influence radius is the sum. Get this wrong and the ROI is correct in the
-    middle and wrong in a band around the edge, which is the sort of bug that
-    only shows up as a faint seam once the artist pans.
+    `_blur` uses a kernel of half-width `_kernel_radius(radius)`, and `_core`
+    chains at most two of them per plate — the pre-blur, then the band split —
+    so the influence radius is the sum. Get this wrong and the ROI is correct in
+    the middle and wrong in a band around the edge, which is the sort of bug
+    that only shows up as a faint seam once the artist pans.
     """
-    split = round(p["split_radius"]) if p["frequency_separation"] else 0
-    reach = max(round(p["soften_a"]), round(p["soften_b"])) + split
+    split = _kernel_radius(p["split_radius"]) if p["frequency_separation"] else 0
+    reach = max(_kernel_radius(p["soften_a"]), _kernel_radius(p["soften_b"])) + split
     return int(max(0, reach) + 2)
 
 
@@ -1113,33 +1301,23 @@ def render_region(entry, p, roi, out_w, out_h, view="result", amp=1.0):
     x0, y0 = max(0, x - m), max(0, y - m)
     x1, y1 = min(fw, x + w + m), min(fh, y + h + m)
 
-    device = a_full.device
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
+    # ComfyUI's device, not "CUDA if there is one": that honours --cpu and
+    # finds MPS / XPU too. A preview must never be the reason a render fails,
+    # so anything the device can't do (OOM above all) retries on the host.
+    device, _ = _compute_devices(a_full.device)
 
-    def slab(t):
-        if t is None:
-            return None
-        return t[:, y0:y1, x0:x1].to(device, non_blocking=True)
-
-    try:
-        a = slab(a_full)
-        b = slab(b_full)
-        mask = slab(entry["mask"])
+    def run(dev):
+        def slab(t):
+            if t is None:
+                return None
+            return t[:, y0:y1, x0:x1].to(dev, non_blocking=True)
+        a, b, mask = slab(a_full), slab(b_full), slab(entry["mask"])
         pp = dict(p)
         pp["mask_chunk"] = None if mask is None else mask.unsqueeze(-1)
-        out, detail, diff = BatAdvancedBlend._core(a, b, pp)
-    except torch.cuda.OutOfMemoryError:
-        # A preview must never be the reason a render fails. Retry on the host.
-        logger.warning("full-resolution preview did not fit in VRAM; "
-                       "falling back to CPU for this request")
-        torch.cuda.empty_cache()
-        a = a_full[:, y0:y1, x0:x1]
-        b = b_full[:, y0:y1, x0:x1]
-        mask = None if entry["mask"] is None else entry["mask"][:, y0:y1, x0:x1]
-        pp = dict(p)
-        pp["mask_chunk"] = None if mask is None else mask.unsqueeze(-1)
-        out, detail, diff = BatAdvancedBlend._core(a, b, pp)
+        return (a, b) + tuple(BatAdvancedBlend._core(a, b, pp))
+
+    (a, b, out, detail, diff), _ = _on_device(
+        run, device, a_full.device, "the full-resolution preview")
 
     # Pick the view. Mirrors the same choice in the JS so the draft and the full
     # layer never disagree about what is being shown, only about how precisely.
@@ -1231,11 +1409,12 @@ try:
 
         node_id = str(body.get("node_id", ""))
         entry = _cache_get(node_id)
-        if entry is None:
-            # Not an error worth shouting about: it just means this node has not
-            # run since the server started, or the LRU dropped it.
+        if not _run_matches(entry, body):
+            # Not an error worth shouting about: this node has not run since the
+            # server started, the LRU dropped it, or the cached frame belongs to
+            # another run (another workflow's node with the same id).
             return web.json_response(
-                {"error": "no cached frame for this node; run it once"},
+                {"error": "no cached frame for this run; run it once"},
                 status=409)
 
         try:

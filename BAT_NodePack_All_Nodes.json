@@ -1,7 +1,7 @@
 {
   "id": "1b1308a1-88c3-4423-9aa7-07abf6cdf065",
   "revision": 0,
-  "last_node_id": 30,
+  "last_node_id": 45,
   "last_link_id": 0,
   "nodes": [
     {
@@ -18,33 +18,11 @@
       "flags": {},
       "order": 0,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "IMAGE",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Video Grid Split",
+      "title": "🦇 Video Grid Split",
       "properties": {
         "Node name for S&R": "Bat_VideoGridSplit",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        5,
-        3,
-        0.0,
-        0,
-        -1
-      ]
+      }
     },
     {
       "id": 2,
@@ -60,80 +38,11 @@
       "flags": {},
       "order": 1,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "control_video",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "control_video",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "frames_added_start",
-          "type": "INT",
-          "links": null,
-          "slot_index": 3
-        },
-        {
-          "name": "frames_added_end",
-          "type": "INT",
-          "links": null,
-          "slot_index": 4
-        },
-        {
-          "name": "total_frames",
-          "type": "INT",
-          "links": null,
-          "slot_index": 5
-        }
-      ],
-      "title": "\ud83e\udd87 Batch Format",
+      "title": "🦇 Batch Format",
       "properties": {
         "Node name for S&R": "Bat_BatchFormat",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "WAN (4k+1)",
-        "nearest_compatible",
-        "repeat_edge",
-        "start",
-        true,
-        81,
-        0,
-        true,
-        0.5
-      ]
+      }
     },
     {
       "id": 3,
@@ -149,44 +58,11 @@
       "flags": {},
       "order": 2,
       "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "frame_rate",
-          "type": "FLOAT",
-          "links": null,
-          "slot_index": 3
-        }
-      ],
-      "title": "\ud83e\udd87 Video Loader",
+      "title": "🦇 Video Loader",
       "properties": {
         "Node name for S&R": "Bat_VideoLoader",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "",
-        0,
-        -1,
-        1
-      ]
+      }
     },
     {
       "id": 4,
@@ -202,38 +78,11 @@
       "flags": {},
       "order": 3,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "audio",
-          "type": "AUDIO",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "filepath",
-          "type": "STRING",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Video Combine",
+      "title": "🦇 Video Combine",
       "properties": {
         "Node name for S&R": "Bat_VideoCombine",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        24.0,
-        "BatVideo",
-        "video/h264-mp4",
-        true
-      ]
+      }
     },
     {
       "id": 5,
@@ -249,68 +98,11 @@
       "flags": {},
       "order": 4,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "plate_image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "plate_mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "start_image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "start_mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "end_image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "end_mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "masks",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        }
-      ],
-      "title": "\ud83e\udd87 VACE Batch Tool",
+      "title": "🦇 VACE Batch Tool",
       "properties": {
         "Node name for S&R": "Bat_VaceBatchTool",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        81,
-        true,
-        127
-      ]
+      }
     },
     {
       "id": 6,
@@ -326,59 +118,11 @@
       "flags": {},
       "order": 5,
       "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "report",
-          "type": "STRING",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "rec_num_frames",
-          "type": "INT",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "rec_context_frames",
-          "type": "INT",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "rec_context_stride",
-          "type": "INT",
-          "links": null,
-          "slot_index": 3
-        },
-        {
-          "name": "rec_context_overlap",
-          "type": "INT",
-          "links": null,
-          "slot_index": 4
-        },
-        {
-          "name": "num_windows",
-          "type": "INT",
-          "links": null,
-          "slot_index": 5
-        }
-      ],
-      "title": "\ud83e\udd87 WAN Context Calculator",
+      "title": "🦇 WAN Context Calculator",
       "properties": {
         "Node name for S&R": "Bat_WanContextCalculator",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        101,
-        81,
-        4,
-        16,
-        true,
-        "balanced",
-        true
-      ]
+      }
     },
     {
       "id": 7,
@@ -394,87 +138,11 @@
       "flags": {},
       "order": 6,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "control_video",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "control_video",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "debug_window_viz",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 3
-        },
-        {
-          "name": "frames_added_start",
-          "type": "INT",
-          "links": null,
-          "slot_index": 4
-        },
-        {
-          "name": "frames_added_end",
-          "type": "INT",
-          "links": null,
-          "slot_index": 5
-        },
-        {
-          "name": "total_frames",
-          "type": "INT",
-          "links": null,
-          "slot_index": 6
-        }
-      ],
-      "title": "\ud83e\udd87 WAN Batch Format",
+      "title": "🦇 WAN Batch Format",
       "properties": {
         "Node name for S&R": "Bat_WanBatchFormat",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "nearest_wan_compatible",
-        "wan_inpaint_grey",
-        "end",
-        81,
-        0,
-        81,
-        16,
-        true,
-        true,
-        0.5
-      ]
+      }
     },
     {
       "id": 8,
@@ -490,55 +158,11 @@
       "flags": {},
       "order": 7,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "control_video",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "control_video",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 2
-        }
-      ],
-      "title": "\ud83e\udd87 Batch Crop",
+      "title": "🦇 Batch Crop",
       "properties": {
         "Node name for S&R": "Bat_WanBatchCrop",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        0,
-        0
-      ]
+      }
     },
     {
       "id": 9,
@@ -554,52 +178,11 @@
       "flags": {},
       "order": 8,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "reference",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "plate",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        }
-      ],
-      "title": "\ud83e\udd87 Wan Reference Aligner",
+      "title": "🦇 Wan Reference Aligner",
       "properties": {
         "Node name for S&R": "Bat_RefAligner",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        0,
-        0,
-        1.0,
-        0.0,
-        "edge_pixel",
-        "128,128,128",
-        true
-      ]
+      }
     },
     {
       "id": 10,
@@ -615,62 +198,11 @@
       "flags": {},
       "order": 9,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "crop_info",
-          "type": "BAT_CROP_INFO",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "rect_mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 3
-        }
-      ],
-      "title": "\ud83e\udd87 Crop",
+      "title": "🦇 Crop",
       "properties": {
         "Node name for S&R": "Bat_Crop",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        0,
-        0,
-        512,
-        512,
-        0.0,
-        8,
-        false,
-        "free",
-        true,
-        "black"
-      ]
+      }
     },
     {
       "id": 11,
@@ -686,58 +218,11 @@
       "flags": {},
       "order": 10,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "crop_info",
-          "type": "BAT_CROP_INFO",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "rect_mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 3
-        }
-      ],
-      "title": "\ud83e\udd87 Animated Crop",
+      "title": "🦇 Animated Crop",
       "properties": {
         "Node name for S&R": "Bat_AnimatedCrop",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "{\"keyframes\":{}}",
-        8,
-        false,
-        "free",
-        true,
-        "black"
-      ]
+      }
     },
     {
       "id": 12,
@@ -753,42 +238,11 @@
       "flags": {},
       "order": 11,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "processed",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "crop_info",
-          "type": "BAT_CROP_INFO",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        }
-      ],
-      "title": "\ud83e\udd87 Uncrop",
+      "title": "🦇 Uncrop",
       "properties": {
         "Node name for S&R": "Bat_Uncrop",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "fit",
-        "bicubic",
-        0
-      ]
+      }
     },
     {
       "id": 13,
@@ -804,44 +258,11 @@
       "flags": {},
       "order": 12,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Grade",
+      "title": "🦇 Grade",
       "properties": {
         "Node name for S&R": "Bat_Grade",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        0.0,
-        1.0,
-        0.0,
-        1.0,
-        1.0,
-        0.0,
-        1.0,
-        false,
-        false,
-        0
-      ]
+      }
     },
     {
       "id": 14,
@@ -857,35 +278,11 @@
       "flags": {},
       "order": 13,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Animated Grade",
+      "title": "🦇 Animated Grade",
       "properties": {
         "Node name for S&R": "Bat_AnimatedGrade",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "{\"keyframes\":{}}"
-      ]
+      }
     },
     {
       "id": 15,
@@ -901,193 +298,11 @@
       "flags": {},
       "order": 14,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "plate_sdr",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "hdr_ai",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "hdr_ai_2",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_ai_3",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_ai_4",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_ai_5",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_ai_6",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_ai_7",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_ai_8",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image_out",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "linear_out",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "image_out_2",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "linear_out_2",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 3
-        },
-        {
-          "name": "image_out_3",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 4
-        },
-        {
-          "name": "linear_out_3",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 5
-        },
-        {
-          "name": "image_out_4",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 6
-        },
-        {
-          "name": "linear_out_4",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 7
-        },
-        {
-          "name": "image_out_5",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 8
-        },
-        {
-          "name": "linear_out_5",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 9
-        },
-        {
-          "name": "image_out_6",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 10
-        },
-        {
-          "name": "linear_out_6",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 11
-        },
-        {
-          "name": "image_out_7",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 12
-        },
-        {
-          "name": "linear_out_7",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 13
-        },
-        {
-          "name": "image_out_8",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 14
-        },
-        {
-          "name": "linear_out_8",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 15
-        }
-      ],
-      "title": "\ud83e\udd87 HDR Tonal Composite",
+      "title": "🦇 HDR Tonal Composite",
       "properties": {
         "Node name for S&R": "Bat_HDRTonalComposite",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "srgb",
-        true,
-        "whole_batch",
-        0.1,
-        0.7,
-        0.12,
-        0.03,
-        1.0,
-        0.75,
-        0.98,
-        1.0,
-        1.0,
-        0.5,
-        0.0,
-        16,
-        0.85,
-        0.25,
-        4.0,
-        0.0,
-        0,
-        "match_plate",
-        "rec709",
-        "soft_rolloff",
-        2.0,
-        0.0,
-        0,
-        "(off)",
-        "512"
-      ]
+      }
     },
     {
       "id": 16,
@@ -1103,66 +318,11 @@
       "flags": {},
       "order": 15,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image_a",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "image_b",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "detail",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "difference",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 2
-        }
-      ],
-      "title": "\ud83e\udd87 Advanced Blend",
+      "title": "🦇 Advanced Blend",
       "properties": {
         "Node name for S&R": "Bat_AdvancedBlend",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "over",
-        1.0,
-        "match_a",
-        "lanczos",
-        false,
-        4.0,
-        "subtract",
-        1.0,
-        1.0,
-        1.0,
-        0.0,
-        0.0,
-        0.0,
-        false,
-        0
-      ]
+      }
     },
     {
       "id": 17,
@@ -1178,82 +338,11 @@
       "flags": {},
       "order": 16,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "plate",
-          "type": "IMAGE",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "bracket",
-          "type": "BAT_BRACKET",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "ev_1",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "ev_2",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "ev_3",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 3
-        },
-        {
-          "name": "ev_4",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 4
-        },
-        {
-          "name": "ev_5",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 5
-        },
-        {
-          "name": "ev_6",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 6
-        },
-        {
-          "name": "ev_7",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 7
-        },
-        {
-          "name": "ev_8",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 8
-        }
-      ],
-      "title": "\ud83e\udd87 Exposure Bracket",
+      "title": "🦇 Exposure Bracket",
       "properties": {
         "Node name for S&R": "Bat_ExposureBracket",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "srgb",
-        3,
-        1.5,
-        "down",
-        "",
-        0
-      ]
+      }
     },
     {
       "id": 18,
@@ -1269,79 +358,11 @@
       "flags": {},
       "order": 17,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "bracket",
-          "type": "BAT_BRACKET",
-          "link": null
-        },
-        {
-          "name": "hdr_1",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_2",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_3",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_4",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_5",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_6",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_7",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "hdr_8",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "hdr_out",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Exposure Merge",
+      "title": "🦇 Exposure Merge",
       "properties": {
         "Node name for S&R": "Bat_ExposureMerge",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "auto",
-        0.2,
-        "auto"
-      ]
+      }
     },
     {
       "id": 19,
@@ -1357,130 +378,11 @@
       "flags": {},
       "order": 18,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image_1",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_1",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_2",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_2",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_3",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_3",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_4",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_4",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_5",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_5",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_6",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_6",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_7",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_7",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "image_8",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "mask_8",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "alpha",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 1
-        }
-      ],
-      "title": "\ud83e\udd87 Layered Images",
+      "title": "🦇 Layered Images",
       "properties": {
         "Node name for S&R": "Bat_LayeredImages",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "match_first",
-        "lanczos",
-        false,
-        "{\"layers\":[]}",
-        0
-      ]
+      }
     },
     {
       "id": 20,
@@ -1496,60 +398,11 @@
       "flags": {},
       "order": 19,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "reference",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "width",
-          "type": "INT",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "height",
-          "type": "INT",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "scale",
-          "type": "FLOAT",
-          "links": null,
-          "slot_index": 3
-        }
-      ],
-      "title": "\ud83e\udd87 Rescale",
+      "title": "🦇 Rescale",
       "properties": {
         "Node name for S&R": "Bat_Rescale",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "factor",
-        1.0,
-        1024,
-        1.0,
-        "lanczos",
-        1,
-        false,
-        0
-      ]
+      }
     },
     {
       "id": 21,
@@ -1565,29 +418,11 @@
       "flags": {},
       "order": 20,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Roto",
+      "title": "🦇 Roto",
       "properties": {
         "Node name for S&R": "Bat_Roto",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "{\"shapes\":[]}"
-      ]
+      }
     },
     {
       "id": 22,
@@ -1603,31 +438,11 @@
       "flags": {},
       "order": 21,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Grow Mask",
+      "title": "🦇 Grow Mask",
       "properties": {
         "Node name for S&R": "Bat_GrowMask",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        4,
-        "disc",
-        0.0
-      ]
+      }
     },
     {
       "id": 23,
@@ -1643,31 +458,11 @@
       "flags": {},
       "order": 22,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "mask",
-          "type": "MASK",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Erode Mask",
+      "title": "🦇 Erode Mask",
       "properties": {
         "Node name for S&R": "Bat_ErodeMask",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        4,
-        "disc",
-        0.0
-      ]
+      }
     },
     {
       "id": 24,
@@ -1683,56 +478,11 @@
       "flags": {},
       "order": 23,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "frames",
-          "type": "IMAGE",
-          "link": null
-        },
-        {
-          "name": "input_mask",
-          "type": "MASK",
-          "link": null,
-          "shape": 7
-        },
-        {
-          "name": "advanced",
-          "type": "SEC_ADVANCED",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "masks",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "preview",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 1
-        }
-      ],
-      "title": "\ud83e\udd87 SeC Segmenter",
+      "title": "🦇 SeC Segmenter",
       "properties": {
         "Node name for S&R": "Bat_SecSegmenter",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "",
-        "",
-        "",
-        "",
-        "",
-        512,
-        512,
-        0,
-        true,
-        "red (50%)"
-      ]
+      }
     },
     {
       "id": 25,
@@ -1748,32 +498,11 @@
       "flags": {},
       "order": 24,
       "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "advanced",
-          "type": "SEC_ADVANCED",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 SeC Advanced Params",
+      "title": "🦇 SeC Advanced Params",
       "properties": {
         "Node name for S&R": "Bat_SecAdvancedParams",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "(no SeC model found \u2014 put SeC-4B-fp16.safetensors in models/sams)",
-        "auto",
-        "bidirectional",
-        1,
-        -1,
-        12,
-        true,
-        true,
-        true,
-        true
-      ]
+      }
     },
     {
       "id": 26,
@@ -1789,25 +518,11 @@
       "flags": {},
       "order": 25,
       "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 BAT Frame Picker",
+      "title": "🦇 BAT Frame Picker",
       "properties": {
         "Node name for S&R": "Bat_FramePicker",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "",
-        0,
-        false
-      ]
+      }
     },
     {
       "id": 27,
@@ -1823,62 +538,11 @@
       "flags": {},
       "order": 26,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "bg_image",
-          "type": "IMAGE",
-          "link": null,
-          "shape": 7
-        }
-      ],
-      "outputs": [
-        {
-          "name": "positive_coords",
-          "type": "STRING",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "negative_coords",
-          "type": "STRING",
-          "links": null,
-          "slot_index": 1
-        },
-        {
-          "name": "bbox",
-          "type": "BBOX",
-          "links": null,
-          "slot_index": 2
-        },
-        {
-          "name": "bbox_mask",
-          "type": "MASK",
-          "links": null,
-          "slot_index": 3
-        },
-        {
-          "name": "cropped_image",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 4
-        }
-      ],
-      "title": "\ud83e\udd87 Points Editor",
+      "title": "🦇 Points Editor",
       "properties": {
         "Node name for S&R": "Bat_PointsEditor",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "",
-        "",
-        "",
-        "",
-        "",
-        "xyxy",
-        512,
-        512,
-        false
-      ]
+      }
     },
     {
       "id": 28,
@@ -1894,23 +558,11 @@
       "flags": {},
       "order": 27,
       "mode": 0,
-      "inputs": [],
-      "outputs": [
-        {
-          "name": "filename_prefix",
-          "type": "STRING",
-          "links": null,
-          "slot_index": 0
-        }
-      ],
-      "title": "\ud83e\udd87 Filename Prefix",
+      "title": "🦇 Filename Prefix",
       "properties": {
         "Node name for S&R": "Bat_FilenamePrefix",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "[]"
-      ]
+      }
     },
     {
       "id": 29,
@@ -1926,35 +578,11 @@
       "flags": {},
       "order": 28,
       "mode": 0,
-      "inputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "link": null
-        }
-      ],
-      "outputs": [
-        {
-          "name": "images",
-          "type": "IMAGE",
-          "links": null,
-          "slot_index": 0
-        },
-        {
-          "name": "count",
-          "type": "INT",
-          "links": null,
-          "slot_index": 1
-        }
-      ],
-      "title": "\ud83e\udd87 Framehold",
+      "title": "🦇 Framehold",
       "properties": {
         "Node name for S&R": "Bat_Framehold",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "0"
-      ]
+      }
     },
     {
       "id": 30,
@@ -1970,16 +598,251 @@
       "flags": {},
       "order": 29,
       "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "title": "\ud83e\udd87 Bypass Switch",
+      "title": "🦇 Bypass Switch",
       "properties": {
         "Node name for S&R": "Bat_BypassSwitch",
         "cnr_id": "ComfyUI-BAT-NodePack"
-      },
-      "widgets_values": [
-        "{\"v\":1,\"exgroups\":[],\"presets\":[]}"
-      ]
+      }
+    },
+    {
+      "id": 31,
+      "type": "Bat_GridMerge",
+      "pos": [
+        0,
+        1992
+      ],
+      "flags": {},
+      "order": 30,
+      "mode": 0,
+      "title": "🦇 Video Grid Merge",
+      "properties": {
+        "Node name for S&R": "Bat_GridMerge",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 32,
+      "type": "Bat_Loader",
+      "pos": [
+        4900,
+        90
+      ],
+      "flags": {},
+      "order": 31,
+      "mode": 0,
+      "title": "🦇 Loader",
+      "properties": {
+        "Node name for S&R": "Bat_Loader",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 33,
+      "type": "Bat_ExrLayer",
+      "pos": [
+        4900,
+        650
+      ],
+      "flags": {},
+      "order": 32,
+      "mode": 0,
+      "title": "🦇 EXR Layer",
+      "properties": {
+        "Node name for S&R": "Bat_ExrLayer",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 34,
+      "type": "Bat_CryptomatteMatte",
+      "pos": [
+        4900,
+        950
+      ],
+      "flags": {},
+      "order": 33,
+      "mode": 0,
+      "title": "🦇 Cryptomatte Matte",
+      "properties": {
+        "Node name for S&R": "Bat_CryptomatteMatte",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 35,
+      "type": "Bat_ShowAny",
+      "pos": [
+        5440,
+        90
+      ],
+      "flags": {},
+      "order": 34,
+      "mode": 0,
+      "title": "🦇 Show Any",
+      "properties": {
+        "Node name for S&R": "Bat_ShowAny",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 36,
+      "type": "Bat_ShowTensorShape",
+      "pos": [
+        5440,
+        390
+      ],
+      "flags": {},
+      "order": 35,
+      "mode": 0,
+      "title": "🦇 Show Tensor Shape",
+      "properties": {
+        "Node name for S&R": "Bat_ShowTensorShape",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 37,
+      "type": "Bat_ConvertAny",
+      "pos": [
+        5440,
+        690
+      ],
+      "flags": {},
+      "order": 36,
+      "mode": 0,
+      "title": "🦇 Convert Any",
+      "properties": {
+        "Node name for S&R": "Bat_ConvertAny",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 38,
+      "type": "Bat_AnyToString",
+      "pos": [
+        5440,
+        910
+      ],
+      "flags": {},
+      "order": 37,
+      "mode": 0,
+      "title": "🦇 Any to String",
+      "properties": {
+        "Node name for S&R": "Bat_AnyToString",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 39,
+      "type": "Bat_NumberToString",
+      "pos": [
+        5440,
+        1130
+      ],
+      "flags": {},
+      "order": 38,
+      "mode": 0,
+      "title": "🦇 Number to String",
+      "properties": {
+        "Node name for S&R": "Bat_NumberToString",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 40,
+      "type": "Bat_Compare",
+      "pos": [
+        5440,
+        1390
+      ],
+      "flags": {},
+      "order": 39,
+      "mode": 0,
+      "title": "🦇 Compare",
+      "properties": {
+        "Node name for S&R": "Bat_Compare",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 41,
+      "type": "Bat_IndexSwitch",
+      "pos": [
+        5440,
+        1610
+      ],
+      "flags": {},
+      "order": 40,
+      "mode": 0,
+      "title": "🦇 Index Switch",
+      "properties": {
+        "Node name for S&R": "Bat_IndexSwitch",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 42,
+      "type": "Bat_ListLength",
+      "pos": [
+        5440,
+        1970
+      ],
+      "flags": {},
+      "order": 41,
+      "mode": 0,
+      "title": "🦇 List Length",
+      "properties": {
+        "Node name for S&R": "Bat_ListLength",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 43,
+      "type": "Bat_ListLengthList",
+      "pos": [
+        5440,
+        2150
+      ],
+      "flags": {},
+      "order": 42,
+      "mode": 0,
+      "title": "🦇 List Length (list)",
+      "properties": {
+        "Node name for S&R": "Bat_ListLengthList",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 44,
+      "type": "Bat_ListIndex",
+      "pos": [
+        5440,
+        2330
+      ],
+      "flags": {},
+      "order": 43,
+      "mode": 0,
+      "title": "🦇 List Index",
+      "properties": {
+        "Node name for S&R": "Bat_ListIndex",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
+    },
+    {
+      "id": 45,
+      "type": "Bat_ListBatch",
+      "pos": [
+        5440,
+        2530
+      ],
+      "flags": {},
+      "order": 44,
+      "mode": 0,
+      "title": "🦇 List Batch",
+      "properties": {
+        "Node name for S&R": "Bat_ListBatch",
+        "cnr_id": "ComfyUI-BAT-NodePack"
+      }
     }
   ],
   "links": [],
@@ -1991,7 +854,7 @@
         -30,
         0,
         480,
-        1962
+        2292
       ],
       "color": "#3f789e",
       "font_size": 24,
@@ -2100,6 +963,32 @@
       "color": "#3f789e",
       "font_size": 24,
       "flags": {}
+    },
+    {
+      "id": 10,
+      "title": "BAT/Loader",
+      "bounding": [
+        4870,
+        0,
+        480,
+        1310
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 11,
+      "title": "BAT/Logic & Convert",
+      "bounding": [
+        5410,
+        0,
+        480,
+        2750
+      ],
+      "color": "#a1309b",
+      "font_size": 24,
+      "flags": {}
     }
   ],
   "config": {},
@@ -2112,7 +1001,7 @@
       ]
     },
     "frontendVersion": "1.49.6",
-    "note": "Every node in ComfyUI-BAT-NodePack, laid out by category. Generated from the pack's INPUT_TYPES/RETURN_TYPES; no links."
+    "note": "Every node in ComfyUI-BAT-NodePack, laid out by category. No links, and no saved slots or widget values: each node loads with its current inputs, outputs and defaults, so the file stays valid as nodes gain options."
   },
   "version": 0.4
 }

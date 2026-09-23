@@ -264,6 +264,17 @@ export function addBatFullscreen(node, widget, el, opts = {}) {
         overlay = document.createElement("div");
         overlay.className = "bat-fs-overlay";
         overlay.tabIndex = -1;
+        // A modal, as far as the frontend is concerned — and that is what makes
+        // the keyboard ours. Core's isModalOpen() (utils/modalUtil.ts) counts
+        // any rendered [role=dialog][aria-modal=true], and both of its callers
+        // then stand down: keybindHandler, which otherwise preventDefault()s
+        // every bare Escape (Comfy.Graph.ExitSubgraph) before onKey below can
+        // see it, and ChangeTracker, whose Ctrl+Z reloads the whole graph —
+        // closing this overlay — on top of the editor's own undo. The cost:
+        // core shortcuts (Ctrl+Enter, Ctrl+S) are inert while maximised, the
+        // same as under any other dialog.
+        overlay.setAttribute("role", "dialog");
+        overlay.setAttribute("aria-modal", "true");
 
         const head = document.createElement("div");
         head.className = "bat-fs-head";
@@ -272,6 +283,7 @@ export function addBatFullscreen(node, widget, el, opts = {}) {
         titleEl.className = "bat-fs-title";
         titleEl.textContent = title || node.title || "BAT";
         head.appendChild(titleEl);
+        overlay.setAttribute("aria-label", titleEl.textContent);
 
         const spacer = document.createElement("div");
         spacer.className = "bat-fs-spacer";

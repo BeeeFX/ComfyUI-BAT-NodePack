@@ -246,6 +246,37 @@ for current, count, want in [
     eq(f"clamp({current}, count={count})", ctx.eval(f"clamp({current}, {count})"), want)
 
 
+# ── 7. Post-run strip: exact frames only, and knows which clip it came from ──
+print("\n7. the strip only claims frames it really holds; its signature tracks the trim")
+for name in ("stripSlot", "pathSourceSig"):
+    if f"function {name}(" not in pure:
+        sys.exit(f"could not extract {name} from {JS}")
+ctx.eval("""
+function slot(count, stride, idx, exact) {
+    var frames = [];
+    for (var i = 0; i < count; i++) frames.push(i);
+    return stripSlot({ frames: frames, stride: stride }, idx, exact);
+}
+function sig(type, widgets, path) { return pathSourceSig(_node(type, widgets), path); }
+""")
+# 1000 frames -> stride 5 in a 200-slot strip. Batch frame 3 is NOT in it:
+# exactOnly must refuse (so the real frame is fetched), the fallback rounds.
+eq("exact: multiple of the stride", ctx.eval("slot(200, 5, 10, true)"), 2)
+eq("exact: between strip frames is refused", ctx.eval("slot(200, 5, 3, true)"), -1)
+eq("nearest: between strip frames rounds", ctx.eval("slot(200, 5, 3, false)"), 1)
+eq("stride 1 is always exact", ctx.eval("slot(50, 1, 37, true)"), 37)
+eq("past the end clamps to the last slot", ctx.eval("slot(50, 1, 99, false)"), 49)
+eq("empty strip", ctx.eval("slot(0, 1, 0, false)"), -1)
+check("retrimming the loader changes the signature",
+      ctx.eval('sig("Bat_VideoLoader", {"end_frame": 50}, "/a.mov")')
+      != ctx.eval('sig("Bat_VideoLoader", {"end_frame": 200}, "/a.mov")'))
+check("a different file changes the signature",
+      ctx.eval('sig("Bat_VideoLoader", {}, "/a.mov")') != ctx.eval('sig("Bat_VideoLoader", {}, "/b.mov")'))
+check("same file + trim gives the same signature",
+      ctx.eval('sig("VoltLoader", {"skip_first_frames": 4}, "/a")')
+      == ctx.eval('sig("VoltLoader", {"skip_first_frames": 4}, "/a")'))
+
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} FAILURE(S):")
