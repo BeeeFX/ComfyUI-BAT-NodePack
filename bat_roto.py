@@ -27,7 +27,13 @@ Shape model (matches what the JS editor serialises into the `state` widget):
 
 Between keyframes each point lerps independently (position + both
 tangent handles). Before the first keyframe / after the last we hold —
-no extrapolation.
+no extrapolation. A shape may also carry
+
+    "keyframe_ease": {"12": "ease_out", ...}    # frame → bat_easing name
+
+naming the curve on the way OUT of that key (a key's point list is a bare
+array, so the ease lives beside it rather than on it). A key with no entry is
+linear, so a state saved before easing existed renders exactly as it did.
 
 The output MASK is a (N, H, W) float tensor. For each frame we
 rasterise every shape's interpolated point list as a closed cubic
@@ -47,6 +53,9 @@ from typing import Optional
 import numpy as np
 import torch
 from PIL import Image
+
+from .bat_easing import apply_ease, ease_name
+from .bat_ui_ref import stash_ui
 
 logger = logging.getLogger("[Bat_Roto]")
 
@@ -157,6 +166,10 @@ def _resolve_shape_at_frame(shape: dict, frame: int) -> Optional[list]:
         return kfs[str(prev)]
     span = nxt - prev
     t = (frame - prev) / span if span else 0.0
+    # The segment belongs to the earlier key: its ease shapes the way out.
+    eases = shape.get("keyframe_ease")
+    if isinstance(eases, dict):
+        t = apply_ease(t, ease_name({"ease": eases.get(str(prev))}))
     return _interp_points(kfs[str(prev)], kfs[str(nxt)], t)
 
 
@@ -397,13 +410,15 @@ class BatRoto:
             im.save(buf, format="JPEG", quality=78)
             frames_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
 
+        # The strip goes to a sidecar file, not into the prompt history (see
+        # bat_ui_ref.py); nothing here is rendered by the frontend itself.
         return {
-            "ui": {
+            "ui": stash_ui({
                 "frames": frames_b64,
                 "w": [int(w)],
                 "h": [int(h)],
                 "stride": [int(stride)],
                 "frame_count": [int(n)],
-            },
+            }),
             "result": (mask_tensor,),
         }
