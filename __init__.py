@@ -164,6 +164,16 @@ try:
 except Exception:
     _log.exception("[BAT] the output-pruning prompt hook could not be installed")
 
+# ─── Preview payloads out of the history ─────────────────────────────
+# The editors' multi-MB `ui` previews are written to a temp sidecar and sent
+# as a token (web/bat_ui_ref.js resolves it), because ComfyUI keeps every
+# executed `ui` in its prompt history. Imported here so /bat/ui/<token> is
+# registered even before any node module pulls it in. See bat_ui_ref.py.
+try:
+    from . import bat_ui_ref  # noqa: F401
+except Exception:
+    _log.exception("[BAT] the preview sidecar route could not be registered")
+
 # class_type keys — bumped from Volt_* to Bat_* with the rename. The
 # in-UI migration tool (ETC_Core) detects the old keys on workflow
 # load and offers a one-click replacement that preserves position,

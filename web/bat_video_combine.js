@@ -696,8 +696,10 @@ function buildPlayer(node) {
     // a hover time, grab the frame via canvas.drawImage, surface as a
     // data URL on the hoverThumb <img>. This replaces the previous
     // server-side /bat/video/frame fetch — zero network, sub-50 ms when
-    // the encode uses all-I-frames (which it now does for H264/H265/VP9;
-    // see the matching `-g 1` change in bat_video_formats/).
+    // the encode uses all-I-frames (which it does for H264/VP9; see the `-g 1`
+    // in bat_video_formats/). H265 is not browser-playable, so the player
+    // always gets the all-I preview transcode and the deliverable keeps a
+    // normal GOP — all-intra there only bought the RExt profile and ~6x size.
     const thumbVideo = document.createElement("video");
     thumbVideo.muted = true;
     thumbVideo.playsInline = true;
