@@ -14,19 +14,21 @@
  *
  * Surviving undo: Ctrl+Z in ComfyUI is a full `loadGraphData`, which throws
  * away every node object and builds new ones — so the text from the last run
- * would vanish even though the run is still valid. The payload is therefore
- * cached per node id and replayed when a node with that id is created again.
- * Same approach as the other BAT previews.
+ * would vanish even though the run is still valid. `batReplayLastExecution`
+ * (bat_lifecycle.js) replays the last payload once the graph is configured,
+ * keyed per graph — same as the other BAT previews. (This file used to keep
+ * its own node.id-keyed map and replay it from onNodeCreated, but the id is
+ * not assigned until after onNodeCreated, so that lookup never hit.)
+ *
+ * 🦇 WAN Context Calculator reuses the panel for its report.
  */
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, refreshBatLayout } from "./bat_node_layout.js";
+import { batReplayLastExecution } from "./bat_lifecycle.js";
 
-const NODE_TYPES = ["Bat_ShowAny", "Bat_ShowTensorShape"];
+const NODE_TYPES = ["Bat_ShowAny", "Bat_ShowTensorShape", "Bat_WanContextCalculator"];
 const PLACEHOLDER = "— not run yet —";
-
-// node.id -> last text seen. Replayed after undo/redo rebuilds the graph.
-const LAST_TEXT = new Map();
 
 function buildPanel(node) {
     const el = document.createElement("pre");
@@ -90,15 +92,14 @@ app.registerExtension({
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (!NODE_TYPES.includes(nodeData?.name)) return;
 
+        // Replays the last run's payload after an undo/redo rebuilds the graph.
+        batReplayLastExecution(nodeType);
+
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
             try {
                 buildPanel(this);
-                // Replay whatever this node id last displayed (undo/redo, or a
-                // workflow reloaded in the same session).
-                const cached = LAST_TEXT.get(this.id);
-                if (cached != null) render(this, cached);
             } catch (e) {
                 console.error("[BAT.show] could not build panel:", e);
             }
@@ -110,23 +111,11 @@ app.registerExtension({
             const r = onExecuted ? onExecuted.apply(this, arguments) : undefined;
             try {
                 const text = textFromMessage(message);
-                if (text != null) {
-                    LAST_TEXT.set(this.id, text);
-                    render(this, text);
-                }
+                if (text != null) render(this, text);
             } catch (e) {
                 console.error("[BAT.show] could not render payload:", e);
             }
             return r;
-        };
-
-        const onRemoved = nodeType.prototype.onRemoved;
-        nodeType.prototype.onRemoved = function () {
-            // Deliberately NOT clearing LAST_TEXT here: onRemoved fires for
-            // every node during the loadGraphData that an undo performs, so
-            // clearing would defeat the replay above. The map only ever holds
-            // short strings for nodes in this session.
-            return onRemoved ? onRemoved.apply(this, arguments) : undefined;
         };
     },
 });

@@ -120,7 +120,14 @@ class _ShowBase:
     def check_lazy_status(self, enabled=True, **kwargs):
         # The load-bearing line: returning [] means the executor never
         # evaluates whatever is upstream of `value`.
-        return ["value"] if enabled else []
+        #
+        # Only request `value` when it is wired: an unwired optional input is
+        # absent from kwargs (a wired-but-unevaluated one arrives as None), and
+        # asking for an absent input makes the executor raise NodeInputError —
+        # which failed every queue that had an unwired readout parked in it.
+        if enabled and "value" in kwargs and kwargs["value"] is None:
+            return ["value"]
+        return []
 
 
 class BatShowAny:

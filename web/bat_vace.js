@@ -48,6 +48,22 @@ function ensureProps(node) {
     if (!Array.isArray(node.properties.kf_indices)) node.properties.kf_indices = [];
 }
 
+/**
+ * Remove a widget the way the frontend expects. `removeWidget` also drops the
+ * widget's entry from the widget value store; splicing `node.widgets` alone
+ * left that entry behind, so re-adding `index_N` re-bound to the stale state
+ * and came back showing the removed row's old index instead of 0.
+ */
+function dropWidget(node, widget) {
+    if (!widget) return;
+    if (typeof node.removeWidget === "function") {
+        node.removeWidget(widget);
+    } else {
+        const i = node.widgets.indexOf(widget);
+        if (i !== -1) node.widgets.splice(i, 1);
+    }
+}
+
 function addControlButtons(node) {
     const addBtn = node.addWidget("button", ADD_BTN_NAME, null, () => {
         addKeyframeRow(node, 0, false);
@@ -84,19 +100,27 @@ function addKeyframeRow(node, defaultIndex, restoring) {
         { min: 0, max: 100000, step: 10, precision: 0 }
     );
 
-    moveBeforeButtons(node, w);
+    keepButtonsLast(node);
 
     node.setSize(node.computeSize());
     node.setDirtyCanvas(true, true);
 }
 
-function moveBeforeButtons(node, widget) {
-    const wIdx = node.widgets.indexOf(widget);
-    const btnIdx = node.widgets.findIndex((w) => w.name === ADD_BTN_NAME);
-    if (wIdx !== -1 && btnIdx !== -1 && wIdx > btnIdx) {
-        node.widgets.splice(wIdx, 1);
-        node.widgets.splice(btnIdx, 0, widget);
-    }
+/**
+ * Put the +/− buttons back after the newest index row.
+ *
+ * Splicing the new widget in front of the buttons only reorders
+ * `node.widgets`, which is all Nodes 1.0 draws from. Nodes 2.0 renders rows in
+ * the widget store's order — registration order — so the index rows showed up
+ * under the buttons there (and after every reload, since onConfigure adds
+ * them once the buttons are registered). Removing and re-adding the buttons
+ * appends them last in both. They hold no value, so nothing is lost.
+ */
+function keepButtonsLast(node) {
+    const btns = node.widgets.filter((w) => w.name === ADD_BTN_NAME || w.name === RM_BTN_NAME);
+    if (!btns.length) return;
+    for (const b of btns) dropWidget(node, b);
+    addControlButtons(node);
 }
 
 function removeKeyframeRow(node) {
@@ -108,8 +132,7 @@ function removeKeyframeRow(node) {
     const maskIdx = node.findInputSlot(`mask_${n}`);
     if (maskIdx !== -1) node.removeInput(maskIdx);
 
-    const widgetIdx = node.widgets.findIndex((w) => w.name === `index_${n}`);
-    if (widgetIdx !== -1) node.widgets.splice(widgetIdx, 1);
+    dropWidget(node, node.widgets.find((w) => w.name === `index_${n}`));
 
     node.properties.kf_count = n - 1;
     node.properties.kf_indices.pop();
