@@ -377,9 +377,13 @@ function buildEditor(node) {
             g = g * (gain - lift) + lift;
             b = b * (gain - lift) + lift;
             r = r * mult + off; g = g * mult + off; b = b * mult + off;
-            r = r < 0 ? 0 : Math.pow(r, invG);
-            g = g < 0 ? 0 : Math.pow(g, invG);
-            b = b < 0 ? 0 : Math.pow(b, invG);
+            // Negatives skip the gamma and pass through linear; `cb` below
+            // decides whether they survive (mirrors _apply_grade).
+            if (invG !== 1) {
+                if (r > 0) r = Math.pow(r, invG);
+                if (g > 0) g = Math.pow(g, invG);
+                if (b > 0) b = Math.pow(b, invG);
+            }
             if (cw) { if (r > 1) r = 1; if (g > 1) g = 1; if (b > 1) b = 1; }
             if (cb) { if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0; }
             if (mask) {
@@ -868,7 +872,13 @@ function buildEditor(node) {
                 break;
             default: handled = false;
         }
-        if (handled) e.preventDefault();
+        if (handled) {
+            // stopPropagation too: ComfyUI's window-level keybinding handler
+            // ignores defaultPrevented, so Delete/Backspace here ALSO ran
+            // "Delete Selected Items" and removed the (focus-selected) node.
+            e.preventDefault();
+            e.stopPropagation();
+        }
     });
 
     // ── ingest from backend ──────────────────────────────────────────

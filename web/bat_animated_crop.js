@@ -507,8 +507,11 @@ function buildEditor(node) {
         if (!state.imgW) { info.textContent = ""; return; }
         const r = rectAtCurrent();
         const snap = Math.max(1, (get("snap_to") | 0) || 8);
-        const outW = Math.max(snap, Math.round(r.w / snap) * snap);
-        const outH = Math.max(snap, Math.round(r.h / snap) * snap);
+        // The output size is uniform across the clip: the FIRST frame's rect,
+        // floored to snap_to exactly as bat_animated_crop.py's _snap does.
+        const r0 = rectAtFrame(0);
+        const outW = Math.max(snap, Math.floor(Math.round(r0.w) / snap) * snap);
+        const outH = Math.max(snap, Math.floor(Math.round(r0.h) / snap) * snap);
         const angTxt = Math.abs(r.angle) >= 0.05 ? `  · ${r.angle.toFixed(1)}°` : "";
         const onKey = !!state.doc.keyframes[String(state.currentFrame)];
         const freeTxt = constrained() ? "" : " · ⛶ free";
@@ -643,9 +646,19 @@ function buildEditor(node) {
                 x = Math.round(dirX > 0 ? anchX : anchX - nw);
                 y = Math.round(dirY > 0 ? anchY : anchY - nh);
             } else if (con) {
-                const nx = Math.min(anchX, cP.x), ny = Math.min(anchY, cP.y);
-                x = cl(Math.round(nx), 0, Math.max(0, Wimg - 1));
-                y = cl(Math.round(ny), 0, Math.max(0, Himg - 1));
+                // Clamp both EDGES to the canvas, not just the origin. w/h used
+                // to be left unclamped here, so a drag past the right edge
+                // stored an overhanging key (which the backend then slid, off
+                // from what was drawn) and one past the left edge moved the
+                // anchor.
+                const x0 = cl(Math.min(anchX, cP.x), 0, Wimg);
+                const y0 = cl(Math.min(anchY, cP.y), 0, Himg);
+                nw = cl(Math.max(anchX, cP.x), 0, Wimg) - x0;
+                nh = cl(Math.max(anchY, cP.y), 0, Himg) - y0;
+                x = cl(Math.round(x0), 0, Math.max(0, Wimg - 1));
+                y = cl(Math.round(y0), 0, Math.max(0, Himg - 1));
+                nw = Math.min(nw, Wimg - x);
+                nh = Math.min(nh, Himg - y);
             } else {
                 x = Math.round(dirX > 0 ? anchX : anchX - nw);
                 y = Math.round(dirY > 0 ? anchY : anchY - nh);
@@ -1137,7 +1150,13 @@ function buildEditor(node) {
                 break;
             default: handled = false;
         }
-        if (handled) e.preventDefault();
+        if (handled) {
+            // stopPropagation too: ComfyUI's window-level keybinding handler
+            // ignores defaultPrevented, so Delete/Backspace here ALSO ran
+            // "Delete Selected Items" and removed the (focus-selected) node.
+            e.preventDefault();
+            e.stopPropagation();
+        }
     });
 
     // ── ingest from backend (input image batch) ──────────────────────

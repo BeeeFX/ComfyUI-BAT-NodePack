@@ -5,7 +5,8 @@ Mirrors Nuke's Grade node math:
     base    = (in - blackpoint) / max(whitepoint - blackpoint, 1e-6)
     leveled = base * (gain - lift) + lift
     out     = (leveled * multiply + offset) ** (1 / max(gamma, 1e-6))
-    out     = clamp(out, 0, 1) if both clamp toggles are on
+              (negative values skip the gamma and pass through linear)
+    out     = clamp(out, max=1) if clamp_white; clamp(out, min=0) if clamp_black
 
 An optional MASK input gates the grade: where mask == 1 the grade
 applies fully, where mask == 0 the pixels pass through unchanged
@@ -26,6 +27,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .bat_crop import _broadcast_mask_to_n
 from .bat_hdr_preview import hdr_tile
 
 
@@ -75,20 +77,47 @@ def _apply_grade(
     wp_minus_bp = max(whitepoint - blackpoint, 1e-6)
     g = max(gamma, 1e-6)
 
-    base = (img - blackpoint) / wp_minus_bp
-    leveled = base * (gain - lift) + lift
-    out = leveled * multiply + offset
-    # pow on negatives is undefined → clamp the pre-gamma minimum to 0 so
-    # the operation is well-defined. (Nuke does the same; "black_clamp"
-    # toggles whether we also clamp the FINAL output to >= 0.)
-    out = torch.clamp(out, min=0.0).pow(1.0 / g)
+    # Pass-through params (the node defaults) are an exact identity; skip the
+    # full-batch arithmetic entirely.
+    if (blackpoint == 0.0 and whitepoint == 1.0 and lift == 0.0 and gain == 1.0
+            and multiply == 1.0 and offset == 0.0 and g == 1.0
+            and not clamp_white and not clamp_black):
+        return img
+
+    # The levels stage is affine in `in`, so fold it into ONE multiply-add:
+    #   ((in - bp)/(wp - bp) * (gain - lift) + lift) * multiply + offset
+    #   = in * A + B
+    # and do everything after it in place. The step-by-step version kept
+    # base / leveled / out alive together: ~6x the batch at peak versus ~2x.
+    a = (gain - lift) / wp_minus_bp * multiply
+    b = (lift - blackpoint * (gain - lift) / wp_minus_bp) * multiply + offset
+    out = img * a
+    out.add_(b)
+
+    # pow on negatives is undefined. Negatives pass through LINEAR (Nuke's
+    # behaviour) rather than being zeroed, so clamp_black is a real toggle:
+    # it used to be a no-op because this step already clamped them to 0.
+    if g != 1.0:
+        if clamp_black:
+            out.clamp_(min=0.0).pow_(1.0 / g)
+        else:
+            neg = out < 0
+            neg_vals = out[neg]
+            out.clamp_(min=0.0).pow_(1.0 / g)
+            out[neg] = neg_vals
 
     if clamp_white:
-        out = torch.clamp(out, max=1.0)
+        out.clamp_(max=1.0)
     if clamp_black:
-        out = torch.clamp(out, min=0.0)
+        out.clamp_(min=0.0)
 
     if mask is not None:
+        # A mask batch that is neither 1 nor N used to crash the mix below
+        # ("size of tensor a (10) must match … (5)"); hold its last frame /
+        # truncate, the same way Bat_Crop brings a mask to the image batch.
+        n = img.shape[0]
+        if mask.shape[0] not in (1, n):
+            mask = _broadcast_mask_to_n(mask, n)
         # mask: (N, H, W) → (N, H, W, 1) for broadcasting against (N,H,W,3)
         m = mask.to(torch.float32).unsqueeze(-1).clamp(0, 1)
         # Resize mask to image spatial size if they differ (e.g. mask is
@@ -100,7 +129,8 @@ def _apply_grade(
                 m_nchw, size=img.shape[1:3], mode="bilinear", align_corners=False,
             )
             m = m_nchw.permute(0, 2, 3, 1)
-        out = out * m + img * (1.0 - m)
+        # out*m + img*(1-m), in place.
+        out.sub_(img).mul_(m).add_(img)
     return out
 
 

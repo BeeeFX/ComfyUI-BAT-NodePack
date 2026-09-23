@@ -31,6 +31,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 from io import BytesIO
 
 import numpy as np
@@ -260,7 +261,9 @@ class BatAnimatedGrade:
         # Bat_Roto / Bat_AnimatedCrop).
         frames_b64 = []
         max_preview_frames = 240
-        stride = max(1, n // max_preview_frames) if n > max_preview_frames else 1
+        # ceil, not floor: n // 240 is 1 for anything under 480 frames, so the
+        # "cap" let up to 479 thumbnails through.
+        stride = max(1, math.ceil(n / max_preview_frames))
         for i in range(0, n, stride):
             arr = (image[i].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
             frames_b64.append(_b64_jpeg(arr))

@@ -242,8 +242,10 @@ function makeEditor(node) {
         const cw = get("crop_w") | 0, ch = get("crop_h") | 0;
         const ang = get("crop_angle") || 0;
         const snap = Math.max(1, get("snap_to") | 0);
-        const outW = Math.max(snap, Math.round(cw / snap) * snap);
-        const outH = Math.max(snap, Math.round(ch / snap) * snap);
+        // Floor, like bat_crop.py's _snap: the backend rounds the rect DOWN
+        // (a full-height 1080 crop at snap 16 outputs 1072, not 1088).
+        const outW = Math.max(snap, Math.floor(cw / snap) * snap);
+        const outH = Math.max(snap, Math.floor(ch / snap) * snap);
         const angTxt = Math.abs(ang) >= 0.05 ? `  · ${ang.toFixed(1)}°` : "";
         info.textContent = state.imgW
             ? `${cw}×${ch}${angTxt}  →  ${outW}×${outH}`

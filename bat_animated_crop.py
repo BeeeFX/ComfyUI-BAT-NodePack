@@ -21,8 +21,10 @@ keyframes we fall back to a 512×512 rect at the origin so the node
 doesn't explode on a freshly placed graph.
 
 Output resolution: snapped from the FIRST keyframe's `w` and `h`
-using `snap_to`. Every frame of the output is resized to that uniform
-size so the result stays a regular `(N, out_h, out_w, 3)` tensor.
+using `snap_to`. Each frame's rect is scaled about its centre by the same
+snap ratio, so frames at the first keyframe's size slice at exactly that
+size; any other frame is resized to it, so the result stays a regular
+`(N, out_h, out_w, 3)` tensor.
 
 `crop_info` always carries the scalar fields Bat_Crop wrote (for
 backward-compat with code that doesn't iterate per-frame), with the
@@ -104,7 +106,10 @@ def _resize_nhwc(t, h, w, mode="bicubic"):
     if mode in ("bilinear", "bicubic"):
         kw["align_corners"] = False
     out = F.interpolate(nchw, **kw)
-    return out.permute(0, 2, 3, 1).clamp(0, 1).contiguous()
+    # Clamp bicubic overshoot to the source's OWN range, not [0,1] — the
+    # latter clipped HDR plates on every resized frame.
+    return out.permute(0, 2, 3, 1).clamp(
+        t.amin().item(), t.amax().item()).contiguous()
 
 
 def _resize_nhw(t, h, w):
@@ -213,8 +218,20 @@ class BatAnimatedCrop:
         # Uniform output size = snap of the first keyframe's dimensions.
         # Falls back to 512×512 (snapped) when no keyframes exist.
         first_rect = _resolve_rect_at_frame(kfs, 0)
-        out_w = _snap(max(1, int(round(first_rect["w"]))), snap_to)
-        out_h = _snap(max(1, int(round(first_rect["h"]))), snap_to)
+        ref_w = max(1, int(round(first_rect["w"])))
+        ref_h = max(1, int(round(first_rect["h"])))
+        out_w = _snap(ref_w, snap_to)
+        out_h = _snap(ref_h, snap_to)
+        # Every frame's rect is scaled about its centre by out/ref BEFORE
+        # extraction — the per-frame equivalent of Bat_Crop snapping its rect
+        # before slicing. A frame at the reference size then slices at exactly
+        # out_w×out_h with no resample; before, a non-multiple size (the
+        # editor's default 960×540 seed on 1080p → 536) bicubic-resampled every
+        # frame, and Uncrop resampled it back. Scaling rather than snapping
+        # each frame keeps an animated zoom smooth instead of stepping in
+        # snap_to increments.
+        scale_w = out_w / ref_w
+        scale_h = out_h / ref_h
 
         out_frames = []
         out_masks = []
@@ -223,10 +240,11 @@ class BatAnimatedCrop:
 
         for f in range(n):
             rect = _resolve_rect_at_frame(kfs, f)
-            x = float(rect["x"])
-            y = float(rect["y"])
-            w = max(1, int(round(rect["w"])))
-            h = max(1, int(round(rect["h"])))
+            w = max(1, int(round(float(rect["w"]) * scale_w)))
+            h = max(1, int(round(float(rect["h"]) * scale_h)))
+            # Keep the drawn centre where the artist put it.
+            x = float(rect["x"]) + (float(rect["w"]) - w) / 2.0
+            y = float(rect["y"]) + (float(rect["h"]) - h) / 2.0
             angle = float(rect["angle"])
             # Constrain to canvas — applies to ROTATED rects too.
             #
@@ -280,16 +298,18 @@ class BatAnimatedCrop:
                 else:
                     cropped_m = torch.ones((1, h, w), device=device, dtype=dtype)
             else:
-                cropped = _rotated_crop(frame_img, int(round(x)), int(round(y)),
-                                        w, h, angle, outside_fill)
-                cx = x + w / 2.0
-                cy = y + h / 2.0
+                # Float x/y: grid_sample is sub-pixel, and Uncrop pastes at the
+                # float rect it reads from `frames`. Rounding here made the
+                # paste land up to 0.5px off, alternating frame to frame on
+                # an interpolated move (visible shimmer).
+                cropped = _rotated_crop(frame_img, x, y, w, h, angle, outside_fill)
+                cx = x + (w - 1) / 2.0
+                cy = y + (h - 1) / 2.0
                 rect_m = _rotated_rect_mask(H, W, cx, cy, w, h, angle, 1,
                                             device, dtype)
                 if frame_mask_in is not None:
                     cropped_m = _rotated_crop_mask(
-                        frame_mask_in, int(round(x)), int(round(y)), w, h, angle,
-                        outside_fill,
+                        frame_mask_in, x, y, w, h, angle, outside_fill,
                     )
                 else:
                     cropped_m = torch.ones((1, h, w), device=device, dtype=dtype)
@@ -336,7 +356,9 @@ class BatAnimatedCrop:
         # the ui payload).
         frames_b64 = []
         max_preview_frames = 240
-        stride = max(1, n // max_preview_frames) if n > max_preview_frames else 1
+        # ceil, not floor: n // 240 is 1 for anything under 480 frames, so the
+        # "cap" let up to 479 thumbnails through.
+        stride = max(1, math.ceil(n / max_preview_frames))
         for i in range(0, n, stride):
             arr = (image[i].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
             frames_b64.append(_b64_jpeg(arr))

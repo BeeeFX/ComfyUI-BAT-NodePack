@@ -44,7 +44,10 @@ def _resize_nhwc(t, h, w, mode):
         if fmode in ("bilinear", "bicubic"):
             kwargs["align_corners"] = False
         out = F.interpolate(nchw, **kwargs)
-    return out.permute(0, 2, 3, 1).clamp(0, 1).contiguous()
+    # Clamp bicubic / lanczos overshoot to the source's OWN range rather than
+    # [0,1], which clipped every HDR value above 1.
+    return out.permute(0, 2, 3, 1).clamp(
+        t.amin().item(), t.amax().item()).contiguous()
 
 
 def _broadcast_to(batch, target_n):
@@ -71,20 +74,26 @@ def _broadcast_to(batch, target_n):
     )
 
 
-def _feather_local(h, w, feather, device, dtype):
+def _feather_local(h, w, feather, device, dtype, sides=(True, True, True, True)):
     """A (h, w) tensor of 1s with a `feather` px linear ramp falling off on
-    each of the four interior edges. feather=0 → all-ones rect."""
+    each edge flagged in `sides` (left, top, right, bottom). feather=0 →
+    all-ones rect."""
     if w <= 0 or h <= 0:
         return torch.zeros((max(1, h), max(1, w)), device=device, dtype=dtype)
     feather = int(max(0, min(feather, w // 2, h // 2)))
     rx = torch.ones(w, device=device, dtype=dtype)
     ry = torch.ones(h, device=device, dtype=dtype)
     if feather > 0:
+        left, top, right, bottom = sides
         ramp = torch.linspace(0.0, 1.0, feather + 2, device=device, dtype=dtype)[1:-1]
-        rx[:feather] = ramp
-        rx[w - feather:] = ramp.flip(0)
-        ry[:feather] = ramp
-        ry[h - feather:] = ramp.flip(0)
+        if left:
+            rx[:feather] = ramp
+        if right:
+            rx[w - feather:] = ramp.flip(0)
+        if top:
+            ry[:feather] = ramp
+        if bottom:
+            ry[h - feather:] = ramp.flip(0)
     return ry.unsqueeze(1) * rx.unsqueeze(0)
 
 
@@ -109,7 +118,11 @@ def _feather_rect_mask(H, W, x, y, w, h, feather, device, dtype):
     src_y1 = min(H, y + h)
     if src_x1 <= src_x0 or src_y1 <= src_y0:
         return mask
-    feathered = _feather_local(h, w, feather, device, dtype)
+    # Only feather edges that sit INSIDE the plate. An edge on (or past) the
+    # frame border has no seam to hide — ramping it faded the processed crop
+    # back to the untouched plate right at the image edge.
+    sides = (x > 0, y > 0, x + w < W, y + h < H)
+    feathered = _feather_local(h, w, feather, device, dtype, sides)
     dst_x0 = src_x0 - x
     dst_y0 = src_y0 - y
     mask[0, src_y0:src_y1, src_x0:src_x1] = feathered[
@@ -242,15 +255,19 @@ class BatUncrop:
                 paste_canvas[:, src_y0:src_y1, src_x0:src_x1, :] = \
                     paste[:, dst_y0:dst_y0 + (src_y1 - src_y0),
                              dst_x0:dst_x0 + (src_x1 - src_x0), :]
-            out = (base * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
+            # No [0,1] clamp on the composite (here or below): it clipped the
+            # WHOLE plate, so an EXR lost every highlight, even outside the rect.
+            out = base * (1.0 - m4) + paste_canvas * m4
             return (out.contiguous(), m_batch.contiguous())
 
         # Rotated path: paste the (paste_w × paste_h) image rotated about the
         # crop rect's centre. The paste is always centred on the rect centre
         # regardless of fit_mode (fit letterboxes inside the rect, cover/stretch
-        # fill it), so we don't need paste_x/y here.
-        rect_cx = x + w / 2.0
-        rect_cy = y + h / 2.0
+        # fill it), so we don't need paste_x/y here. Centres are in pixel-INDEX
+        # space ((w-1)/2), matching align_corners=True and Bat_Crop's sampling
+        # grid — the edge-space w/2 left a rotated round trip ~0.5px off.
+        rect_cx = x + (w - 1) / 2.0
+        rect_cy = y + (h - 1) / 2.0
         a = math.radians(angle)
         cos_t, sin_t = math.cos(a), math.sin(a)
 
@@ -264,8 +281,8 @@ class BatUncrop:
         # Inverse rotation maps canvas displacement → paste-local axes.
         u = cos_t * dx + sin_t * dy
         v = -sin_t * dx + cos_t * dy
-        pu = u + paste_w / 2.0
-        pv = v + paste_h / 2.0
+        pu = u + (paste_w - 1) / 2.0
+        pv = v + (paste_h - 1) / 2.0
         gx = pu / max(1, paste_w - 1) * 2.0 - 1.0
         gy = pv / max(1, paste_h - 1) * 2.0 - 1.0
         grid = torch.stack([gx, gy], dim=-1).unsqueeze(0).expand(target_n, H, W, 2)
@@ -274,7 +291,7 @@ class BatUncrop:
         paste_nchw = paste.permute(0, 3, 1, 2)
         sampled = F.grid_sample(paste_nchw, grid, mode="bilinear",
                                 padding_mode="zeros", align_corners=True)
-        paste_canvas = sampled.permute(0, 2, 3, 1).clamp(0, 1)
+        paste_canvas = sampled.permute(0, 2, 3, 1)
 
         # Sample a paste-local feather mask through the same grid so the
         # feather rotates with the paste.
@@ -285,7 +302,7 @@ class BatUncrop:
         m_batch = m_sampled[:, 0].clamp(0, 1)
         m4 = m_batch.unsqueeze(-1)
 
-        out = (base * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
+        out = base * (1.0 - m4) + paste_canvas * m4
         return (out.contiguous(), m_batch.contiguous())
 
     def _uncrop_animated(self, processed, original, per_frame, H, W,
@@ -395,14 +412,14 @@ class BatUncrop:
                     paste_canvas[:, src_y0:src_y1, src_x0:src_x1, :] = \
                         paste[:, dst_y0:dst_y0 + (src_y1 - src_y0),
                                  dst_x0:dst_x0 + (src_x1 - src_x0), :]
-                frame_out = (base_i * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
+                frame_out = base_i * (1.0 - m4) + paste_canvas * m4
                 out_frames.append(frame_out)
                 out_masks.append(m)
                 continue
 
             # Rotated path: same math as the scalar branch but for one frame.
-            rect_cx = x + w / 2.0
-            rect_cy = y + h / 2.0
+            rect_cx = x + (w - 1) / 2.0
+            rect_cy = y + (h - 1) / 2.0
             a = math.radians(angle)
             cos_t, sin_t = math.cos(a), math.sin(a)
             ys, xs = _pixel_grid()   # built once, reused every frame
@@ -410,8 +427,8 @@ class BatUncrop:
             dy = ys - rect_cy
             u = cos_t * dx + sin_t * dy
             v = -sin_t * dx + cos_t * dy
-            pu = u + paste_w / 2.0
-            pv = v + paste_h / 2.0
+            pu = u + (paste_w - 1) / 2.0
+            pv = v + (paste_h - 1) / 2.0
             gx = pu / max(1, paste_w - 1) * 2.0 - 1.0
             gy = pv / max(1, paste_h - 1) * 2.0 - 1.0
             grid = torch.stack([gx, gy], dim=-1).unsqueeze(0)
@@ -419,7 +436,7 @@ class BatUncrop:
             paste_nchw = paste.permute(0, 3, 1, 2)
             sampled = F.grid_sample(paste_nchw, grid, mode="bilinear",
                                     padding_mode="zeros", align_corners=True)
-            paste_canvas = sampled.permute(0, 2, 3, 1).clamp(0, 1)
+            paste_canvas = sampled.permute(0, 2, 3, 1)
 
             local = _feather_local(paste_h, paste_w, feather_px, device, dtype)
             local_n = local.unsqueeze(0).unsqueeze(0)
@@ -428,7 +445,7 @@ class BatUncrop:
             m_batch = m_sampled[:, 0].clamp(0, 1)
             m4 = m_batch.unsqueeze(-1)
 
-            frame_out = (base_i * (1.0 - m4) + paste_canvas * m4).clamp(0, 1)
+            frame_out = base_i * (1.0 - m4) + paste_canvas * m4
             out_frames.append(frame_out)
             out_masks.append(m_batch)
 
