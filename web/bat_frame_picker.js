@@ -10,7 +10,7 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
-import { makeBatPathWidget } from "./bat_path_widget.js";
+import { installBatPathWidget, makeBatPathWidget } from "./bat_path_widget.js";
 import { batTrack } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 
@@ -168,11 +168,10 @@ app.registerExtension({
             const orig = this.widgets[pathIdx];
             const config = nodeData.input?.required?.path;
             const opts = (config && config[1]) || {};
-            const pathW = makeBatPathWidget({
+            const pathW = installBatPathWidget(this, pathIdx, makeBatPathWidget({
                 name: "path", value: orig.value || "", options: opts,
                 route: PATH_ROUTE, title: "Frame Source",
-            });
-            this.widgets[pathIdx] = pathW;
+            }));
 
             const preview = makeGridWidget();
             // Dual-mode sizing — the contact-sheet grid is flex:1 inside a

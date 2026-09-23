@@ -587,6 +587,39 @@ def test_progress_and_cancel(clip):
 # 10. The banner parser, on the shapes ffmpeg actually prints
 # ---------------------------------------------------------------------------
 
+def test_rotated_deep(tmp):
+    """A 10-bit clip with a 90-degree display matrix decodes upright.
+
+    Built with prores_ks (10-bit, so it takes the ffmpeg path) and re-wrapped
+    with -display_rotation. Before the banner parser read the rotation, the
+    pipe's 64x48 frames were reshaped as 48x64: a sheared, garbage frame.
+    """
+    ff = _ffmpeg()
+    src = os.path.join(tmp, "deep.mov")
+    rot = os.path.join(tmp, "deep_rot.mov")
+    try:
+        subprocess.run([ff, "-y", "-v", "error", "-f", "lavfi",
+                        "-i", f"testsrc2=size={H}x{W}:rate=24", "-frames:v", "2",
+                        "-c:v", "prores_ks", "-profile:v", "3",
+                        "-pix_fmt", "yuv422p10le", src], check=True, capture_output=True)
+        subprocess.run([ff, "-y", "-v", "error", "-display_rotation", "90",
+                        "-i", src, "-c", "copy", rot], check=True, capture_output=True)
+    except Exception as e:
+        print(f"SKIP  rotated clip ({e})")
+        return
+    upright, _, _ = vl.load_batch(src, 0, 0, 1, want_progress=False)
+    turned, _, meta = vl.load_batch(rot, 0, 0, 1, want_progress=False)
+    check("rotated 10-bit clip decodes at its displayed size",
+          tuple(turned.shape) == (1, upright.shape[2], upright.shape[1], 3)
+          and meta["backend"] == "ffmpeg", f"{tuple(turned.shape)} {meta}")
+    # Upright content, turned a quarter: equal to the source under rot90 in one
+    # direction or the other (the sign convention is ffmpeg's business).
+    a = turned[0]
+    matches = [bool(torch.allclose(a, torch.rot90(upright[0], k, (0, 1)), atol=0.02))
+               for k in (1, 3)]
+    check("...and the pixels are the source turned, not sheared", any(matches))
+
+
 def test_banner_parser():
     cases = [
         # (banner line, pix_fmt, alpha, depth)
@@ -637,6 +670,21 @@ def test_banner_parser():
     check("banner: no audio stream", vl._parse_ffmpeg_banner(
         "Stream #0:0: Video: h264, yuv420p, 8x8, 24 fps")["has_audio"] is False)
 
+    # ffmpeg auto-rotates on decode, so a clip tagged 90/270 arrives with its
+    # sides swapped; the reshape has to use the size ffmpeg will deliver.
+    for label, side, expect in (
+            ("-90", "        displaymatrix: rotation of -90.00 degrees", (180, 320)),
+            ("90, 7.x spelling", "        Display Matrix: rotation of 90.00 degrees", (180, 320)),
+            ("180", "        displaymatrix: rotation of -180.00 degrees", (320, 180)),
+            ("old rotate tag", "        rotate          : 270", (180, 320))):
+        got = vl._parse_ffmpeg_banner(
+            "    Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv), 320x180, 24 fps\n"
+            "      Side data:\n" + side + "\n"
+            "    Stream #0:1: Audio: aac, 48000 Hz, stereo, fltp")
+        check(f"banner: rotation {label} -> {expect[0]}x{expect[1]}",
+              (got["width"], got["height"]) == expect,
+              f"got {got['width']}x{got['height']} rot {got['rotation']}")
+
     for layout, expect in (("mono", 1), ("stereo", 2), ("5.1(side)", 6),
                            ("7.1", 8), ("16 channels", 16), ("weird", 2)):
         rate, ch = vl._parse_audio_layout(
@@ -663,6 +711,7 @@ if __name__ == "__main__":
         test_route_gating(clip, tmp)
         test_progress_and_cancel(clip)
         test_bit_depth_and_alpha(tmp)
+        test_rotated_deep(tmp)
         test_audio_gating(tmp)
         test_cache(clip, tmp)
         # Last: it mutates the clip's mtime/size.
