@@ -19,17 +19,17 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out ComfyUI (master)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: comfyanonymous/ComfyUI
           path: ComfyUI
 
       - name: Check out the pack
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           path: ComfyUI/custom_nodes/ComfyUI-BAT-NodePack
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
