@@ -104,13 +104,34 @@ DEFAULT_LAYER = {"mode": "normal", "opacity": 1.0, "enabled": True}
 # Layer state
 # ---------------------------------------------------------------------------
 
-def parse_layers(text: str, count: int):
+def _slot_of(entry):
+    """The input slot (image_N's N) a stored entry belongs to, or None.
+
+    Entries used to be matched to layers by POSITION among the connected ones,
+    so unwiring image_2 of three handed layer 2's mode to image_3. They now
+    carry their slot; an entry without one is from that older format and is
+    still read by position, which is identical whenever there is no gap.
+    Mirrors `slotOf()` in web/bat_layered_images.js.
+    """
+    s = entry.get("slot") if isinstance(entry, dict) else None
+    if isinstance(s, bool) or not isinstance(s, (int, float)):
+        return None
+    if not np.isfinite(s) or float(s) != int(s) or not 1 <= int(s) <= MAX_LAYERS:
+        return None
+    return int(s)
+
+
+def parse_layers(text: str, count: int, slots=None):
     """Decode the layer panel's JSON into exactly `count` sane entries.
 
     Forgiving by design: this string is written by the frontend and stored in a
     workflow, so it can be absent, truncated, from an older version, or hand
     edited. Anything unusable falls back to the default layer rather than
     failing the run — a missing opacity should not cost someone a render.
+
+    `slots` are the image_N numbers of the layers wanted, bottom first. Entries
+    that carry a slot are looked up by it; the older positional format is read
+    by index, exactly as before.
     """
     doc = None
     if text:
@@ -118,16 +139,28 @@ def parse_layers(text: str, count: int):
             doc = json.loads(text)
         except (TypeError, ValueError):
             logger.warning("layer state is not valid JSON; using defaults")
-    raw = (doc or {}).get("layers")
+    raw = doc.get("layers") if isinstance(doc, dict) else None
     if not isinstance(raw, list):
         raw = []
 
+    if any(_slot_of(e) is not None for e in raw):
+        by_slot = {}
+        for e in raw:
+            s = _slot_of(e)
+            if s is not None:
+                by_slot.setdefault(s, e)
+        want = (list(slots) if slots is not None and len(slots) == count
+                else range(1, count + 1))
+        entries = [by_slot.get(int(s), {}) for s in want]
+    else:
+        entries = [raw[i] if i < len(raw) and isinstance(raw[i], dict) else {}
+                   for i in range(count)]
+
     out = []
-    for i in range(count):
-        entry = raw[i] if i < len(raw) and isinstance(raw[i], dict) else {}
+    for i, entry in enumerate(entries):
         mode = entry.get("mode", DEFAULT_LAYER["mode"])
         if mode not in MODES:
-            if mode is not None and i < len(raw):
+            if mode is not None and "mode" in entry:
                 logger.warning("layer %d: unknown blend mode %r; using normal",
                                i + 1, mode)
             mode = "normal"
@@ -208,20 +241,21 @@ def _b64_jpeg(arr_hwc: np.ndarray, max_dim: int = PREVIEW_TILE_DIM,
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _prep_mask(mask, n, device, dtype):
-    """MASK -> (N,H,W) at its own resolution, frame count aligned to `n`."""
-    if mask is None:
-        return None
-    m = mask.to(device=device, dtype=dtype).clamp(0.0, 1.0)
-    if m.ndim == 2:
-        m = m.unsqueeze(0)
-    if m.shape[0] == 1 and n > 1:
-        m = m.expand(n, -1, -1)
-    elif m.shape[0] < n:
-        m = torch.cat([m, m[-1:].expand(n - m.shape[0], -1, -1)], dim=0)
-    elif m.shape[0] > n:
-        m = m[:n]
-    return m
+def _mask_frames(mask, s, e, device, dtype):
+    """Frames s..e-1 of a MASK, at its own resolution, as (e-s, H, W).
+
+    Per chunk, so a long clip never holds a converted copy of the whole mask —
+    and a short one is not materialised out to the clip's length. The frame
+    rule is the one the whole-batch version used: a single frame covers every
+    frame, a short mask holds its last frame, a long one is truncated.
+    """
+    m = mask if mask.ndim == 3 else mask.reshape(1, *mask.shape[-2:])
+    last = int(m.shape[0]) - 1
+    if s <= last and e - 1 <= last:
+        m = m[s:e]
+    else:
+        m = m[torch.arange(s, e).clamp(max=last).to(m.device)]
+    return m.to(device=device, dtype=dtype).clamp(0.0, 1.0)
 
 
 class BatLayeredImages:
@@ -355,21 +389,24 @@ class BatLayeredImages:
         imgs = [t.expand(n, -1, -1, -1) if t.shape[0] == 1 else t[:n] for t in imgs]
 
         out_h, out_w = self._target_size(imgs, resize_mode)
-        settings = parse_layers(layers, len(imgs))
-        prepared_masks = [_prep_mask(m, n, device, torch.float32) for m in masks]
+        settings = parse_layers(layers, len(imgs), [i + 1 for (i, _, _) in found])
 
         idx = max(0, min(int(preview_frame), n - 1))
         pv = None
 
-        outs, alphas = [], []
+        # Preallocated and written by slice, not gathered into lists and
+        # torch.cat'ed: that held every chunk AND the concatenated copy at once,
+        # doubling the peak. Same fix, same reasoning as Bat_AdvancedBlend.
+        out = torch.empty((n, out_h, out_w, 3), dtype=torch.float32, device=device)
+        alpha = torch.empty((n, out_h, out_w), dtype=torch.float32, device=device)
         for s in range(0, n, CHUNK_FRAMES):
             e = min(s + CHUNK_FRAMES, n)
             chunk = []
-            for t, m in zip(imgs, prepared_masks):
+            for t, m in zip(imgs, masks):
                 c = _resize(t[s:e], out_h, out_w, resize_filter)
                 a = None
                 if m is not None:
-                    a = m[s:e].unsqueeze(-1)
+                    a = _mask_frames(m, s, e, device, torch.float32).unsqueeze(-1)
                     if a.shape[1:3] != (out_h, out_w):
                         a = torch.nn.functional.interpolate(
                             a.permute(0, 3, 1, 2), size=(out_h, out_w),
@@ -377,8 +414,9 @@ class BatLayeredImages:
                         ).permute(0, 2, 3, 1)
                 chunk.append((c, a))
             o, al = composite(chunk, settings, clamp_output)
-            outs.append(o)
-            alphas.append(al)
+            out[s:e] = o
+            alpha[s:e] = al[..., 0]
+            del o, al
             if pv is None and s <= idx < e:
                 k = idx - s
                 # .clone(), not a view: a view pins the whole chunk, which for a
@@ -387,12 +425,9 @@ class BatLayeredImages:
                        None if a is None else a[k:k + 1].clone())
                       for (c, a) in chunk]
 
-        out = torch.cat(outs, dim=0) if len(outs) > 1 else outs[0]
-        alpha = torch.cat(alphas, dim=0) if len(alphas) > 1 else alphas[0]
-
         ui = self._preview_payload(pv, found, settings, idx, n, out_w, out_h,
                                    unique_id)
-        return {"ui": ui, "result": (out, alpha[..., 0])}
+        return {"ui": ui, "result": (out, alpha)}
 
     # ------------------------------------------------------------------
     def _preview_payload(self, pv, found, settings, idx, frames, out_w, out_h,
@@ -416,6 +451,10 @@ class BatLayeredImages:
             "h": [int(out_h)],
             "modes": [list(MODES)],
         }
+        # The key the frame is cached under, for the full-resolution request:
+        # inside a subgraph the node's own id is only the local part of it.
+        if unique_id is not None:
+            ui["node_id"] = [str(unique_id)]
 
         tiles, mask_pngs = [], []
         for (c, a) in pv:
@@ -522,7 +561,7 @@ def render_region(entry, settings, roi, out_w, out_h, view="result",
                   clamp_output=False):
     """Composite one region of the cached frame at full resolution.
 
-    `view` is "result" or "layer:<i>" to solo one layer. Unlike
+    `view` is "result", "alpha", or "layer:<i>" to solo one layer. Unlike
     Bat_AdvancedBlend there is no blur here, so no context margin is needed —
     every operation is per-pixel, and a region is exactly independent of its
     surroundings.
@@ -541,30 +580,38 @@ def render_region(entry, settings, roi, out_w, out_h, view="result",
     def slab(t):
         return None if t is None else t[:, y:y + h, x:x + w].to(device, non_blocking=True)
 
-    try:
-        chunk = [(slab(c), slab(a)) for (c, a) in layers]
+    def pick(chunk):
+        # Every view here must be the one `paintLayered()` draws in the JS, or
+        # the full layer replaces the draft with a different picture a moment
+        # after it lands.
         if view.startswith("layer:"):
             i = int(view.split(":", 1)[1])
             if not (0 <= i < len(chunk)):
                 raise ValueError(f"no layer {i}")
-            # Solo: that layer alone over transparency, at full opacity and
-            # `normal`, so what you see is the layer itself rather than the layer
-            # as its mode happens to render it against nothing.
-            img, _ = composite([chunk[i]], [dict(DEFAULT_LAYER)], clamp_output)
-        else:
-            img, _ = composite(chunk, settings, clamp_output)
+            # Solo: the layer itself at full opacity through its mask, OVER
+            # BLACK — premultiplied, so a soft matte edge reads as one. The
+            # composite's un-premultiplied colour showed full colour wherever
+            # the mask was above zero.
+            c, a = chunk[i]
+            return c if a is None else c * a
+        if view == "alpha":
+            # The accumulated matte, which is the node's second output. There
+            # was no branch for this, so the full layer painted the RGB result
+            # over the Alpha view.
+            _, ab = composite(chunk, settings, clamp_output)
+            return ab.expand(*ab.shape[:-1], 3)
+        img, _ = composite(chunk, settings, clamp_output)
+        return img
+
+    try:
+        img = pick([(slab(c), slab(a)) for (c, a) in layers])
     except torch.cuda.OutOfMemoryError:
         logger.warning("full-resolution preview did not fit in VRAM; falling "
                        "back to CPU for this request")
         torch.cuda.empty_cache()
-        chunk = [(None if c is None else c[:, y:y + h, x:x + w],
-                  None if a is None else a[:, y:y + h, x:x + w])
-                 for (c, a) in layers]
-        if view.startswith("layer:"):
-            i = int(view.split(":", 1)[1])
-            img, _ = composite([chunk[i]], [dict(DEFAULT_LAYER)], clamp_output)
-        else:
-            img, _ = composite(chunk, settings, clamp_output)
+        img = pick([(None if c is None else c[:, y:y + h, x:x + w],
+                     None if a is None else a[:, y:y + h, x:x + w])
+                    for (c, a) in layers])
 
     if (out_h, out_w) != (img.shape[1], img.shape[2]):
         filt = "area" if (out_w < img.shape[2] or out_h < img.shape[1]) else "lanczos"

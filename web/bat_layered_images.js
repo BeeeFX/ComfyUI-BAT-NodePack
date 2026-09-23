@@ -27,6 +27,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
@@ -131,20 +132,56 @@ function connectedLayers(node) {
 // ── layer state ──────────────────────────────────────────────────────────
 
 /**
+ * The input slot (image_N's N) a stored entry belongs to, or null.
+ *
+ * Entries used to be matched to layers by POSITION among the connected ones, so
+ * unwiring image_2 of three handed layer 2's mode to image_3 — and the next
+ * write then dropped image_3's own settings. They now carry their slot. An
+ * entry without one is from that older format and is still read by position,
+ * which is identical whenever there is no gap. Mirrors `_slot_of()` in the .py.
+ */
+function slotOf(e) {
+    const s = (e && typeof e === "object") ? e.slot : undefined;
+    return (Number.isInteger(s) && s >= 1 && s <= MAX_LAYERS) ? s : null;
+}
+
+/** Stored entries for the given layers, one per layer, `{}` where none. */
+function layerEntries(raw, count, slots) {
+    if (raw.some((e) => slotOf(e) !== null)) {
+        const bySlot = new Map();
+        for (const e of raw) {
+            const s = slotOf(e);
+            if (s !== null && !bySlot.has(s)) bySlot.set(s, e);
+        }
+        const want = (Array.isArray(slots) && slots.length === count)
+            ? slots : Array.from({ length: count }, (_, i) => i + 1);
+        return want.map((s) => bySlot.get(s) || {});
+    }
+    const out = [];
+    for (let i = 0; i < count; i++) {
+        out.push((raw[i] && typeof raw[i] === "object") ? raw[i] : {});
+    }
+    return out;
+}
+
+function storedLayers(node) {
+    const w = node.widgets?.find((x) => x.name === "layers");
+    let doc = null;
+    try { doc = JSON.parse(w?.value || "{}"); } catch (_) { doc = null; }
+    return Array.isArray(doc?.layers) ? doc.layers : [];
+}
+
+/**
  * Read the layer settings out of the node's STRING widget.
  *
  * Mirrors `parse_layers()` in the Python, including its forgiveness: the string
  * comes from a saved workflow and can be absent, truncated or hand edited, and
- * a missing opacity should not break the node.
+ * a missing opacity should not break the node. `slots` are the image_N numbers
+ * of the layers wanted, bottom first, as the last run reported them.
  */
-export function readLayerState(node, count) {
-    const w = node.widgets?.find((x) => x.name === "layers");
-    let doc = null;
-    try { doc = JSON.parse(w?.value || "{}"); } catch (_) { doc = null; }
-    const raw = Array.isArray(doc?.layers) ? doc.layers : [];
+export function readLayerState(node, count, slots) {
     const out = [];
-    for (let i = 0; i < count; i++) {
-        const e = (raw[i] && typeof raw[i] === "object") ? raw[i] : {};
+    for (const e of layerEntries(storedLayers(node), count, slots)) {
         const mode = MODES.includes(e.mode) ? e.mode : DEFAULT_LAYER.mode;
         let op = Number(e.opacity);
         if (!Number.isFinite(op)) op = 1;
@@ -157,10 +194,33 @@ export function readLayerState(node, count) {
     return out;
 }
 
-function writeLayerState(node, settings) {
+/**
+ * Store `settings` (one per layer, bottom first) against their slots.
+ *
+ * Entries for slots not in `slots` are kept, so unwiring a layer and wiring it
+ * back does not cost it its settings. Entries in the older positional format
+ * are dropped on the first write: `settings` already holds what they resolved
+ * to for the layers on screen, which is the only meaning they had. Written in
+ * slot order, so a build that still reads by position agrees when there is no
+ * gap.
+ */
+function writeLayerState(node, settings, slots) {
     const w = node.widgets?.find((x) => x.name === "layers");
     if (!w) return;
-    w.value = JSON.stringify({ layers: settings });
+    const bySlot = new Map();
+    for (const e of storedLayers(node)) {
+        const s = slotOf(e);
+        if (s !== null && !bySlot.has(s)) bySlot.set(s, e);
+    }
+    settings.forEach((cfg, i) => {
+        const s = slotOf({ slot: slots?.[i] }) ?? (i + 1);
+        bySlot.set(s, { mode: cfg.mode, opacity: cfg.opacity, enabled: cfg.enabled });
+    });
+    const layers = [...bySlot.keys()].sort((a, b) => a - b).map((s) => {
+        const e = bySlot.get(s);
+        return { slot: s, mode: e.mode, opacity: e.opacity, enabled: e.enabled };
+    });
+    w.value = JSON.stringify({ layers });
     // The widget is the serialised truth, so a change to it has to mark the
     // graph dirty or it can be lost on save.
     node.graph?.setDirtyCanvas?.(true, true);
@@ -238,6 +298,7 @@ function buildEditor(node) {
         runId: 0,
         full: null, fullKey: null, fullRect: null, fullPending: false, fullStale: false,
         serverMs: 0,
+        serverId: null,
     };
     node._batLayeredState = state;
 
@@ -363,7 +424,7 @@ function buildEditor(node) {
 
     // ── compositing ──────────────────────────────────────────────────────
     function settings() {
-        return readLayerState(node, state.layers.length);
+        return readLayerState(node, state.layers.length, state.slots);
     }
 
     function clampOutput() {
@@ -482,12 +543,15 @@ function buildEditor(node) {
         paintBadge();
         const started = performance.now();
         try {
-            const res = await fetch("/bat/layered_images/render", {
+            const res = await fetch(api.apiURL("/bat/layered_images/render"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 signal: ctl.signal,
                 body: JSON.stringify({
-                    node_id: String(node.id),
+                    // Inside a subgraph `node.id` is only the local part of the
+                    // execution id the frame was cached under, so every request
+                    // missed. Python ships the real one with the payload.
+                    node_id: state.serverId ?? String(node.id),
                     roi: [region.world.x, region.world.y, region.world.w, region.world.h],
                     out_w: region.outW, out_h: region.outH,
                     view: state.view, settings: settings(),
@@ -637,7 +701,7 @@ function buildEditor(node) {
             eye.addEventListener("click", () => {
                 const s = settings();
                 s[i].enabled = !s[i].enabled;
-                writeLayerState(node, s);
+                writeLayerState(node, s, state.slots);
                 rebuildPanel(); schedule(false);
             });
             eye.addEventListener("pointerdown", (e) => e.stopPropagation());
@@ -678,7 +742,7 @@ function buildEditor(node) {
             mode.addEventListener("change", () => {
                 const s = settings();
                 s[i].mode = mode.value;
-                writeLayerState(node, s);
+                writeLayerState(node, s, state.slots);
                 schedule(false);
             });
             mode.addEventListener("pointerdown", (e) => e.stopPropagation());
@@ -696,7 +760,7 @@ function buildEditor(node) {
                 onInput: (v) => {
                     const s = settings();
                     s[i].opacity = v;
-                    writeLayerState(node, s);
+                    writeLayerState(node, s, state.slots);
                     schedule(true);
                 },
                 // The drag itself already repainted; this asks for the settled
@@ -735,6 +799,9 @@ function buildEditor(node) {
         const one = (v) => (Array.isArray(v) ? v[0] : v);
         const tiles = one(msg.tiles);
         const masks = one(msg.masks) || [];
+        // The execution id the frame is cached under — see the request.
+        const sid = one(msg.node_id);
+        state.serverId = sid != null ? String(sid) : null;
         state.meta = {
             w: Number(one(msg.w)) || 0,
             h: Number(one(msg.h)) || 0,
@@ -813,12 +880,13 @@ function buildEditor(node) {
             }
         }
 
-        // Settings shipped by Python are the sanitised truth; adopt them so the
-        // panel and the render can never disagree about what was just rendered.
-        const shipped = one(msg.settings);
-        if (Array.isArray(shipped) && shipped.length === decoded.length) {
-            writeLayerState(node, shipped);
-        }
+        // Deliberately NOT adopting the settings Python shipped back. An ingest
+        // is also a replay — bat_lifecycle re-runs it on every paste anywhere in
+        // the graph (the frontend fires onAfterGraphConfigured on every node),
+        // on undo and on a tab switch — so writing them here silently reverted
+        // every panel edit made since the run, and undo could not get it back
+        // because the undo reloaded and replayed too. readLayerState() applies
+        // the same sanitising parse_layers() does, so nothing is lost.
 
         if (state.view.startsWith("layer:")
             && parseInt(state.view.slice(6), 10) >= decoded.length) {

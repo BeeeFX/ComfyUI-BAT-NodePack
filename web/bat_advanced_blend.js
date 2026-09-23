@@ -108,6 +108,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
 import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
@@ -263,6 +264,40 @@ function repairNode(node) {
     }
 }
 
+/**
+ * Call `onChange` whenever `node.showAdvanced` is assigned, from anywhere.
+ *
+ * The header's own click refreshes it directly, but Nodes 2.0 has a second
+ * switch — the Vue node footer's advanced-inputs button assigns
+ * `node.showAdvanced` itself (LGraphNode.vue) — and that left the header
+ * reading "▸ Advanced" over an expanded section.
+ *
+ * Wraps the frontend's own accessor in an instance-level one rather than
+ * replacing it, so the reactive state it writes keeps working. Only installed
+ * when that accessor exists: on a frontend where `showAdvanced` is a plain
+ * property, shadowing it would change what gets stored, and a stale caret is
+ * the lesser problem.
+ */
+function watchShowAdvanced(node, onChange) {
+    let desc = null;
+    for (let o = Object.getPrototypeOf(node); o && !desc; o = Object.getPrototypeOf(o)) {
+        desc = Object.getOwnPropertyDescriptor(o, "showAdvanced") || null;
+    }
+    if (!desc || typeof desc.get !== "function" || typeof desc.set !== "function") return;
+    if (Object.getOwnPropertyDescriptor(node, "showAdvanced")) return;
+    try {
+        Object.defineProperty(node, "showAdvanced", {
+            configurable: true,
+            enumerable: !!desc.enumerable,
+            get() { return desc.get.call(this); },
+            set(v) {
+                desc.set.call(this, v);
+                try { onChange(); } catch (_) {}
+            },
+        });
+    } catch (_) { /* non-configurable: keep the frontend's behaviour as-is */ }
+}
+
 // ── the preview ──────────────────────────────────────────────────────────
 
 /** Amplification steps for the Detail / Diff views. See the note in render(). */
@@ -400,6 +435,7 @@ function buildPreview(node) {
         node.setDirtyCanvas?.(true, true);
     });
     node._batRefreshAdvBar = refreshAdvBar;
+    watchShowAdvanced(node, refreshAdvBar);
     root.appendChild(advBar);
 
     const stage = document.createElement("div");
@@ -513,6 +549,8 @@ function buildPreview(node) {
         needsRun: false,
         // Measured round trip for a server render, used to pace the requests.
         serverMs: 0,
+        // The execution id this node's frame is cached under server-side.
+        serverId: null,
     };
     node._batAdvBlendState = state;
 
@@ -771,6 +809,10 @@ function buildPreview(node) {
         if (msg.id === jobId) {
             state.blendMs = msg.ms;
             state.tw = msg.w; state.th = msg.h;
+            // The worker only ever blends the full tile. Without this, a drag on
+            // Half left the level at 1 and the probe indexed the half-size mip
+            // with full-tile coordinates: wrong A/B values, then a TypeError.
+            state.draftLevel = 0;
             if (off.width !== msg.w || off.height !== msg.h) {
                 off.width = msg.w; off.height = msg.h;
             }
@@ -935,12 +977,15 @@ function buildPreview(node) {
         paintBadge();
         const started = performance.now();
         try {
-            const res = await fetch("/bat/advanced_blend/render", {
+            const res = await fetch(api.apiURL("/bat/advanced_blend/render"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 signal: ctl.signal,
                 body: JSON.stringify({
-                    node_id: String(node.id),
+                    // The id Python cached the frame under. `node.id` is only
+                    // the local part inside a subgraph, so it is the fallback
+                    // for a payload that predates the field.
+                    node_id: state.serverId ?? String(node.id),
                     roi: [region.world.x, region.world.y, region.world.w, region.world.h],
                     out_w: region.outW, out_h: region.outH,
                     view: state.view, amp: state.amp,
@@ -1341,6 +1386,8 @@ function buildPreview(node) {
 
     node._batAdvBlendIngest = async (msg) => {
         const one = (v) => (Array.isArray(v) ? v[0] : v);
+        const sid = one(msg.node_id);
+        state.serverId = sid != null ? String(sid) : null;
         state.meta = {
             w: Number(one(msg.w)) || 0,
             h: Number(one(msg.h)) || 0,
@@ -1364,6 +1411,24 @@ function buildPreview(node) {
         state.aMips = state.a ? ladder(state.a) : null;
         state.bMips = state.b ? ladder(state.b) : null;
 
+        // The mask BEFORE the worker is seeded. The seed takes whatever
+        // maskFor() returns, and when it ran first that was the PREVIOUS run's
+        // mask: a newly wired mask was ignored by the draft, a removed one kept
+        // applying.
+        const maskB64 = one(msg.mask_png);
+        state.mask = null;
+        if (maskB64) {
+            const mimg = new Image();
+            await new Promise((res, rej) => {
+                mimg.onload = res; mimg.onerror = rej;
+                mimg.src = `data:image/png;base64,${maskB64}`;
+            });
+            state.maskImg = mimg;
+        } else {
+            state.maskImg = null;
+        }
+        if (!isNodeAlive(node)) return;
+
         // Hand the full tile to the worker. Copies, not transfers: the main
         // thread still needs these for the reduced settings, the A/B views and
         // the mask rasteriser. One 8MB copy per execution, against a repaint
@@ -1383,19 +1448,6 @@ function buildPreview(node) {
                 console.warn("[Bat_AdvancedBlend] could not seed the blend worker:", e);
                 workerReady = false;
             }
-        }
-
-        const maskB64 = one(msg.mask_png);
-        state.mask = null;
-        if (maskB64) {
-            const mimg = new Image();
-            await new Promise((res, rej) => {
-                mimg.onload = res; mimg.onerror = rej;
-                mimg.src = `data:image/png;base64,${maskB64}`;
-            });
-            state.maskImg = mimg;
-        } else {
-            state.maskImg = null;
         }
 
         blurs.clear();

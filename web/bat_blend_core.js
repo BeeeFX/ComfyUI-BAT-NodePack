@@ -55,7 +55,10 @@ export const BLEND_FNS = {
  */
 export function blurRGB(src, w, h, radius) {
     if (!(radius > 0)) return src;
-    const r0 = Math.round(radius);
+    // Half-up with a one-tap floor — `_kernel_radius()` in the Python, exactly.
+    // Without the floor a radius the tile scaling shrank below 0.5 blurred
+    // nothing here while the render did, and the draft showed no band split.
+    const r0 = Math.max(1, Math.floor(radius + 0.5));
     if (r0 <= 0) return src;
     const sigma = Math.max(radius / 2, 0.5);
 

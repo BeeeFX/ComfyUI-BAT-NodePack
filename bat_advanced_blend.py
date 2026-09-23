@@ -133,6 +133,7 @@ which is the only honest way to judge sharpening.
 
 import base64
 import logging
+import math
 from io import BytesIO
 
 import numpy as np
@@ -154,7 +155,7 @@ def _num(value, default: float, lo: float, hi: float) -> float:
     directions: neither can assume its input is sane. The endpoint is reachable
     over HTTP, and a saved workflow can carry impossible values — an early build
     of this node shifted them on copy/paste and wrote NaN into a radius, which
-    reaches `_blur` as `int(round(nan))` and raises mid-render. A silently
+    reached `_blur` as `int(round(nan))` and raised mid-render. A silently
     defaulted radius is a far better outcome than a traceback halfway through a
     queue, and the frontend repairs the node on load anyway.
     """
@@ -315,13 +316,18 @@ def _resize(img: torch.Tensor, out_h: int, out_w: int, filt: str) -> torch.Tenso
         return img[:, ys][:, :, xs]
 
     out = img
+    # `.contiguous()` before each matmul is the difference between one large
+    # GEMM and a slow batched path over the strided view: measured on CPU, a
+    # 1080p->4K lanczos conform went from several seconds a frame to a fraction
+    # of one (4-30x across runs), for the same arithmetic. The transposed
+    # weight matrix is fine as a view.
     if w != out_w:
         mx = _resample_matrix(w, out_w, filt, img.device, img.dtype)
         # (N,H,W,C) -> (N,H,C,W) @ (W,out_w) -> (N,H,C,out_w) -> back
-        out = (out.movedim(2, -1) @ mx.transpose(0, 1)).movedim(-1, 2)
+        out = (out.movedim(2, -1).contiguous() @ mx.transpose(0, 1)).movedim(-1, 2)
     if h != out_h:
         my = _resample_matrix(h, out_h, filt, img.device, img.dtype)
-        out = (out.movedim(1, -1) @ my.transpose(0, 1)).movedim(-1, 1)
+        out = (out.movedim(1, -1).contiguous() @ my.transpose(0, 1)).movedim(-1, 1)
     return out
 
 
@@ -342,6 +348,21 @@ def _gauss_kernel(radius: int, sigma: float, device, dtype) -> torch.Tensor:
     return k / k.sum()
 
 
+def _kernel_radius(radius: float) -> int:
+    """Half-width, in taps, of the Gaussian for a widget radius.
+
+    Round half UP, with a floor of one tap for any positive radius. Mirrored by
+    `blurRGB()` in web/bat_blend_core.js, which has to agree exactly. Python's
+    own `round()` is half-to-even and JS's `Math.round` is half-up, so the two
+    used to disagree at every .5 radius — and `round(0.5) == 0` made the
+    widget's own minimum split_radius a silent no-op: no blur, an empty high
+    band, and high_mix doing nothing at all.
+    """
+    if not radius > 0.0:
+        return 0
+    return max(1, int(math.floor(radius + 0.5)))
+
+
 def _blur(x: torch.Tensor, radius: float) -> torch.Tensor:
     """Separable Gaussian on an (N,H,W,C) tensor, reflect-padded.
 
@@ -351,7 +372,7 @@ def _blur(x: torch.Tensor, radius: float) -> torch.Tensor:
     """
     if radius <= 0.0:
         return x
-    r = int(round(radius))
+    r = _kernel_radius(radius)
     if r <= 0:
         return x
     sigma = max(radius / 2.0, 0.5)
@@ -965,6 +986,12 @@ class BatAdvancedBlend:
             "frames": [int(frames)],
             "preview_frame": [int(idx)],
         }
+        # The key the frame was cached under, for the full-resolution request.
+        # Not `node.id` on the client: inside a subgraph the executed id is the
+        # path ("12:5") and the node only knows its own local part, so every
+        # request missed the cache and the full layer silently never appeared.
+        if unique_id is not None:
+            ui["node_id"] = [str(unique_id)]
 
         t_a = hdr_tile(af, PREVIEW_TILE_DIM, sample="area")
         t_b = hdr_tile(bf, PREVIEW_TILE_DIM, sample="area")
@@ -1078,14 +1105,14 @@ def _cache_get(node_id):
 def _blur_margin(p):
     """Pixels of context an ROI needs so its interior matches a full-frame render.
 
-    `_blur` uses a kernel of half-width `round(radius)`, and `_core` chains at
-    most two of them per plate — the pre-blur, then the band split — so the
-    influence radius is the sum. Get this wrong and the ROI is correct in the
-    middle and wrong in a band around the edge, which is the sort of bug that
-    only shows up as a faint seam once the artist pans.
+    `_blur` uses a kernel of half-width `_kernel_radius(radius)`, and `_core`
+    chains at most two of them per plate — the pre-blur, then the band split —
+    so the influence radius is the sum. Get this wrong and the ROI is correct in
+    the middle and wrong in a band around the edge, which is the sort of bug
+    that only shows up as a faint seam once the artist pans.
     """
-    split = round(p["split_radius"]) if p["frequency_separation"] else 0
-    reach = max(round(p["soften_a"]), round(p["soften_b"])) + split
+    split = _kernel_radius(p["split_radius"]) if p["frequency_separation"] else 0
+    reach = max(_kernel_radius(p["soften_a"]), _kernel_radius(p["soften_b"])) + split
     return int(max(0, reach) + 2)
 
 
