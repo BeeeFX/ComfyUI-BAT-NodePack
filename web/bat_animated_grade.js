@@ -28,7 +28,7 @@ import { addBatFullscreen } from "./bat_fullscreen.js";
 import {
     hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
 } from "./bat_hdr_preview.js";
-import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_AnimatedGrade";
 
@@ -60,7 +60,7 @@ function _previewCacheKey(node) {
     return batNodeCacheKey(app, "bat_animgrade_preview", node);
 }
 function _saveCachedPreview(node, data) {
-    try { localStorage.setItem(_previewCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(_previewCacheKey(node), JSON.stringify(data)); }
     catch (_) {}
 }
 function _loadCachedPreview(node) {

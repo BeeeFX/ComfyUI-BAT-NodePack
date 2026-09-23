@@ -30,7 +30,7 @@
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
-import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 
 const NODE_TYPE = "Bat_AnimatedCrop";
@@ -48,7 +48,7 @@ function _previewCacheKey(node) {
     return batNodeCacheKey(app, "bat_animcrop_preview", node);
 }
 function _saveCachedPreview(node, data) {
-    try { localStorage.setItem(_previewCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(_previewCacheKey(node), JSON.stringify(data)); }
     catch (_) {}
 }
 function _loadCachedPreview(node) {
@@ -1355,7 +1355,9 @@ function buildEditor(node) {
 
     // Display-only zoom control (bottom-left of the canvas). Lets the artist
     // pull back to see the out-of-frame area for an off-canvas crop.
-    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl" });
+    // scope: root — the element this editor focuses, which is what makes the
+    // Nodes 2.0 wheel exemption apply (see bat_zoom_control.js).
+    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl", scope: root });
 
     // Re-clamp every axis-aligned keyframe rect back inside the canvas when
     // the artist turns "constrain to canvas" on. Called from the widget's

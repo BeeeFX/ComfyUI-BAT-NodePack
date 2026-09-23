@@ -39,7 +39,7 @@ import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
 import {
-    batReplayLastExecution, batTrack, batNodeCacheKey, batPreviewWillReplay,
+    batReplayLastExecution, batTrack, batNodeCacheKey, batCacheSet, batPreviewWillReplay,
 } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_HDRTonalComposite";
@@ -380,7 +380,7 @@ function blurMap(src, w, h, radius) {
 // Workflow-scoped: a bare node.id is only unique within one graph, so another
 // shot's composite with the same id restored THIS shot's plate.
 const cacheKey = (node) => batNodeCacheKey(app, "bat_hdrcomp_preview", node);
-function saveCache(node, d) { try { localStorage.setItem(cacheKey(node), JSON.stringify(d)); } catch (_) {} }
+function saveCache(node, d) { try { batCacheSet(cacheKey(node), JSON.stringify(d)); } catch (_) {} }
 function loadCache(node) {
     try { const r = localStorage.getItem(cacheKey(node)); return r ? JSON.parse(r) : null; }
     catch (_) { return null; }

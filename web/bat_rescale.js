@@ -51,7 +51,8 @@ import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import {
-    batTrack, isNodeAlive, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay,
+    batTrack, isNodeAlive, batNodeCacheKey, batCacheSet, batReplayLastExecution,
+    batPreviewWillReplay,
 } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Rescale";
@@ -205,7 +206,7 @@ function loadJson(key, fallback) {
     } catch (_) { return fallback; }
 }
 function saveJson(key, value) {
-    try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) {}
+    try { batCacheSet(key, JSON.stringify(value)); } catch (_) {}
 }
 
 

@@ -23,18 +23,20 @@ import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import {
     hdrSupported, decodeHdrTile, imageDataToSource, buildInspectBar,
 } from "./bat_hdr_preview.js";
-import { batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_Grade";
 
-// localStorage preview cache, keyed by node id. Mirrors the pattern in
-// bat_roto.js / bat_animated_crop.js — gives the live canvas something
-// to show on workflow reopen without bloating the workflow JSON.
+// localStorage preview cache. Mirrors the pattern in bat_roto.js /
+// bat_animated_crop.js — gives the live canvas something to show on workflow
+// reopen without bloating the workflow JSON. Workflow-scoped: a bare node.id
+// is only unique within one graph, so another workflow's Grade with the same
+// id showed this one's plate.
 function _previewCacheKey(node) {
-    return `bat_grade_preview_${node?.id ?? "_"}`;
+    return batNodeCacheKey(app, "bat_grade_preview", node);
 }
 function _saveCachedPreview(node, data) {
-    try { localStorage.setItem(_previewCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(_previewCacheKey(node), JSON.stringify(data)); }
     catch (_) {}
 }
 function _loadCachedPreview(node) {

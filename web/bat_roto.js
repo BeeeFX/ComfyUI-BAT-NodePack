@@ -40,7 +40,7 @@
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
-import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 
@@ -68,7 +68,7 @@ function _previewCacheKey(node) {
     return batNodeCacheKey(app, "bat_roto_preview", node);
 }
 function _saveCachedPreview(node, data) {
-    try { localStorage.setItem(_previewCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(_previewCacheKey(node), JSON.stringify(data)); }
     catch (_) { /* quota exceeded or storage disabled — fine, just skip */ }
 }
 function _loadCachedPreview(node) {

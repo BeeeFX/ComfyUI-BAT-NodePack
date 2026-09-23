@@ -57,8 +57,8 @@ import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
 import {
-    batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution,
-    batPreviewWillReplay,
+    batTrack, registerCleanup, batNodeCacheKey, batCacheSet, isNodeAlive,
+    batReplayLastExecution, batPreviewWillReplay,
 } from "./bat_lifecycle.js";
 import { exposeToSdr, encodeFromLinear, toLinear } from "./bat_transfer.js";
 
@@ -651,9 +651,7 @@ function buildBracketPreview(node) {
         // origin-wide localStorage budget shared with every other BAT node's
         // cache. Reopening shows the fallback until the next run.
         if (jpeg) {
-            try {
-                localStorage.setItem(cacheKey, JSON.stringify({ jpeg, meta: state.meta }));
-            } catch (_) {}
+            batCacheSet(cacheKey, JSON.stringify({ jpeg, meta: state.meta }));
         }
         schedule();
     };

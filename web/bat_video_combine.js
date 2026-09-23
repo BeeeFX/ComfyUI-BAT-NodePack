@@ -34,7 +34,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { batTrack, batNodeCacheKey, batReplayLastExecution } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution } from "./bat_lifecycle.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 
@@ -586,7 +586,7 @@ function _vcPreviewCacheKey(node) {
 function _vcSavePreview(node, preview) {
     try {
         if (!preview) localStorage.removeItem(_vcPreviewCacheKey(node));
-        else localStorage.setItem(_vcPreviewCacheKey(node), JSON.stringify(preview));
+        else batCacheSet(_vcPreviewCacheKey(node), JSON.stringify(preview));
     } catch (_) { /* quota exceeded / storage disabled — non-fatal */ }
 }
 

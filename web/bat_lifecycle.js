@@ -88,6 +88,90 @@ export function batNodeCacheKey(app, prefix, node) {
     return `${prefix}_${wf ?? batWorkflowKey(app)}_${sub}${node?.id ?? "_"}`;
 }
 
+// ─── localStorage budget for the preview caches ─────────────────────────────
+//
+// Every editor keeps a JPEG thumbnail per node so a reopened workflow shows its
+// plate before the next run. Those are 50–300 KB each, and they share the
+// origin's ~5 MB localStorage with ComfyUI's own unsaved-workflow drafts —
+// which, when a write hits the quota, evict the user's OLDEST DRAFTS to make
+// room (workflowDraftStoreV2.handleQuotaExceeded). Unbounded thumbnails would
+// quietly cost people their draft recovery. Since the caches became
+// per-workflow (batNodeCacheKey) they are no longer bounded by the node-id
+// range either, so they get an explicit budget: least-recently-written first
+// out once the total passes CACHE_BUDGET_CHARS.
+
+const CACHE_INDEX_KEY = "bat_cache_lru";
+/** Characters (UTF-16 units) BAT may hold — well under half the quota. */
+const CACHE_BUDGET_CHARS = 1_500_000;
+
+/**
+ * Prefixes of the per-node caches that were keyed by the page path before
+ * batNodeCacheKey used the workflow UUID ("bat_roto_preview_/_14"). Those
+ * keys can never be read again. Grade keyed on the bare node id.
+ */
+const LEGACY_PATH_PREFIXES = [
+    "bat_advblend_view_", "bat_advblend_preview_", "bat_animcrop_preview_",
+    "bat_animgrade_preview_", "bat_bracket_view_", "bat_bracket_preview_",
+    "bat_merge_view_", "bat_hdrcomp_preview_", "bat_hdrcomp_view_",
+    "bat_layered_view_", "bat_rescale_view_", "bat_rescale_src_",
+    "bat_roto_preview_", "bat_sec_plate_", "bat_vc_preview_", "bat_vc_view_",
+    "bat_framehold_tok_",
+];
+
+let legacySwept = false;
+
+/** Drop the orphaned path-scoped and id-only keys, once per page load. */
+function sweepLegacyCacheKeys() {
+    if (legacySwept) return;
+    legacySwept = true;
+    try {
+        const stale = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (!k) continue;
+            const path = LEGACY_PATH_PREFIXES.find((p) => k.startsWith(p));
+            if (path && k.charAt(path.length) === "/") stale.push(k);
+            else if (/^bat_grade_preview_(\d+|_)$/.test(k)) stale.push(k);
+        }
+        for (const k of stale) localStorage.removeItem(k);
+    } catch (_) { /* storage disabled — nothing to sweep */ }
+}
+
+function readCacheIndex() {
+    try {
+        const v = JSON.parse(localStorage.getItem(CACHE_INDEX_KEY) || "[]");
+        return Array.isArray(v)
+            ? v.filter((e) => e && typeof e.k === "string" && Number.isFinite(e.n))
+            : [];
+    } catch (_) { return []; }
+}
+
+/**
+ * localStorage.setItem for a per-node preview cache, within the pack's budget.
+ * Returns false when the value could not be stored (quota, storage disabled) —
+ * callers treat the cache as a convenience, never as state.
+ */
+export function batCacheSet(key, value) {
+    sweepLegacyCacheKeys();
+    try {
+        const size = key.length + value.length;
+        const index = readCacheIndex().filter((e) => e.k !== key);
+        let total = size;
+        for (const e of index) total += e.n;
+        while (total > CACHE_BUDGET_CHARS && index.length) {
+            const old = index.shift();
+            try { localStorage.removeItem(old.k); } catch (_) {}
+            total -= old.n;
+        }
+        localStorage.setItem(key, value);
+        index.push({ k: key, n: size });
+        localStorage.setItem(CACHE_INDEX_KEY, JSON.stringify(index));
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
 function bag(node) {
     if (!node[KEY]) {
         node[KEY] = {

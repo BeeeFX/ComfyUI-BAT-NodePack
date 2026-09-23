@@ -111,7 +111,7 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
+import { batTrack, registerCleanup, batNodeCacheKey, batCacheSet, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 import { blendTile, makeBlurCache, paintView, neutralHigh } from "./bat_blend_core.js";
 
@@ -1464,11 +1464,11 @@ function buildPreview(node) {
         // node's thumbnail cache, so stashing them there would evict the caches
         // that actually need to survive a reload.
         if (jpegA && jpegB) {
-            try {
-                localStorage.setItem(cacheKey, JSON.stringify({
-                    jpeg_a: jpegA, jpeg_b: jpegB, meta: state.meta,
-                }));
-            } catch (_) { /* quota — the preview repopulates on the next run */ }
+            // Within the pack's budget; a refusal just means the preview
+            // repopulates on the next run.
+            batCacheSet(cacheKey, JSON.stringify({
+                jpeg_a: jpegA, jpeg_b: jpegB, meta: state.meta,
+            }));
         }
 
         schedule(false);

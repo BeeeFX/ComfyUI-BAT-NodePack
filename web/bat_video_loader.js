@@ -1047,6 +1047,11 @@ function makePreviewWidget() {
 // When a Bat_VideoLoader node is the (only) selected node, arrow keys and
 // a few NLE-style bindings nudge / snap the trim handles. Skipped when the
 // active focus target is an input/textarea so the path popup keeps working.
+//
+// Capture phase, so a handled key goes no further. ComfyUI's own keybinding
+// handler is a bubble-phase listener on this same window, which a bubble-phase
+// stopPropagation here cannot reach — and it binds a bare "." to Fit View, so
+// nudging the handle by one frame also re-framed the whole canvas.
 
 function selectedTrimWidget() {
     const sel = app.canvas?.selected_nodes;
@@ -1092,7 +1097,7 @@ window.addEventListener("keydown", (e) => {
         if (!only || only === "start") debouncedFetchStart(node);
         if (!only || only === "end")   debouncedFetchEnd(node);
     }
-});
+}, true);
 
 // ─── Extension hook ─────────────────────────────────────────────────────────
 
@@ -1199,11 +1204,12 @@ app.registerExtension({
             // so the info-fetch there gets the right start/end.
             queueMicrotask(() => fetchVideoInfo(this));
 
-            // Resize node to fit (Nodes 1.0 only — clampNodeSize no-ops under
-            // 2.0, where the height comes from each widget's computeLayoutSize).
-            // Bump min width so the IN/OUT step button clusters + status line
-            // don't crowd each other, and add room for the preview pane below
-            // the trim widget.
+            // Resize node to fit. Bump min width so the IN/OUT step button
+            // clusters + status line don't crowd each other, and add room for
+            // the preview pane below the trim widget. Under 2.0 the height
+            // comes from each widget's computeLayoutSize, so only the width
+            // floor applies — without it a fresh node opened at the default
+            // ~250px, too narrow for the trim controls.
             if (!vueNodesEnabled()) {
                 const computed = this.computeSize();
                 this.size = [
@@ -1211,6 +1217,8 @@ app.registerExtension({
                     computed[1] + VIDEO_PANE_H,
                 ];
                 this.setDirtyCanvas?.(true, true);
+            } else {
+                clampNodeSize(this, 420, 0);
             }
             return r;
         };

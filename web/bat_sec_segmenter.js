@@ -46,7 +46,7 @@ import { api } from "../../scripts/api.js";
 import { chainCallback, resolveSourcePreview, captureVideoFrame } from "./bat_points_editor/utility.js";
 import { BaseEditorCanvas } from "./bat_points_editor/editor_base.js";
 import { BatPointsEditor } from "./bat_points_editor/point_editor_canvas.js";
-import { batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_SecSegmenter";
 
@@ -258,7 +258,7 @@ function stripCacheKey(node) {
 }
 
 function saveCachedPlate(node, data) {
-    try { localStorage.setItem(stripCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(stripCacheKey(node), JSON.stringify(data)); }
     catch (_) { /* quota or storage disabled — the plate is a convenience, not state */ }
 }
 
