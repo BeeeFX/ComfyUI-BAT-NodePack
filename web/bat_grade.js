@@ -51,10 +51,10 @@ export function gradeCoefficients(bp, wp, lift, gain, mult, off, liftMode) {
  * Current frontends save `widgets_values_named` beside the positional array,
  * which answers the question directly. Without it (an older frontend), look at
  * the value sitting in lift_mode's POSITIONAL slot — restore is positional —
- * rather than at the array's length: BAT DOM widgets serialise a trailing ""
- * (docs/review-2026-09.md), so an old Grade's 11-entry array holds that ""
- * exactly where lift_mode now sits, and a missing or foreign value there means
- * the save predates the widget.
+ * rather than at the array's length: BAT DOM widgets used to serialise a
+ * trailing "" (docs/review-2026-09.md), so an old Grade's 11-entry array holds
+ * that "" exactly where lift_mode now sits, and a missing or foreign value
+ * there means the save predates the widget.
  */
 export function savedBeforeLiftMode(node, info) {
     const named = info?.widgets_values_named;

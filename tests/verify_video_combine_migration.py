@@ -87,8 +87,11 @@ var api = {
 };
 var batTrack = function () {};
 var batNodeCacheKey = function () { return "test-key"; };
+// As the real helper: out of the API prompt (options) AND out of
+// widgets_values (widget.serialize). Saves made before the latter still carry
+// the player's "" — PLAYER below.
 var addBatDOMWidget = function (node, name, type, el, opts) {
-    var w = { name: name, type: type, element: el, options: { serialize: false } };
+    var w = { name: name, type: type, element: el, options: { serialize: false }, serialize: false };
     node.widgets.push(w);
     return w;
 };
@@ -258,10 +261,11 @@ def check(label, got, want):
         FAILURES.append(label)
 
 
-# The DOM player's value. The frontend writes it into widgets_values after the
-# codec entries (it only skips `widget.serialize === false`; the player sets
-# options.serialize alone), so every real saved array ends with it. Leaving it
-# out of these fixtures is what let the "" -> codec-slot bug through.
+# The DOM player's value. Until addBatDOMWidget set `widget.serialize = false`
+# the frontend wrote it into widgets_values after the codec entries (it only
+# skips `widget.serialize === false`), so every save from before then ends with
+# it. Leaving it out of these fixtures is what let the "" -> codec-slot bug
+# through; the "new save" case below has none.
 PLAYER = ""
 
 
@@ -352,6 +356,14 @@ def main():
         v = load(ctx, key, [24.0, 0, "B", fmt, False, True] + tail + [PLAYER])
         for name, value in want.items():
             check(f"{key}: {name}", v.get(name), value)
+
+    # ── A save made now: no player slot at all.
+    print("\nCurrent save without the player's value:")
+    v = load(ctx, "new-h265", [24.0, "B", "video/h265-mp4", True, 20, "yuv420p", "slow", "8"])
+    check("crf", v.get("crf"), 20)
+    check("preset", v.get("preset"), "slow")
+    check("bit_depth", v.get("bit_depth"), "8")
+    check("pix_fmt", v.get("pix_fmt"), "yuv420p")
 
     # ── An array from no known layout must be left alone, not scrambled.
     print("\nUnrecognisable widgets_values:")

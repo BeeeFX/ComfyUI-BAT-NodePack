@@ -195,6 +195,22 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
         return null;
     }
 
+    // `options.serialize: false` above only keeps the editor out of the API
+    // prompt. The WORKFLOW serialiser checks `widget.serialize` (frontend 1.55
+    // LGraphNode serialiseWidgetValues, which the frontend's own preview
+    // widgets set as well), so until this line every BAT editor wrote a ""
+    // into widgets_values after its real values.
+    //
+    // Old saves keep that stale slot, and that is safe only because every BAT
+    // DOM widget is the LAST widget on its node (tools/test_node_layout.py
+    // checks each editor): positional restore walks the widgets, not the
+    // values, so a trailing entry past the last serialised widget is never
+    // read. Keep editors that way — a serialised widget added after a DOM
+    // widget would load every pre-change save one slot out.
+    if (rest.serialize !== true) {
+        try { w.serialize = false; } catch (_) { /* frozen widget object */ }
+    }
+
     // The editor spans the node, always — see unpinWidgetWidth().
     unpinWidgetWidth(w);
 

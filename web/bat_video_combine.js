@@ -413,9 +413,9 @@ async function rebuildCodecWidgets(node, formatLabel, savedValues, opts) {
     // append we move the widget to just *before* the player, giving it a normal
     // row above the player. Codec widgets still sit after every static widget, so
     // positional widgets_values restore on load never shifts onto a static one.
-    // (The DOM player is options.serialize:false, which keeps it out of the API
-    // prompt; widgets_values still records its "" after the codec entries —
-    // onConfigure discards it.)
+    // (The DOM player is serialize:false, so neither the API prompt nor
+    // widgets_values carries it; older saves hold its "" after the codec
+    // entries, which onConfigure discards.)
     const playerIndex = () => node.widgets.findIndex((w) => w.name === "bat_video_player");
     const derived = def.derived || {};
     const preferMax = !!(opts && opts.preferMaxBitDepth);
@@ -1803,10 +1803,9 @@ app.registerExtension({
                     const tail = savedVals.slice(staticCount);
                     savedByName = {};
                     // "" is never a codec value (they are all COMBO / INT /
-                    // BOOLEAN) — it is the DOM player's own serialised value,
-                    // which the frontend writes after the codec entries: it
-                    // skips only `widget.serialize === false`, and the player
-                    // sets options.serialize (API prompt) alone. Where a knob
+                    // BOOLEAN) — it is the DOM player's own value, which every
+                    // save made before addBatDOMWidget set `widget.serialize =
+                    // false` carries after the codec entries. Where a knob
                     // was appended since the save, that "" sat in its slot,
                     // looked like a saved value, and stopped the inference
                     // below from recovering it (a 10-bit h264 reloaded 8-bit).

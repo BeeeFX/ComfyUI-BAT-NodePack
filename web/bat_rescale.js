@@ -85,9 +85,9 @@ const TRUTH_DEBOUNCE_MS = 80;
  * ==========================================================================
  *
  * `ringing` was appended after `preview_frame`, but the viewer's DOM widget
- * comes after both, and it only sets `options.serialize: false` (which keeps
- * it out of the API prompt) — not `widget.serialize = false`, the flag the
- * workflow serialiser checks. So every earlier save ends
+ * comes after both, and until addBatDOMWidget set `widget.serialize = false`
+ * it only had `options.serialize: false` (which keeps it out of the API
+ * prompt, not out of widgets_values). So every earlier save ends
  * [..., preview_frame, <viewer value>], and positional restore hands that
  * trailing "" / null to `ringing`: a combo value not in its list, which fails
  * validation the moment the workflow is queued.
