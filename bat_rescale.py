@@ -124,6 +124,11 @@ MAX_OUT_DIM = 4096
 # past that the LRU evicts and the oldest node's viewer asks for a re-run.
 CACHE_MAX_BYTES = 400 << 20
 
+# Ceiling on the memoised resample matrices. The memo exists for the node's own
+# chunk loop, where two matrices are reused for every chunk; a count limit alone
+# let an 8x upscale (a 30720x3840 matrix is 470MB) stack dozens of them.
+MATRIX_CACHE_MAX_BYTES = 512 << 20
+
 
 # ---------------------------------------------------------------------------
 # Size planning
@@ -212,7 +217,7 @@ def _area_weights(x):
 
 
 def _map_matrix(src_lo, src_hi, slab_lo, n_slab, n_out, filt,
-                device, dtype, _cache={}):
+                device, dtype, memo=True, _cache={}):
     """(n_out, n_slab) weights resampling a source interval to `n_out` samples.
 
     Coordinates are in source pixels of the FULL frame; the slab handed to the
@@ -222,15 +227,20 @@ def _map_matrix(src_lo, src_hi, slab_lo, n_slab, n_out, filt,
     their own and land on precisely the grid the full resize would have used.
 
     Memoised: the frame loop is chunked, and rebuilding the matrix per chunk
-    costs more than the resample.
+    costs more than the resample. The preview passes ``memo=False``: its keys
+    carry the pan offset, so they almost never repeat, and memoising them only
+    parked matrices in VRAM that nothing would ask for again.
     """
     key = (float(src_lo), float(src_hi), int(slab_lo), int(n_slab), int(n_out),
            filt, str(device), str(dtype))
-    hit = _cache.get(key)
+    hit = _cache.get(key) if memo else None
     if hit is not None:
         return hit
-    if len(_cache) > 64:
-        _cache.clear()
+    if memo:
+        held = sum(t.numel() * t.element_size() for t in _cache.values())
+        new = int(n_out) * int(n_slab) * torch.empty((), dtype=dtype).element_size()
+        if len(_cache) > 64 or held + new > MATRIX_CACHE_MAX_BYTES:
+            _cache.clear()
 
     span = max(float(src_hi) - float(src_lo), 1e-9)
     scale = n_out / span                       # output samples per source pixel
@@ -263,7 +273,8 @@ def _map_matrix(src_lo, src_hi, slab_lo, n_slab, n_out, filt,
         s = w.sum(dim=1, keepdim=True)
 
     out = (w / s).to(dtype)
-    _cache[key] = out
+    if memo:
+        _cache[key] = out
     return out
 
 
@@ -278,13 +289,14 @@ def _nearest_index(src_lo, src_hi, slab_lo, n_slab, n_out, device):
 
 def resample_region(img, out_h, out_w, filt,
                     src_x=0.0, src_y=0.0, src_w=None, src_h=None,
-                    off_x=0, off_y=0):
+                    off_x=0, off_y=0, memo=True):
     """Resample the source interval ``(src_x, src_y, src_w, src_h)`` of `img` to
     ``out_h`` x ``out_w``.
 
     `img` is (N, H, W, C) float. ``off_x`` / ``off_y`` say where `img` sits in
     the coordinate system the interval is expressed in, so a slab cut out of a
     bigger frame can be passed straight in. Nothing is clamped or quantised.
+    ``memo`` is handed to `_map_matrix`.
     """
     n, h, w, c = img.shape
     if src_w is None:
@@ -300,12 +312,16 @@ def resample_region(img, out_h, out_w, filt,
         return out[:, ys][:, :, xs]
 
     mx = _map_matrix(src_x, src_x + src_w, off_x, w, out_w,
-                     filt, img.device, img.dtype)
+                     filt, img.device, img.dtype, memo)
     # (N,H,W,C) -> (N,H,C,W) @ (W,out_w) -> (N,H,C,out_w) -> back
-    out = (out.movedim(2, -1) @ mx.transpose(0, 1)).movedim(-1, 2)
+    #
+    # `.contiguous()` before each matmul is worth 8-10x on CPU, where IMAGE
+    # tensors live: a batched matmul on a movedim()ed, strided view falls off
+    # BLAS's fast path (measured 2.6s -> 0.3s for one 4K frame to 540p).
+    out = (out.movedim(2, -1).contiguous() @ mx.transpose(0, 1)).movedim(-1, 2)
     my = _map_matrix(src_y, src_y + src_h, off_y, h, out_h,
-                     filt, img.device, img.dtype)
-    out = (out.movedim(1, -1) @ my.transpose(0, 1)).movedim(-1, 1)
+                     filt, img.device, img.dtype, memo)
+    out = (out.movedim(1, -1).contiguous() @ my.transpose(0, 1)).movedim(-1, 1)
     return out
 
 
@@ -554,10 +570,15 @@ class BatRescale:
             "out_w": [out_w], "out_h": [out_h],
             "preview_frame": [idx],
             "scale": [float(out_w) / w],
+            # The viewer plans its sizes itself and has no way to learn an
+            # IMAGE's size in the browser, so match_reference previewed as a
+            # 1:1 no-op until these were shipped. 0 = nothing connected.
+            "ref_w": [int(ref_w or 0)], "ref_h": [int(ref_h or 0)],
         }
         if unique_id is not None:
             try:
-                ui.update(self._cache_preview(unique_id, image, idx, n, w, h))
+                ui.update(self._cache_preview(unique_id, image, idx, n, w, h,
+                                              ref_w, ref_h))
             except Exception as exc:
                 # A preview is never worth failing a render over.
                 logger.warning("Bat_Rescale: could not cache the preview frame "
@@ -567,7 +588,8 @@ class BatRescale:
                                      float(out_w) / w)}
 
     # ------------------------------------------------------------------
-    def _cache_preview(self, unique_id, image, idx, n, w, h):
+    def _cache_preview(self, unique_id, image, idx, n, w, h,
+                       ref_w=None, ref_h=None):
         """Park the anchor frame for the full-resolution preview service.
 
         `.clone()` rather than a view: a view of the input batch keeps the whole
@@ -582,7 +604,8 @@ class BatRescale:
         token = uuid.uuid4().hex[:16]
         _cache_put(token, unique_id, frame, image,
                    {"frames": int(n), "frame": int(idx),
-                    "w": int(w), "h": int(h)})
+                    "w": int(w), "h": int(h),
+                    "ref_w": int(ref_w or 0), "ref_h": int(ref_h or 0)})
 
         # 8-bit whole-frame thumbnail. Two jobs: it is the fit-view draft the
         # browser scales while the truth is in flight, and it is the only thing
@@ -641,9 +664,13 @@ def render_pair(entry, p, roi, out_w, out_h, frame_index, magnify="smooth"):
     frame, exact = _frame_for(entry, frame_index)
     fh, fw = int(frame.shape[1]), int(frame.shape[2])
 
+    # The reference's size as the last run saw it, unless the request names one.
+    meta = entry.get("meta") or {}
+    ref_h = p.get("ref_h") or meta.get("ref_h") or None
+    ref_w = p.get("ref_w") or meta.get("ref_w") or None
     out_full_h, out_full_w = plan_size(
         fh, fw, p["mode"], p["scale"], p["target"], p["megapixels"],
-        p["multiple_of"], p.get("ref_h"), p.get("ref_w"))
+        p["multiple_of"], ref_h, ref_w)
     sx, sy = out_full_w / fw, out_full_h / fh
 
     x, y, rw, rh = (float(v) for v in roi)
@@ -689,8 +716,9 @@ def render_pair(entry, p, roi, out_w, out_h, frame_index, magnify="smooth"):
     slab_x0, slab_x1 = _pad_interval(dx0 / sx, dx1 / sx, dw, filt, 0, fw)
     slab_y0, slab_y1 = _pad_interval(dy0 / sy, dy1 / sy, dh, filt, 0, fh)
 
-    device = torch.device("cuda") if torch.cuda.is_available() else frame.device
+    device = _preview_device()
 
+    # memo=False throughout: see _map_matrix. Every key here carries the pan.
     def _work(dev):
         slab = frame[:, slab_y0:slab_y1, slab_x0:slab_x1].to(dev, non_blocking=True)
         # The rescale, on the real destination grid: bit-identical to cropping
@@ -698,20 +726,20 @@ def render_pair(entry, p, roi, out_w, out_h, frame_index, magnify="smooth"):
         scaled = resample_region(slab, dh, dw, filt,
                                  src_x=dx0 / sx, src_y=dy0 / sy,
                                  src_w=dw / sx, src_h=dh / sy,
-                                 off_x=slab_x0, off_y=slab_y0)
+                                 off_x=slab_x0, off_y=slab_y0, memo=False)
         # Back up to the screen box. This is the display decision, and it is why
         # the picture does not change size when the resolution does.
         shown = resample_region(scaled, out_h, out_w, magnify_filt,
                                 src_x=dsx0, src_y=dsy0,
                                 src_w=dsx1 - dsx0, src_h=dsy1 - dsy0,
-                                off_x=dx0, off_y=dy0)
+                                off_x=dx0, off_y=dy0, memo=False)
         # The unscaled half: the same source area, straight to the screen box,
         # with no trip through the destination grid.
         ref = resample_region(slab, out_h, out_w,
                               _up_filter(sx1 - sx0, sy1 - sy0, out_w, out_h),
                               src_x=sx0, src_y=sy0,
                               src_w=sx1 - sx0, src_h=sy1 - sy0,
-                              off_x=slab_x0, off_y=slab_y0)
+                              off_x=slab_x0, off_y=slab_y0, memo=False)
         return ref, shown
 
     try:
@@ -756,6 +784,20 @@ def render_pair(entry, p, roi, out_w, out_h, frame_index, magnify="smooth"):
         "magnify": "nearest" if magnify == "nearest" else "smooth",
     }
     return u8, info
+
+
+def _preview_device():
+    """Where the preview renders: ComfyUI's own compute device.
+
+    Asking ComfyUI rather than `torch.cuda.is_available()` is what makes
+    ``--cpu`` mean CPU here too, and picks up MPS / XPU / DirectML. The
+    fallback is for running outside ComfyUI (the tests).
+    """
+    try:
+        import comfy.model_management as mm
+        return mm.get_torch_device()
+    except Exception:
+        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def _up_filter(in_w, in_h, out_w, out_h):
@@ -813,6 +855,8 @@ try:
             "src_h": int(entry["frame"].shape[1]),
             # Whether the viewer can scrub frames without a re-run.
             "live_batch": bool(ref is not None and ref() is not None),
+            "ref_w": int(entry["meta"].get("ref_w", 0) or 0),
+            "ref_h": int(entry["meta"].get("ref_h", 0) or 0),
         })
 
     @server.PromptServer.instance.routes.post("/bat/rescale/render")

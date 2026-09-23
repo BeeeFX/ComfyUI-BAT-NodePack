@@ -38,7 +38,9 @@ import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batReplayLastExecution } from "./bat_lifecycle.js";
+import {
+    batReplayLastExecution, batTrack, batNodeCacheKey, batPreviewWillReplay,
+} from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_HDRTonalComposite";
 const MAX_HDR_VERSIONS = 8;   // must match MAX_HDR_VERSIONS in the .py
@@ -375,15 +377,18 @@ function blurMap(src, w, h, radius) {
 }
 
 // ── preview cache (JPEG only — see the note in bat_grade.js) ─────────────
-const cacheKey = (node) => `bat_hdrcomp_preview_${node?.id ?? "_"}`;
+// Workflow-scoped: a bare node.id is only unique within one graph, so another
+// shot's composite with the same id restored THIS shot's plate.
+const cacheKey = (node) => batNodeCacheKey(app, "bat_hdrcomp_preview", node);
 function saveCache(node, d) { try { localStorage.setItem(cacheKey(node), JSON.stringify(d)); } catch (_) {} }
 function loadCache(node) {
     try { const r = localStorage.getItem(cacheKey(node)); return r ? JSON.parse(r) : null; }
     catch (_) { return null; }
 }
-const viewKey = (node) => `bat_hdrcomp_view_${node?.id ?? "_"}`;
+const viewKey = (node) => batNodeCacheKey(app, "bat_hdrcomp_view", node);
 
 function buildPreview(node) {
+    const track = batTrack(node);
     const root = document.createElement("div");
     root.style.cssText = `position:relative; display:flex; flex-direction:column;
         background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; overflow:hidden;`;
@@ -767,7 +772,10 @@ function buildPreview(node) {
         e.stopPropagation(); state.holding = true; applyComposite();
     });
     const release = () => { if (state.holding) { state.holding = false; applyComposite(); } };
-    window.addEventListener("pointerup", release);
+    // Tracked: a bare window listener outlived the node and kept this whole
+    // closure — both decoded tiles and every per-pixel buffer — alive, once
+    // per node ever built (and an undo rebuilds every node).
+    track.listener(window, "pointerup", release);
     canvas.addEventListener("pointerleave", () => { probe.style.display = "none"; release(); });
 
     // Value probe.
@@ -874,6 +882,10 @@ function buildPreview(node) {
     // cached — the two 16-bit tiles are a few hundred KB each and localStorage
     // is a ~5MB origin-wide budget shared with every other BAT node's cache.
     node._batHdrCompRestore = () => {
+        // A replay of this session's last run is coming with both 16-bit
+        // tiles. This JPEG's decode could land after it and, having no HDR
+        // tile of its own, blank the composite back to "plate only".
+        if (batPreviewWillReplay(node)) return;
         const c = loadCache(node);
         if (!c?.jpeg) return;
         node._batHdrCompIngest({ plate_jpeg: [c.jpeg], ...(c.meta ? {

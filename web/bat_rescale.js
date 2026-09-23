@@ -47,6 +47,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import {
@@ -577,7 +578,9 @@ function buildViewer(node) {
 
         let res;
         try {
-            res = await fetch("/bat/rescale/render", {
+            // fetchApi, not a bare fetch: it resolves the route against
+            // ComfyUI's base URL, so a subpath-hosted server still answers.
+            res = await api.fetchApi("/bat/rescale/render", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(body),
@@ -1221,6 +1224,9 @@ function buildViewer(node) {
         state.frames = Number(one(msg.frames)) || 1;
         state.srcW = Number(one(msg.src_w)) || state.srcW;
         state.srcH = Number(one(msg.src_h)) || state.srcH;
+        // match_reference's target size. 0 = no reference connected.
+        state.refW = Number(one(msg.ref_w)) || 0;
+        state.refH = Number(one(msg.ref_h)) || 0;
         state.liveBatch = true;      // fresh run: the batch is in Comfy's cache
         const anchor = Number(one(msg.preview_frame));
         state.anchorFrame = Number.isFinite(anchor) ? anchor : null;
@@ -1235,6 +1241,7 @@ function buildViewer(node) {
             saveJson(cacheKey(node), {
                 thumb, token: state.token, frames: state.frames,
                 src_w: state.srcW, src_h: state.srcH,
+                ref_w: state.refW || 0, ref_h: state.refH || 0,
                 anchor: state.anchorFrame,
             });
         }
@@ -1254,6 +1261,8 @@ function buildViewer(node) {
         state.frames = Number(cached.frames) || 1;
         state.srcW = Number(cached.src_w) || 0;
         state.srcH = Number(cached.src_h) || 0;
+        state.refW = Number(cached.ref_w) || 0;
+        state.refH = Number(cached.ref_h) || 0;
         state.anchorFrame = Number.isFinite(Number(cached.anchor))
             ? Number(cached.anchor) : null;
         try { await loadThumb(cached.thumb); } catch (_) {}
@@ -1264,7 +1273,7 @@ function buildViewer(node) {
         // viewer comes back fully — truth layer included — with no re-run.
         if (!cached.token) return;
         try {
-            const r = await fetch(`/bat/rescale/info?token=${encodeURIComponent(cached.token)}`);
+            const r = await api.fetchApi(`/bat/rescale/info?token=${encodeURIComponent(cached.token)}`);
             const j = await r.json();
             if (!isNodeAlive(node) || !j?.ok) return;
             state.token = cached.token;
@@ -1272,6 +1281,7 @@ function buildViewer(node) {
             state.srcW = Number(j.src_w) || state.srcW;
             state.srcH = Number(j.src_h) || state.srcH;
             state.liveBatch = !!j.live_batch;
+            if (j.ref_w && j.ref_h) { state.refW = Number(j.ref_w); state.refH = Number(j.ref_h); }
             if (Number.isFinite(Number(j.frame))) state.anchorFrame = Number(j.frame);
             paintChrome();
             requestTruth(true);
@@ -1281,8 +1291,9 @@ function buildViewer(node) {
     /* ---- reference input ------------------------------------------------- */
 
     // match_reference needs the reference plate's size to show the output
-    // resolution before a run. Nothing in the frontend knows an image's size,
-    // so the readout says so rather than guessing.
+    // resolution. Nothing in the frontend knows an image's size, so each run
+    // reports it (ref_w / ref_h in the ingest above); until the first run the
+    // readout shows the source size rather than guessing.
     node._batRescaleRefSize = (h, w) => { state.refH = h; state.refW = w; draw(); };
 
     /* ---- keep up with the panel ------------------------------------------ */

@@ -371,6 +371,41 @@ def test_divider_hit_test():
 
 
 # ---------------------------------------------------------------------------
+# 4b. match_reference reaches the preview; the preview parks no matrices
+# ---------------------------------------------------------------------------
+
+def test_preview_reference_and_memo():
+    """Two regressions in the preview service.
+
+    match_reference used to preview as a 1:1 no-op: the browser cannot measure
+    an IMAGE, nothing shipped the reference's size, so the viewer and the
+    server both planned a passthrough while the node itself resized. And every
+    preview render memoised its matrices under keys that carry the pan offset,
+    which never repeat — on a GPU that was VRAM held for nothing.
+    """
+    src = _plate(120, 160, seed=5)
+    ref = torch.zeros(1, 45, 80, 3)
+    res = rescale.BatRescale().run(src, "match_reference", 1.0, 1024, 1.0,
+                                   "lanczos", 1, False, reference=ref)
+    ui = res["ui"]
+    check("run() ships the reference size in ui",
+          ui.get("ref_w") == [80] and ui.get("ref_h") == [45],
+          f"ref_w={ui.get('ref_w')} ref_h={ui.get('ref_h')}")
+
+    entry = {"frame": src, "batch": None,
+             "meta": {"frame": 0, "ref_w": 80, "ref_h": 45}}
+    p = rescale.params_from_request({"mode": "match_reference"})
+    cache = rescale._map_matrix.__defaults__[-1]
+    cache.clear()
+    before = len(cache)
+    _u8, info = rescale.render_pair(entry, p, [0, 0, 160, 120], 160, 120, 0)
+    check("render_pair falls back to the cached reference size",
+          info["res"] == [80, 45], f"res={info['res']}")
+    check("preview renders do not grow the matrix memo",
+          len(cache) == before, f"{before} -> {len(cache)} entries")
+
+
+# ---------------------------------------------------------------------------
 # 5. The extension parses, registers, and keeps its hands off other nodes
 # ---------------------------------------------------------------------------
 
@@ -420,6 +455,7 @@ if __name__ == "__main__":
     test_blend_parity()
     test_plan_size_parity()
     test_divider_hit_test()
+    test_preview_reference_and_memo()
     test_extension_loads()
     print()
     if FAILURES:

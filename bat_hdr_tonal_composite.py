@@ -303,6 +303,7 @@ _VIEW_LUT_MIN_EV, _VIEW_LUT_MAX_EV = -12.0, 12.0
 MAX_HDR_VERSIONS = 8
 
 _view_lut_cache = {}
+_view_choices_cache = None
 
 
 def _ocio_view_choices():
@@ -312,7 +313,13 @@ def _ocio_view_choices():
     the artist picks from a list rather than typing a name that has to match
     exactly. "(off)" first: the LUT is ~95 KB on every execution and most
     graphs do not need it.
+
+    Memoised for the process: INPUT_TYPES runs several times per queued prompt
+    (validation, input lookup, execution), and each call re-parsed the config.
     """
+    global _view_choices_cache
+    if _view_choices_cache is not None:
+        return list(_view_choices_cache)
     choices = ["(off)"]
     try:
         import PyOpenColorIO as ocio
@@ -324,7 +331,8 @@ def _ocio_view_choices():
             choices += outs + [n for n in names if n not in outs]
     except Exception as exc:
         logger.info("no OCIO config for the preview view list (%s)", exc)
-    return choices
+    _view_choices_cache = choices
+    return list(choices)
 
 
 def _find_ocio_config():
@@ -1113,6 +1121,18 @@ class BatHDRTonalComposite:
             },
         }
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, preview_ocio_view="(off)"):
+        """Accept any preview_ocio_view, including one this machine lacks.
+
+        Its list is read from the LOCAL OCIO config, so a workflow saved where a
+        view was picked failed "Value not in list" — the whole prompt, over a
+        display-only widget — anywhere that config is missing. Naming the input
+        here is what skips the stock combo check (execution.py); `composite`
+        then treats an unknown view as "(off)".
+        """
+        return True
+
     RETURN_TYPES = ("IMAGE", "IMAGE") * MAX_HDR_VERSIONS
     RETURN_NAMES = tuple(
         n for i in range(MAX_HDR_VERSIONS)
@@ -1223,6 +1243,12 @@ class BatHDRTonalComposite:
         # The LUT's source is the plate's primaries, which is what the canvas
         # works in — NOT linear_out_primaries, which is applied downstream of
         # everything the canvas ever sees.
+        if (preview_ocio_view and preview_ocio_view != "(off)"
+                and preview_ocio_view not in _ocio_view_choices()):
+            logger.warning("preview_ocio_view %r is not in this machine's OCIO "
+                           "config; the canvas preview falls back to its gamma "
+                           "encodes (treated as \"(off)\")", preview_ocio_view)
+            preview_ocio_view = "(off)"
         if preview_ocio_view and preview_ocio_view != "(off)":
             lut = _view_lut(str(preview_ocio_view), "rec709")
             if lut is not None:

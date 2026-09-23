@@ -58,6 +58,7 @@ import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
 import {
     batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution,
+    batPreviewWillReplay,
 } from "./bat_lifecycle.js";
 import { exposeToSdr, encodeFromLinear, toLinear } from "./bat_transfer.js";
 
@@ -67,12 +68,16 @@ const PIPE_TYPE = "BAT_BRACKET";
 const MAX_STOPS = 8;          // must match MAX_STOPS in bat_exposure_bracket.py
 
 // ── mirror of parse_stops / build_stops in the .py ───────────────────────
+// Same pattern as _STOP_RE in the .py. parseFloat() read "-2ev" as -2 where
+// Python refused it, so the slots were labelled with stops the render never
+// used; one grammar on both sides is what keeps the labels honest.
+const STOP_RE = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
 function parseStops(text) {
     if (!text || !text.trim()) return null;
     const out = [];
     for (const tok of text.replace(/,/g, " ").split(/\s+/)) {
         if (!tok) continue;
-        const v = parseFloat(tok);
+        const v = STOP_RE.test(tok) ? Number(tok) : NaN;
         if (!isFinite(v)) return null;      // same refusal-to-guess as Python
         out.push(v);
     }
@@ -654,6 +659,9 @@ function buildBracketPreview(node) {
     };
 
     node._batBracketRestore = () => {
+        // A replay of this session's last run is on its way with the 16-bit
+        // tile; an 8-bit JPEG decoded here could land after it and win.
+        if (batPreviewWillReplay(node)) return;
         let c = null;
         try { c = JSON.parse(localStorage.getItem(cacheKey) || "null"); } catch (_) {}
         if (!c?.jpeg) return;
@@ -695,7 +703,8 @@ const PASS_HUES = [
 
 /**
  * Mirror of `_alignment` — one scalar per pass, bringing them onto the
- * reference's scale.
+ * plate's scale: measured against the reference pass, which is then taken
+ * back to 0 EV by its own nominal 2^-ev.
  *
  * The `auto` branch measures over the tile, not the frame, so it is an
  * estimate; the caller labels it as one. Everything else, including the
@@ -714,16 +723,16 @@ function computeAlignment(passes, plateLin, w, h, mode, align, reference, sigma)
         : passes.reduce((best, p, i) => (Math.abs(p.ev) < Math.abs(passes[best].ev) ? i : best), 0);
 
     if (align === "nominal") {
-        return { scales: nominal.map((k) => k / nominal[refIdx]), measured: false, refIdx };
+        return { scales: nominal.slice(), measured: false, refIdx };
     }
-    if (n === 1) return { scales: [1], measured: false, refIdx };
+    if (n === 1) return { scales: [nominal[refIdx]], measured: false, refIdx };
 
     const total = w * h;
     const wRef = passWeights(plateLin, w, h, passes[refIdx].ev, mode, sigma);
     const scales = [];
     let anyMeasured = false;
     for (let i = 0; i < n; i++) {
-        if (i === refIdx) { scales.push(1); continue; }
+        if (i === refIdx) { scales.push(nominal[refIdx]); continue; }
         const wI = passWeights(plateLin, w, h, passes[i].ev, mode, sigma);
         let ovSum = 0, den = 0, num = 0;
         const refData = passes[refIdx].lin, iData = passes[i].lin;
@@ -743,7 +752,7 @@ function computeAlignment(passes, plateLin, w, h, mode, align, reference, sigma)
             if (!isFinite(k) || k < K_MIN || k > K_MAX) k = nominal[i] / nominal[refIdx];
             else anyMeasured = true;
         }
-        scales.push(k);
+        scales.push(k * nominal[refIdx]);
     }
     return { scales, measured: anyMeasured, refIdx };
 }
