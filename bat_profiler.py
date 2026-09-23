@@ -63,8 +63,10 @@ Measurement notes / honest caveats
 * **Async / lazy nodes** re-enter ``execute`` (it returns PENDING and is
   called again). Records accumulate rather than overwrite: time sums,
   peaks take a max, deltas span first-entry to last-exit. For a truly
-  async node the wall time inside ``execute`` is not the work's
-  duration, and the row is flagged so the panel can say so.
+  async node the wall time inside ``execute`` is only the launch and the
+  collect, so its row is flagged ``async_node`` and its duration is the
+  wall span from first entry to last exit instead (which overlaps
+  whatever else ran meanwhile).
 
 Nothing in here may ever break execution. Every probe is wrapped; a
 profiler failure disables the profiler, it does not fail the prompt.
@@ -496,8 +498,11 @@ class NodeRecord:
 
 
 class RunRecord:
-    def __init__(self, prompt_id: str):
+    def __init__(self, prompt_id: str, client_id: Optional[str] = None):
         self.prompt_id = prompt_id
+        # The browser that submitted the prompt. Every event about this
+        # run goes to that socket only — see _send().
+        self.client_id = client_id
         self.workflow: Optional[str] = None
         self.started = time.time()
         self.ended: Optional[float] = None
@@ -541,7 +546,9 @@ class RunRecord:
         d["baseline"] = self.baseline
         d["nodes"] = [self.nodes[nid].to_dict() for nid in self.order]
         if with_samples:
-            d["samples"] = self.samples
+            # A copy: the caller serialises after releasing _lock, while
+            # the sampler keeps appending to (and decimating) the list.
+            d["samples"] = list(self.samples)
         return d
 
 
@@ -555,9 +562,11 @@ _history: deque = deque(maxlen=CONFIG.max_runs)
 # run is attributed to the tab that submitted it even if the user
 # switches tabs while it executes.
 _claims: Dict[str, str] = {}
-# unique_id -> (bytes_in, bytes_out, desc_in, desc_out), handed from the
-# get_output_data hook to the execute hook. Sizes only, never objects.
-_payloads: Dict[str, Tuple[int, int, Optional[str], Optional[str]]] = {}
+# unique_id -> (bytes_in, bytes_out, desc_in, desc_out, pending), handed
+# from the get_output_data hook to the execute hook. Sizes only, never
+# objects. Written on *entry* too, so a node that raises inside its own
+# function still counts as executed rather than as a cache hit.
+_payloads: Dict[str, Tuple[int, int, Optional[str], Optional[str], bool]] = {}
 
 
 def claim(prompt_id: str, workflow: Optional[str]) -> None:
@@ -612,15 +621,17 @@ def state_payload(workflow: Optional[str] = None,
 # ─────────────────────────────────────────────────────────────────────
 # Broadcast
 # ─────────────────────────────────────────────────────────────────────
-def _send(event: str, data: Dict[str, Any]) -> None:
+def _send(event: str, data: Dict[str, Any], sid: Optional[str] = None) -> None:
     try:
         from server import PromptServer
         inst = PromptServer.instance
         if inst is None:
             return
-        # Broadcast (sid=None): the panel is a monitor, and a second
-        # browser window watching the same box is a legitimate use.
-        inst.send_sync(event, data, None)
+        # To the submitting browser only. This used to broadcast, and
+        # every other artist's page — panel open or not — filed the run
+        # into its own localStorage, under whatever workflow it had open.
+        # sid=None (a run from no client) still broadcasts.
+        inst.send_sync(event, data, sid)
     except Exception:
         pass
 
@@ -734,7 +745,9 @@ class Sampler(threading.Thread):
                         self._pending.append(sample)
                         if (now - last_flush) >= 0.5 and self._pending:
                             _send("bat.profiler.samples",
-                                  {"prompt_id": run.prompt_id, "samples": self._pending})
+                                  {"prompt_id": run.prompt_id, "client_id": run.client_id,
+                                   "samples": self._pending},
+                                  run.client_id)
                             self._pending = []
                             last_flush = now
                     elif self._pending:
@@ -779,14 +792,14 @@ _orig_get_output_data = None
 _orig_execute_async = None
 
 
-def _begin_run(prompt_id: str) -> RunRecord:
+def _begin_run(prompt_id: str, client_id: Optional[str] = None) -> RunRecord:
     global _current
     with _lock:
         if _current is not None and _current.prompt_id == prompt_id:
             return _current
         if _current is not None:
             _end_run_locked("interrupted")
-        run = RunRecord(prompt_id)
+        run = RunRecord(prompt_id, client_id)
         run.workflow = _claims.get(prompt_id)
         cu = cuda_stats(include_device=True)
         used, total = sys_ram()
@@ -806,7 +819,9 @@ def _begin_run(prompt_id: str) -> RunRecord:
     ensure_sampler()
     if _sampler is not None:
         _sampler.wake()
-    _send("bat.profiler.run", {"phase": "start", "run": run.summary(), "baseline": run.baseline})
+    _send("bat.profiler.run", {"phase": "start", "client_id": run.client_id,
+                               "run": run.summary(), "baseline": run.baseline},
+          run.client_id)
     return run
 
 
@@ -864,14 +879,19 @@ def _end_run(status: str, prompt: Optional[Dict[str, Any]] = None, caches=None) 
                 _note_unvisited(run, prompt, caches)
             except Exception:
                 pass
+        # Cancel reaches us as an ordinary failed node (execute() turns
+        # InterruptProcessingException into FAILURE), so tell it apart here.
+        if status == "error" and run is not None and (run.error or {}).get("interrupted"):
+            status = "interrupted"
         run = _end_run_locked(status)
+        if run is not None:
+            payload = {"phase": "end", "client_id": run.client_id, "run": run.summary(),
+                       "nodes": [run.nodes[n].to_dict() for n in run.order
+                                 if run.nodes[n].entries == 0]}
     if run is not None:
         # The end message carries the rows that were never streamed
         # live, because execute() never ran for them.
-        _send("bat.profiler.run",
-              {"phase": "end", "run": run.summary(),
-               "nodes": [run.nodes[n].to_dict() for n in run.order
-                         if run.nodes[n].entries == 0]})
+        _send("bat.profiler.run", payload, run.client_id)
 
 
 async def _wrapped_get_output_data(prompt_id, unique_id, obj, input_data_all, *a, **kw):
@@ -884,6 +904,10 @@ async def _wrapped_get_output_data(prompt_id, unique_id, obj, input_data_all, *a
     if profiling:
         try:
             b_in, d_in = payload_bytes(input_data_all)
+            # Entered = executed, even if the node's function then raises:
+            # the node that OOMs must not be filed as a cache hit.
+            with _lock:
+                _payloads[str(unique_id)] = (b_in or 0, 0, d_in, None, False)
         except Exception:
             b_in, d_in = None, None
     result = await _orig_get_output_data(prompt_id, unique_id, obj, input_data_all, *a, **kw)
@@ -891,11 +915,38 @@ async def _wrapped_get_output_data(prompt_id, unique_id, obj, input_data_all, *a
         try:
             output_data = result[0] if isinstance(result, tuple) and result else None
             b_out, d_out = payload_bytes(output_data)
+            # result[3] is has_pending_task: an async node that only
+            # launched its work here and is collected on a later entry.
+            pending = bool(result[3]) if isinstance(result, tuple) and len(result) > 3 else False
             with _lock:
-                _payloads[str(unique_id)] = (b_in or 0, b_out, d_in, d_out)
+                _payloads[str(unique_id)] = (b_in or 0, b_out, d_in, d_out, pending)
         except Exception:
             pass
     return result
+
+
+def _failure_info(result) -> Optional[Dict[str, Any]]:
+    """Details of a FAILURE returned by ``execute()``, or None.
+
+    ``execute()`` never raises for a failing node: it catches the
+    exception (a CUDA OOM included) and returns
+    ``(ExecutionResult.FAILURE, error_details, ex)``. Matched by name so
+    this module never has to import ``execution`` at call time.
+    """
+    if not (isinstance(result, tuple) and len(result) >= 3):
+        return None
+    if getattr(result[0], "name", None) != "FAILURE":
+        return None
+    details = result[1] if isinstance(result[1], dict) else {}
+    ex = result[2]
+    interrupted = type(ex).__name__ == "InterruptProcessingException"
+    msg = details.get("exception_message") or (str(ex) if ex is not None else "")
+    return {
+        "interrupted": interrupted,
+        "exception_type": details.get("exception_type") or (type(ex).__name__ if ex is not None else None),
+        # Bounded: this is persisted in the browser store and pasted in reports.
+        "message": "Interrupted" if interrupted else str(msg).strip()[:600],
+    }
 
 
 async def _wrapped_execute(*args, **kwargs):
@@ -935,8 +986,14 @@ async def _wrapped_execute(*args, **kwargs):
         return await _orig_execute(*args, **kwargs)
 
     failed = False
+    fail_info = None
     try:
         result = await _orig_execute(*args, **kwargs)
+        try:
+            fail_info = _failure_info(result)
+            failed = fail_info is not None
+        except Exception:
+            pass
         return result
     except BaseException:
         failed = True
@@ -974,6 +1031,12 @@ async def _wrapped_execute(*args, **kwargs):
                     rec.executed = True
                     rec.bytes_in, rec.bytes_out = pay[0], pay[1]
                     rec.desc_in, rec.desc_out = pay[2], pay[3]
+                    if len(pay) > 4 and pay[4]:
+                        rec.async_node = True
+                if rec.async_node:
+                    # Time inside execute() was only the launch and the
+                    # collect; the work ran in between. Report the span.
+                    rec.duration = max(rec.duration, (t0 + dt) - rec.started)
                 # A cache hit returns from execute() before
                 # get_output_data is ever reached, so "did the payload
                 # hook fire" is a fact rather than the timing guess this
@@ -982,24 +1045,51 @@ async def _wrapped_execute(*args, **kwargs):
                 rec.cached = not rec.executed
                 if failed:
                     rec.error = True
+                    # It may have failed before get_output_data (inputs,
+                    # lazy check) — still not a cache hit.
+                    rec.cached = False
+                    if fail_info is not None and run.error is None:
+                        run.error = dict(fail_info, node_id=unique_id,
+                                         display_node=display_node,
+                                         class_type=class_type)
                 snapshot = rec.to_dict()
 
-            _send("bat.profiler.node", {"prompt_id": prompt_id, "node": snapshot})
+            _send("bat.profiler.node",
+                  {"prompt_id": prompt_id, "client_id": run.client_id, "node": snapshot},
+                  run.client_id)
         except Exception:
             pass
 
 
 def _wrap_execute_async(orig):
-    async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+    async def execute_async(self, *args, **kwargs):
         # The single arming gate for a whole prompt. `client_id` is the
         # browser that submitted it, so an artist who never opened the
         # panel runs on the original code path from here down.
-        if not is_armed(extra_data.get("client_id") if isinstance(extra_data, dict) else None):
-            return await orig(self, prompt, prompt_id, extra_data, execute_outputs)
-        _begin_run(str(prompt_id))
+        #
+        # Arguments are forwarded untouched and only *read* here: this
+        # seam replaces a class attribute for every prompt on the box, so
+        # a fixed signature would turn the next upstream parameter into a
+        # TypeError for everyone, armed or not.
+        try:
+            prompt = args[0] if args else kwargs.get("prompt")
+            prompt_id = args[1] if len(args) > 1 else kwargs.get("prompt_id")
+            extra_data = args[2] if len(args) > 2 else kwargs.get("extra_data")
+            client_id = extra_data.get("client_id") if isinstance(extra_data, dict) else None
+            armed = prompt_id is not None and is_armed(client_id)
+        except Exception:
+            armed = False
+        if armed:
+            try:
+                _begin_run(str(prompt_id), str(client_id) if client_id else None)
+            except Exception as e:
+                logger.warning("[BAT Profiler] could not open a run: %r", e)
+                armed = False
+        if not armed:
+            return await orig(self, *args, **kwargs)
         status = "ok"
         try:
-            return await orig(self, prompt, prompt_id, extra_data, execute_outputs)
+            return await orig(self, *args, **kwargs)
         except BaseException:
             status = "error"
             raise
@@ -1009,7 +1099,8 @@ def _wrap_execute_async(orig):
                     status = "error"
             except Exception:
                 pass
-            _end_run(status, prompt, getattr(self, "caches", None))
+            _end_run(status, prompt if isinstance(prompt, dict) else None,
+                     getattr(self, "caches", None))
     return execute_async
 
 

@@ -272,6 +272,102 @@ def t_install():
 t_install()
 
 # ─────────────────────────────────────────────────────────────────────
+print("\n[4b] failed nodes, async nodes, and who hears about them")
+
+
+def t_failures():
+    """execute() never raises for a failing node — it catches the exception
+    (a CUDA OOM included) and returns FAILURE. The profiler used to read
+    only exceptions, so the node that OOMed was filed as a cache hit and
+    hidden by the panel's default filter. Also covers the per-client
+    addressing of events and the fail-safe execute_async signature."""
+    import asyncio
+    import enum
+
+    class ExecutionResult(enum.Enum):
+        SUCCESS = 0
+        FAILURE = 1
+        PENDING = 2
+
+    class InterruptProcessingException(Exception):
+        pass
+
+    class DP:
+        def get_node(self, uid):
+            return {"class_type": "KSampler", "inputs": {}}
+
+        def get_display_node_id(self, uid):
+            return uid
+
+    sent = []
+    real_send = prof._send
+    prof._send = lambda ev, d, sid=None: sent.append((ev, d, sid))
+    saved = (prof._orig_execute, prof._orig_get_output_data)
+
+    def fake_execute(exc):
+        async def _execute(server, dynprompt, caches, current_item, extra_data,
+                           executed, prompt_id, *rest):
+            try:
+                await prof._wrapped_get_output_data(prompt_id, current_item, None, {"x": [1]})
+            except Exception as ex:
+                return (ExecutionResult.FAILURE,
+                        {"node_id": current_item, "exception_message": str(ex),
+                         "exception_type": type(ex).__name__}, ex)
+            return (ExecutionResult.SUCCESS, None, None)
+        return _execute
+
+    def raiser(exc):
+        async def _god(*a, **k):
+            raise exc
+        return _god
+
+    try:
+        for exc, want_status in ((RuntimeError("CUDA out of memory"), "error"),
+                                 (InterruptProcessingException(), "interrupted")):
+            sent.clear()
+            prof._orig_execute = fake_execute(exc)
+            prof._orig_get_output_data = raiser(exc)
+            prof.arm("fail-client", True)
+
+            async def orig_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+                await prof._wrapped_execute(None, DP(), None, "7", extra_data, set(),
+                                            prompt_id, None, {}, {}, {}, None)
+
+            gate = prof._wrap_execute_async(orig_async)
+            asyncio.run(gate(types.SimpleNamespace(success=False), None, "pf",
+                             {"client_id": "fail-client"}, []))
+            node = [d for e, d, _ in sent if e == "bat.profiler.node"][-1]["node"]
+            end = [d for e, d, _ in sent if e == "bat.profiler.run" and d["phase"] == "end"][-1]
+            check(f"{want_status}: the failing node is an error row, not a cache hit",
+                  node["error"] is True and node["cached"] is False, f"got {node}")
+            check(f"{want_status}: run status and run.error name the node",
+                  end["run"]["status"] == want_status
+                  and (end["run"]["error"] or {}).get("node_id") == "7",
+                  f"got {end['run']['status']} {end['run']['error']}")
+            check(f"{want_status}: every event goes to the submitting client only",
+                  sent and all(sid == "fail-client" for _, _, sid in sent),
+                  f"sids={[sid for _, _, sid in sent]}")
+            prof.arm("fail-client", False)
+
+        # An upstream signature change must not become a TypeError for
+        # every prompt on the box.
+        async def orig_new_sig(self, prompt, prompt_id, extra_data={}, execute_outputs=[],
+                               extra=None, *, flag=False):
+            return ("through", extra, flag)
+
+        res = asyncio.run(prof._wrap_execute_async(orig_new_sig)(
+            types.SimpleNamespace(success=True), {}, "pz", {"client_id": "nobody"}, [],
+            "x", flag=True))
+        check("execute_async wrapper forwards arguments it does not know",
+              res == ("through", "x", True), f"got {res}")
+    finally:
+        prof._send = real_send
+        prof._orig_execute, prof._orig_get_output_data = saved
+
+
+t_failures()
+
+# ─────────────────────────────────────────────────────────────────────
 print("\n[5] frontend")
 
 
@@ -410,14 +506,21 @@ def t_queue_passthrough():
     ctx = quickjs.Context()
     ctx.eval("""
       var seen = null;
+      var claims = 0;
+      var nextId = 0;
       var api = {
         queuePrompt: function () {
           seen = Array.prototype.slice.call(arguments);
-          return Promise.resolve({prompt_id: "p1"});
+          nextId++;
+          return Promise.resolve({prompt_id: "p" + nextId});
         },
-        fetchApi: function () { return Promise.resolve({}); }
+        fetchApi: function (url) {
+          if (url === "/bat/profiler/claim") claims++;
+          return Promise.resolve({});
+        }
       };
       var pendingClaims = new Map();
+      var state = {config: {enabled: true}};
       function currentKey() { return "wf/x.json"; }
     """)
     ctx.eval(iife)
@@ -436,6 +539,29 @@ def t_queue_passthrough():
           f"got {targets}")
     check("wrapper marks itself, so it installs once",
           ctx.eval("api.queuePrompt.__batProfiler === true"))
+
+    def drain():
+        while ctx.execute_pending_job():
+            pass
+
+    drain()
+    check("an armed browser claims its prompt",
+          ctx.eval("claims") == 1 and ctx.eval("pendingClaims.size") == 1,
+          f"claims={ctx.eval('claims')} map={ctx.eval('pendingClaims.size')}")
+
+    # Disarmed, nothing is ever profiled, so nothing may be claimed: no
+    # run-end would ever arrive to clear the entry again.
+    ctx.eval("state.config.enabled = false; api.queuePrompt(0, {});")
+    drain()
+    check("a disarmed browser claims nothing",
+          ctx.eval("claims") == 1 and ctx.eval("pendingClaims.size") == 1,
+          f"claims={ctx.eval('claims')} map={ctx.eval('pendingClaims.size')}")
+
+    ctx.eval("state.config.enabled = true; for (var i = 0; i < 200; i++) api.queuePrompt(0, {});")
+    drain()
+    check("pending claims stay bounded",
+          ctx.eval("pendingClaims.size") <= 64 and ctx.eval(f"pendingClaims.has('p{202}')"),
+          f"size={ctx.eval('pendingClaims.size')}")
 
 
 t_queue_passthrough()
@@ -565,6 +691,31 @@ def t_report():
     r3 = ctx.eval('buildReport({run: EMPTY, runCount: 1, workflowName: "y",'
                   ' system: null, config: {}})')
     check("survives an empty run", isinstance(r3, str) and len(r3) > 0)
+
+    # DynamicVRAM keeps weights outside the torch allocator: torch says 4 GB,
+    # the card says 23 GB of 24. The headroom check must believe the card.
+    dyn = dict(clean)
+    dyn["samples"] = [dict(s, vram=4 * GB, res=5 * GB, dev=23 * GB, dev_total=24 * GB)
+                      for s in samples]
+    ctx.eval("var DYN = " + json.dumps(dyn) + ";")
+    r4 = ctx.eval('buildReport({run: DYN, runCount: 1, workflowName: "d",'
+                  ' system: SYS, config: {}})')
+    check("headroom judged on the whole device, not torch's share",
+          "HEADROOM" in r4 and "VRAM reached 95.8%" in r4 and "whole device peaked" in r4,
+          r4[:400])
+
+    # A failed run names the node and the exception.
+    err = dict(clean)
+    err["status"] = "error"
+    err["error"] = {"node_id": "42", "class_type": "WanVideoSampler",
+                    "exception_type": "torch.OutOfMemoryError",
+                    "message": "CUDA out of memory. Tried to allocate 2.00 GiB\nmore"}
+    ctx.eval("var ERR = " + json.dumps(err) + ";")
+    r5 = ctx.eval('buildReport({run: ERR, runCount: 1, workflowName: "e",'
+                  ' system: SYS, config: {}})')
+    check("an errored run names the failing node and the exception",
+          "ENDED IN ERROR" in r5 and "WanVideo Sampler (WanVideoSampler)" in r5
+          and "torch.OutOfMemoryError: CUDA out of memory" in r5, r5[:500])
 
 
 t_report()

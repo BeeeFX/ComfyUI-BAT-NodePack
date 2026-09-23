@@ -49,11 +49,16 @@ if routes is not None:
     @routes.get("/bat/profiler/run/{prompt_id}")
     async def bat_profiler_run(request):
         """One run in full, including the sample series for the graphs."""
-        run = prof.get_run(request.match_info["prompt_id"])
-        if run is None:
-            return web.json_response({"error": "unknown run"}, status=404)
         with_samples = request.query.get("samples", "1") != "0"
-        return web.json_response(run.to_dict(with_samples=with_samples))
+        # Snapshot under the lock: a live run is still being written by
+        # the executor thread, and iterating its node dict unguarded can
+        # raise "dictionary changed size during iteration" mid-run.
+        with prof._lock:
+            run = prof.get_run(request.match_info["prompt_id"])
+            data = run.to_dict(with_samples=with_samples) if run is not None else None
+        if data is None:
+            return web.json_response({"error": "unknown run"}, status=404)
+        return web.json_response(data)
 
     @routes.post("/bat/profiler/subscribe")
     async def bat_profiler_subscribe(request):

@@ -81,7 +81,7 @@ function fmtClock(epoch) {
 // ─────────────────────────────────────────────────────────────────────
 const METRICS = {
   duration:   { label: "Time",        get: (n) => n.duration,   fmt: (v) => fmtDuration(v), hint: "Wall time inside the node." },
-  vram_peak:  { label: "VRAM peak",   get: (n) => n.vram_peak,  fmt: (v) => fmtBytes(v),    hint: "High-water VRAM while the node ran — the number that decides whether you OOM." },
+  vram_peak:  { label: "VRAM peak",   get: (n) => n.vram_peak,  fmt: (v) => fmtBytes(v),    hint: "High-water torch-allocator VRAM while the node ran. Under DynamicVRAM it excludes model weights — the chart's device line is the whole card." },
   vram_delta: { label: "VRAM held",   get: (n) => n.vram_delta, fmt: (v) => fmtBytes(v, true), hint: "VRAM still allocated after the node returned. Positive values accumulate down the graph." },
   ram_peak:   { label: "RAM peak",    get: (n) => n.ram_peak,   fmt: (v) => fmtBytes(v),    hint: "High-water process RSS, sampled at 5 Hz." },
   ram_delta:  { label: "RAM held",    get: (n) => n.ram_delta,  fmt: (v) => fmtBytes(v, true), hint: "Process RSS still held after the node returned." },
@@ -313,7 +313,12 @@ async function setArmed(enabled) {
   savePrefs();
   render();
   if (!cid) {
-    toast("No client id yet — try again in a moment.");
+    // Not connected yet. Do not show "armed" for a server that was never
+    // told; the first `status` message carries the id and re-arms.
+    state.config.enabled = false;
+    armOnFirstStatus = true;
+    render();
+    toast("No client id yet — will arm once connected.");
     return;
   }
   try {
@@ -338,6 +343,32 @@ async function setArmed(enabled) {
 async function restoreArming() {
   if (state.wantArmed && !state.config.enabled) await setArmed(true);
 }
+
+/**
+ * Re-arm after the backend forgot us.
+ *
+ * Arming lives in server RAM, so an OOM kill plus restart wipes it — and
+ * the frontend does not reload, it just reconnects the socket under the
+ * same client id. Without this the panel kept saying "Profiling this
+ * browser" while nothing was recorded, which is exactly the second crash
+ * the stored preference exists to catch. Ask the server first: our own
+ * `config.enabled` is from before the restart.
+ */
+let armOnFirstStatus = false;
+async function resyncArming() {
+  await fetchState();
+  await restoreArming();
+  scheduleRender();
+}
+
+api.addEventListener("reconnected", () => { void resyncArming(); });
+// `status` fires on every queue change, so this only acts once, and only
+// when setup (or a click) found no client id to arm with.
+api.addEventListener("status", () => {
+  if (!armOnFirstStatus || !clientId()) return;
+  armOnFirstStatus = false;
+  void resyncArming();
+});
 
 async function pushConfig(patch) {
   Object.assign(state.config, patch);
@@ -374,13 +405,20 @@ function heartbeat() {
     const res = await orig(...args);
     try {
       const promptId = res?.prompt_id;
-      if (promptId) {
+      // Only while armed: a disarmed browser's prompts are never
+      // profiled, so no run-end would ever come to clear the entry.
+      if (promptId && state.config.enabled) {
         api.fetchApi("/bat/profiler/claim", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ prompt_id: promptId, workflow: wf }),
         }).catch(() => {});
         pendingClaims.set(String(promptId), wf);
+        // Bounded all the same: a run whose end never arrives (server
+        // killed) would otherwise stay here for the life of the page.
+        while (pendingClaims.size > 64) {
+          pendingClaims.delete(pendingClaims.keys().next().value);
+        }
       }
     } catch (e) { /* never block a queue on the profiler */ }
     return res;
@@ -399,6 +437,22 @@ function keyForRun(promptId) {
   return currentKey();
 }
 
+/**
+ * Is this run one this browser submitted?
+ *
+ * The backend addresses profiler events to the submitting socket, and
+ * stamps them with that client id; this is the belt to that braces. A
+ * run from anyone else must never be filed here — it would land under
+ * whatever workflow this tab has open. The client-id match covers the
+ * start event that races ahead of our own claim, and a reload mid-run.
+ */
+function ownsRun(promptId, runClientId) {
+  if (pendingClaims.has(String(promptId))) return true;
+  if (store.findRun(promptId)) return true;
+  const cid = clientId();
+  return !!(runClientId && cid && runClientId === cid);
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Websocket stream
 // ─────────────────────────────────────────────────────────────────────
@@ -406,6 +460,7 @@ api.addEventListener("bat.profiler.run", (ev) => {
   const d = ev.detail || {};
   const run = d.run || {};
   if (!run.prompt_id) return;
+  if (!ownsRun(run.prompt_id, d.client_id)) return;
   if (d.phase === "start") {
     const wf = run.workflow || keyForRun(run.prompt_id);
     store.beginRun(wf, { ...run, baseline: d.baseline });
@@ -430,6 +485,7 @@ api.addEventListener("bat.profiler.run", (ev) => {
 api.addEventListener("bat.profiler.node", (ev) => {
   const d = ev.detail || {};
   if (!d.node || !d.prompt_id) return;
+  if (!ownsRun(d.prompt_id, d.client_id)) return;
   // Capture the title now: the record has to stay readable after the
   // node is deleted, renamed, or the workflow is closed entirely.
   let title = null;
@@ -699,6 +755,11 @@ const CHART_SPECS = [
     series: [
       { key: "vram", color: "#d68a3c", fill: true, label: "allocated" },
       { key: "res", color: "#f0c48a", fill: false, label: "reserved" },
+      // The whole card, as nvidia-smi sees it. The torch figures above
+      // miss model weights under DynamicVRAM (comfy-aimdo maps them
+      // outside the torch allocator), so this is the one that tells you
+      // how close you came. Sampled once a second, hence `sparse`.
+      { key: "dev", color: "#c792ea", fill: false, label: "device", sparse: true },
     ],
     totalKey: "dev_total",
     baseKey: "vram",
@@ -964,9 +1025,13 @@ function drawCharts() {
     ctx.rect(x0, y0 - 1, plotW, plotH + 2);
     ctx.clip();
     for (const ser of spec.series) {
+      // A sparse series is only present on some samples; drawing its
+      // gaps as zero would saw-tooth it to the floor every tick.
+      const pts = ser.sparse ? samples.filter((s) => s[ser.key] !== undefined) : samples;
+      if (!pts.length) continue;
       const trace = () => {
         ctx.beginPath();
-        samples.forEach((s, i) => {
+        pts.forEach((s, i) => {
           const px = x(s.t), py = y(s[ser.key]);
           if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
         });
@@ -1007,10 +1072,22 @@ function drawCharts() {
       ctx.stroke();
       ctx.globalAlpha = 1;
 
+      // A sparse series reads its nearest sample that actually has it.
+      const valOf = (ser) => {
+        if (!ser.sparse || best[ser.key] !== undefined) return best[ser.key];
+        let v, d = Infinity;
+        for (const s of samples) {
+          if (s[ser.key] === undefined) continue;
+          const dd = Math.abs(s.t - best.t);
+          if (dd < d) { d = dd; v = s[ser.key]; }
+        }
+        return v;
+      };
       for (const ser of spec.series) {
+        if (valOf(ser) === undefined) continue;
         ctx.fillStyle = ser.color;
         ctx.beginPath();
-        ctx.arc(px, y(best[ser.key]), 2.5, 0, Math.PI * 2);
+        ctx.arc(px, y(valOf(ser)), 2.5, 0, Math.PI * 2);
         ctx.fill();
       }
 
@@ -1018,7 +1095,7 @@ function drawCharts() {
         ? (run.titles?.[best.node] || run.nodes?.[best.node]?.class_type || `#${best.node}`)
         : null;
       const lines = [`+${shortTime(best.t - t0)}`];
-      for (const ser of spec.series) lines.push(`${ser.label} ${fmtBytes(best[ser.key])}`);
+      for (const ser of spec.series) lines.push(`${ser.label} ${fmtBytes(valOf(ser))}`);
       if (nodeName) lines.push(nodeName);
 
       ctx.font = "9px system-ui, sans-serif";
@@ -1071,9 +1148,15 @@ function buildSummary() {
     s.appendChild(el("div", "bat-prof-stat-v", v));
     wrap.appendChild(s);
   }
-  if (run.status === "error") {
+  if (run.status === "error" || run.status === "interrupted") {
+    const e = run.error;
+    const who = e ? (run.titles?.[e.node_id] || e.class_type || `node ${e.node_id}`) : null;
     wrap.appendChild(el("div", "bat-prof-warn",
-      "This run ended in an error — the last row is where it stopped."));
+      run.status === "interrupted"
+        ? (who ? `Cancelled while running “${who}”.` : "This run was cancelled.")
+        : who
+          ? `Failed in “${who}”${e.message ? `: ${e.message.split("\n")[0]}` : ""}`
+          : "This run ended in an error."));
   } else if (run.status === "lost") {
     // The interesting case: no error was ever reported because the
     // process did not live long enough to report one.
@@ -1166,7 +1249,9 @@ function buildList() {
     if (rec.io_read || rec.io_write) detail.push(`disk ${fmtBytes((rec.io_read || 0) + (rec.io_write || 0))}`);
     if (rec.cached) detail.push("cached");
     else if (rec.skipped) detail.push("not run");
-    if (rec.async_node || rec.entries > 1) detail.push(`${rec.entries}× entered`);
+    if (rec.error) detail.push("failed");
+    if (rec.async_node) detail.push("async — wall span, overlaps other nodes");
+    else if (rec.entries > 1) detail.push(`${rec.entries}× entered`);
     const sub = el("div", "bat-prof-sub", detail.join(" · "));
     if (rec.desc_out) sub.title = `output ${rec.desc_out}`;
     row.appendChild(sub);

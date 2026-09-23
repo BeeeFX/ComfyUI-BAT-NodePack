@@ -1076,6 +1076,34 @@ def test_recapture_flow():
     check("cancelling a re-select returns to the dialog with the old targets",
           got == [True, [10]], f"got {got}")
 
+    # The cure the ⚠ toast prescribes has to stick. A pasted copy is found by
+    # shared preset ids, so re-selecting only the targets left it flagged again
+    # on the very next load — for ever.
+    got = jrun(ctx, """
+        const g = makeGraph();
+        const orig = makeSwitch(g, 1);
+        const copy = makeSwitch(g, 5);
+        addNode(g, 10, 0); addNode(g, 11, 0);
+        const state = {v: 1, exgroups: [], presets: [
+            {id: "p1", name: "One", on: true, ex: "", nodes: [10], groups: []}]};
+        writeState(orig, state);
+        writeState(copy, state);
+        copy._bswDuplicate = true;
+        buildWidgets(copy, true);
+        openEditDialog(copy);
+        let panel = document.body.children[document.body.children.length - 1].children[0];
+        click(panel, "Re-select…");
+        select([g.getNodeById(11)]);
+        pressKey("Enter");
+        panel = document.body.children[document.body.children.length - 1].children[0];
+        click(panel, "Save");
+        const p = readState(copy).presets[0];
+        return [p.id !== "p1", p.nodes, duplicateSwitch(copy), !!copy._bswDuplicate,
+                readState(orig).presets[0].id];
+    """)
+    check("re-selecting a pasted copy gives it its own ids, so it is no longer a copy",
+          got == [True, [11], None, False, "p1"], f"got {got}")
+
 
 def test_refused_recapture():
     """A Re-select… that cannot start must not swallow the unsaved draft."""
