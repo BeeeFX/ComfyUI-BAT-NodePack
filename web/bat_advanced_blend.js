@@ -568,8 +568,10 @@ function buildPreview(node) {
         needsRun: false,
         // Measured round trip for a server render, used to pace the requests.
         serverMs: 0,
-        // The execution id this node's frame is cached under server-side.
-        serverId: null,
+        // The execution id this node's frame is cached under server-side, and
+        // the token of the run whose tiles are on screen. The server renders
+        // only for that run; a restored thumbnail has none and asks for nothing.
+        serverId: null, serverRun: null,
     };
     node._batAdvBlendState = state;
 
@@ -983,7 +985,7 @@ function buildPreview(node) {
 
     async function requestFull() {
         if (!isNodeAlive(node) || !state.tw || state.holding) return;
-        if (node.id == null) return;
+        if (node.id == null || !state.serverRun) return;
         const region = visibleRegion();
         if (!region) return;
 
@@ -1008,6 +1010,7 @@ function buildPreview(node) {
                     // the local part inside a subgraph, so it is the fallback
                     // for a payload that predates the field.
                     node_id: state.serverId ?? String(node.id),
+                    run: state.serverRun,
                     roi: [region.world.x, region.world.y, region.world.w, region.world.h],
                     out_w: region.outW, out_h: region.outH,
                     view: state.view, amp: state.amp,
@@ -1410,6 +1413,8 @@ function buildPreview(node) {
         const one = (v) => (Array.isArray(v) ? v[0] : v);
         const sid = one(msg.node_id);
         state.serverId = sid != null ? String(sid) : null;
+        const run = one(msg.run);
+        state.serverRun = typeof run === "string" && run ? run : null;
         state.meta = {
             w: Number(one(msg.w)) || 0,
             h: Number(one(msg.h)) || 0,

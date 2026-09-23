@@ -323,7 +323,9 @@ function buildEditor(node) {
         runId: 0,
         full: null, fullKey: null, fullRect: null, fullPending: false, fullStale: false,
         serverMs: 0,
-        serverId: null,
+        // Execution id and run token of the frame the server cached for the
+        // tiles on screen; it renders only for that run (see Bat_AdvancedBlend).
+        serverId: null, serverRun: null,
         // Showing the cached thumbnail of an earlier session's run, which has
         // no tiles behind it to recomposite.
         restored: false,
@@ -568,7 +570,8 @@ function buildEditor(node) {
     async function requestFull() {
         // No tiles means a restored thumbnail is on screen: the settings to
         // render with are not known to match any cached run, so wait for one.
-        if (!isNodeAlive(node) || !state.tw || !state.layers.length || node.id == null) return;
+        if (!isNodeAlive(node) || !state.tw || !state.layers.length || node.id == null
+            || !state.serverRun) return;
         const region = visibleRegion();
         if (!region) return;
         const key = fullKeyFor(region);
@@ -589,6 +592,7 @@ function buildEditor(node) {
                     // execution id the frame was cached under, so every request
                     // missed. Python ships the real one with the payload.
                     node_id: state.serverId ?? String(node.id),
+                    run: state.serverRun,
                     roi: [region.world.x, region.world.y, region.world.w, region.world.h],
                     out_w: region.outW, out_h: region.outH,
                     view: state.view, settings: settings(),
@@ -857,6 +861,8 @@ function buildEditor(node) {
         // The execution id the frame is cached under — see the request.
         const sid = one(msg.node_id);
         state.serverId = sid != null ? String(sid) : null;
+        const run = one(msg.run);
+        state.serverRun = typeof run === "string" && run ? run : null;
         state.meta = {
             w: Number(one(msg.w)) || 0,
             h: Number(one(msg.h)) || 0,

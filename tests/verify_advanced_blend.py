@@ -784,7 +784,17 @@ def main():
     ui_ref, ui_got = ui_mod.load_ui(ref["ui"]), ui_mod.load_ui(got["ui"])
     assert ui_ref["node_id"] == ["4:2"] and ui_ref["preview_frame"] == [1], ui_ref.keys()
     assert ui_ref["tile_a"] == ui_got["tile_a"] and "mask_png" in ui_ref
-    print("device fallback reproduces the CPU render; payload stashed and resolves: OK")
+    # The full-resolution endpoint renders only for the run whose tiles the
+    # client holds: the id alone is shared by same-numbered nodes in other open
+    # workflows. Both runs above cached under "4:2", so only the latest token
+    # may render, and a restored thumbnail (no token) never does.
+    entry = m._cache_get("4:2")
+    assert m._run_matches(entry, {"node_id": "4:2", "run": ui_got["run"][0]})
+    for stale in ({"run": ui_ref["run"][0]}, {}, {"run": ""}, {"run": None}):
+        assert not m._run_matches(entry, dict(stale, node_id="4:2")), stale
+    assert not m._run_matches(None, {"run": ui_got["run"][0]})
+    print("device fallback reproduces the CPU render; payload stashed and resolves; "
+          "full layer gated on the run token: OK")
 
     # split_radius 0.5 is the widget's minimum, and round(0.5) == 0 used to make
     # it no blur at all: an empty high band, so high_mix 0 still returned A

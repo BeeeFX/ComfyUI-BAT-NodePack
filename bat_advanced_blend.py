@@ -136,6 +136,7 @@ import contextlib
 import logging
 import math
 import threading
+import uuid
 from io import BytesIO
 
 import numpy as np
@@ -1101,6 +1102,9 @@ class BatAdvancedBlend:
         # Hand the conformed frame to the full-resolution preview service. This
         # copy is what makes that layer possible at all, and it is the feature's
         # real cost — see CACHE_MAX_BYTES.
+        # This run's token: the full-resolution endpoint only renders for a
+        # client holding it — see _run_matches().
+        run = uuid.uuid4().hex
         if unique_id is not None:
             try:
                 mk = None
@@ -1110,7 +1114,8 @@ class BatAdvancedBlend:
                     mk = None if mk is None else mk[..., 0]
                 _cache_put(str(unique_id), a_conf, b_conf, mk,
                            {"w": int(out_w), "h": int(out_h),
-                            "frames": int(frames), "frame": int(idx)})
+                            "frames": int(frames), "frame": int(idx),
+                            "run": run})
             except Exception as exc:
                 # The draft layer does not depend on this, so a failure here
                 # costs the full layer and nothing else.
@@ -1132,6 +1137,7 @@ class BatAdvancedBlend:
         # request missed the cache and the full layer silently never appeared.
         if unique_id is not None:
             ui["node_id"] = [str(unique_id)]
+            ui["run"] = [run]
 
         t_a = hdr_tile(af, PREVIEW_TILE_DIM, sample="area")
         t_b = hdr_tile(bf, PREVIEW_TILE_DIM, sample="area")
@@ -1240,6 +1246,21 @@ def _cache_get(node_id):
         if entry is not None:
             _cache.move_to_end(node_id)
         return entry
+
+
+def _run_matches(entry, body):
+    """May this request render from `entry`? Only with the entry's run token.
+
+    The cache is keyed by execution id, which is unique within ONE workflow:
+    two open workflows that both have a node 7 share the slot, so after a tab
+    switch the full layer painted the other workflow's frame over this one's
+    draft. The token names the run whose tiles the client holds. No token — a
+    thumbnail restored from localStorage, or an older client — renders nothing.
+    Shared with Bat_LayeredImages.
+    """
+    run = body.get("run") if isinstance(body, dict) else None
+    return (entry is not None and isinstance(run, str) and bool(run)
+            and run == (entry.get("meta") or {}).get("run"))
 
 
 def _blur_margin(p):
@@ -1388,11 +1409,12 @@ try:
 
         node_id = str(body.get("node_id", ""))
         entry = _cache_get(node_id)
-        if entry is None:
-            # Not an error worth shouting about: it just means this node has not
-            # run since the server started, or the LRU dropped it.
+        if not _run_matches(entry, body):
+            # Not an error worth shouting about: this node has not run since the
+            # server started, the LRU dropped it, or the cached frame belongs to
+            # another run (another workflow's node with the same id).
             return web.json_response(
-                {"error": "no cached frame for this node; run it once"},
+                {"error": "no cached frame for this run; run it once"},
                 status=409)
 
         try:

@@ -593,6 +593,13 @@ def main():
     # The subgraph execution id rides along for the full-resolution request,
     # and the thumbnail a reopened workflow shows is the COMPOSITE.
     assert ui["node_id"] == ["12:5"], ui.get("node_id")
+    # The full layer renders only for the run whose tiles the client holds; the
+    # id alone is shared by same-numbered nodes in other open workflows, and a
+    # restored thumbnail has no token at all.
+    entry = m._cache_get("12:5")
+    assert m._run_matches(entry, {"node_id": "12:5", "run": ui["run"][0]})
+    for stale in ({"run": "0" * 32}, {}, {"run": ""}):
+        assert not m._run_matches(entry, dict(stale, node_id="12:5")), stale
     import base64, io
     from PIL import Image
     thumb = np.asarray(Image.open(io.BytesIO(base64.b64decode(ui["jpeg_result"][0]))),

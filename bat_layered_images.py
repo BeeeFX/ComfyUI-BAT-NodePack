@@ -66,6 +66,7 @@ import base64
 import json
 import logging
 import threading
+import uuid
 from collections import OrderedDict
 from io import BytesIO
 
@@ -229,7 +230,7 @@ def composite(layers, settings, clamp_output=False):
 
 from . import bat_interrupt as _interrupt                  # noqa: E402
 from .bat_advanced_blend import (                          # noqa: E402
-    _chunk_frames, _compute_devices, _num, _on_device, _resize)
+    _chunk_frames, _compute_devices, _num, _on_device, _resize, _run_matches)
 
 
 def _b64_jpeg(arr_hwc: np.ndarray, max_dim: int = PREVIEW_TILE_DIM,
@@ -511,10 +512,15 @@ class BatLayeredImages:
         ui["jpeg_result"] = [_b64_jpeg(u8)]
 
         if unique_id is not None:
+            # This run's token; the endpoint renders only for a client holding
+            # it (see _run_matches() in bat_advanced_blend.py).
+            run = uuid.uuid4().hex
+            ui["run"] = [run]
             try:
                 _cache_put(str(unique_id), pv, settings,
                            {"w": int(out_w), "h": int(out_h),
-                            "frames": int(frames), "frame": int(idx)})
+                            "frames": int(frames), "frame": int(idx),
+                            "run": run})
             except Exception as exc:
                 logger.warning("could not cache the frame for full-resolution "
                                "preview: %s", exc)
@@ -673,9 +679,9 @@ try:
             return web.json_response({"error": "bad json"}, status=400)
 
         entry = _cache_get(str(body.get("node_id", "")))
-        if entry is None:
+        if not _run_matches(entry, body):
             return web.json_response(
-                {"error": "no cached frame for this node; run it once"}, status=409)
+                {"error": "no cached frame for this run; run it once"}, status=409)
 
         try:
             layers = entry["layers"]
