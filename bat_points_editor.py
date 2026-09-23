@@ -32,8 +32,11 @@ class BatPointsEditor:
                         'xywh',
                     ],
                 ),
-                "width": ("INT", {"default": 512, "min": 8, "max": 4096, "step": 8}),
-                "height": ("INT", {"default": 512, "min": 8, "max": 4096, "step": 8}),
+                # 16384, not upstream's 4096: this fork keeps the plate's
+                # native resolution as the coord space, so a 5K+ plate would
+                # otherwise write a width the prompt validator rejects.
+                "width": ("INT", {"default": 512, "min": 8, "max": 16384, "step": 8}),
+                "height": ("INT", {"default": 512, "min": 8, "max": 16384, "step": 8}),
                 "normalize": ("BOOLEAN", {"default": False}),
             },
             "optional": {
@@ -150,8 +153,14 @@ to 1024 on the longest side; original image dimensions are kept.
         if bg_image is None:
             return (json.dumps(pos_coordinates), json.dumps(neg_coordinates), bboxes, mask_tensor, cropped_image)
         else:
+            # JPEG is RGB-only: an RGBA / grey+alpha plate raised OSError here.
+            frame = bg_image[0]
+            if frame.shape[-1] < 3:
+                frame = frame[..., :1].repeat(1, 1, 3)
+            elif frame.shape[-1] > 3:
+                frame = frame[..., :3]
             transform = transforms.ToPILImage()
-            image = transform(bg_image[0].permute(2, 0, 1))
+            image = transform(frame.permute(2, 0, 1))
             buffered = BytesIO()
             image.save(buffered, format="JPEG", quality=75)
             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')

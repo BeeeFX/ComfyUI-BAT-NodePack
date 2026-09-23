@@ -25,7 +25,6 @@ all of them behind the canvas. See ``web/bat_sec_segmenter.js``.
 import base64
 from io import BytesIO
 
-import numpy as np
 from PIL import Image
 
 from . import bat_sec_advanced as adv
@@ -87,8 +86,9 @@ class BatSecSegmenter:
             "optional": {
                 "input_mask": ("MASK", {
                     "tooltip": "Optional mask to seed the object instead of clicking it, applied "
-                               "on the selected frame. Points or a bbox override it; positive "
-                               "points outside it are dropped.",
+                               "on the selected frame. Positive points inside it (or a bbox) "
+                               "override it; positive points outside it are dropped, and with "
+                               "none left the mask alone is used.",
                 }),
                 "advanced": ("SEC_ADVANCED", {
                     "tooltip": "Optional 🦇 SeC Advanced Params node. Unconnected = defaults.",
@@ -136,10 +136,10 @@ device, tracking direction and the rest.
 
         strip = []
         for i in range(0, count, stride):
-            arr = (frames[i].detach().cpu().float().clamp(0, 1).numpy() * 255.0 + 0.5).astype(np.uint8)
-            if arr.ndim == 3 and arr.shape[-1] > 3:
-                arr = arr[..., :3]
-            img = Image.fromarray(arr, "RGB")
+            # Same RGB coercion the segmentation itself uses: a grey or
+            # grey+alpha batch used to segment fine and then crash HERE,
+            # throwing away the finished run.
+            img = Image.fromarray(rt.frame_to_rgb_uint8(frames[i]), "RGB")
             if max(img.size) > PREVIEW_MAX_DIM:
                 r = PREVIEW_MAX_DIM / max(img.size)
                 img = img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.BILINEAR)

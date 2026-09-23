@@ -12,7 +12,10 @@
  *   1. Post-run strip — after any execution the node ships back a strided JPEG
  *      strip of the whole clip (`ui.frames`). Scrubbing frame_index_select
  *      then re-previews instantly from memory, no re-run. This is the only
- *      source that is guaranteed to be the exact pixels SeC will see.
+ *      source that is guaranteed to be the exact pixels SeC will see — for the
+ *      frames it holds (every `stride`-th) and only while the upstream it was
+ *      cut from is unchanged (see liveStrip). Between strip frames the file
+ *      source goes first; the nearest strip frame is only a fallback.
  *   2. Upstream file — if the chain feeding `frames` resolves to a node holding
  *      a file path, decode frame N server-side via the existing
  *      /bat/frame-picker/frame route (video, stills, EXR, image sequences).
@@ -213,6 +216,39 @@ async function fileFrameCount(path) {
     return frames;
 }
 
+/**
+ * Identity of a path source's output: the file plus every widget that trims or
+ * steps it. Two equal signatures mean the same batch arrives.
+ */
+function pathSourceSig(sourceNode, path) {
+    return [
+        path,
+        sourceNode.type,
+        widgetNum(sourceNode, "start_frame", ""),
+        widgetNum(sourceNode, "end_frame", ""),
+        widgetNum(sourceNode, "skip_first_frames", ""),
+        widgetNum(sourceNode, "frame_load_cap", ""),
+        widgetNum(sourceNode, "select_every_nth", ""),
+    ].join("|");
+}
+
+/**
+ * Which strip slot shows batch frame `batchIdx`, or -1.
+ *
+ * The strip holds every `stride`-th frame, so only multiples of the stride are
+ * exact. `exactOnly` refuses the rest — the caller then asks the upstream file
+ * for the real frame and only falls back to the nearest slot if that fails.
+ * Picking points on a neighbouring frame of a fast-moving object misses it.
+ */
+function stripSlot(strip, batchIdx, exactOnly) {
+    const count = strip?.frames?.length || 0;
+    if (!count) return -1;
+    const stride = Math.max(1, strip.stride || 1);
+    if (exactOnly && batchIdx % stride !== 0) return -1;
+    // Clamp so an out-of-range index still shows something.
+    return Math.min(count - 1, Math.max(0, Math.round(batchIdx / stride)));
+}
+
 // ── per-node preview state ──────────────────────────────────────────────────
 
 function stripCacheKey(node) {
@@ -233,6 +269,34 @@ function loadCachedPlate(node) {
     } catch (_) { return null; }
 }
 
+/**
+ * What feeds `frames` right now: the link's origin plus, when the chain reaches
+ * a file-backed loader, that loader's path and trim. Stamped onto the strip at
+ * ingest so a strip from another clip (reconnected, retrimmed, or a duplicated
+ * node wired elsewhere) is recognised as stale instead of being shown — and
+ * used to bound frame_index_select — as if it were this clip.
+ */
+function upstreamSignature(node) {
+    const input = node.inputs?.find((inp) => inp.name === "frames");
+    const link = input?.link != null ? node.graph?.links?.get(input.link) : null;
+    const source = findPathSource(node);
+    return [
+        link ? `${link.origin_id}:${link.origin_slot}` : "-",
+        source ? pathSourceSig(source.node, source.path) : "",
+    ].join("#");
+}
+
+/** The post-run strip, or null once the upstream it was cut from has changed. */
+function liveStrip(node) {
+    const strip = node._batSecStrip;
+    if (!strip) return null;
+    if (strip.sig !== upstreamSignature(node)) {
+        node._batSecStrip = null;
+        return null;
+    }
+    return strip;
+}
+
 function loadImage(src, { crossOrigin = false } = {}) {
     return new Promise((resolve, reject) => {
         const img = new Image();
@@ -249,6 +313,11 @@ class BatSecPointsEditor extends BatPointsEditor {
     // Room for the three visible widgets under the canvas (frame_index_select,
     // auto_unload_model, mask_preview) — not the Points Editor's nine.
     get editorHeightOffset() { return 180; }
+
+    // No free centre click on a fresh node. SAM2 drops a frame's mask prompt
+    // the moment any point lands on it, so an untouched default point silently
+    // replaced a wired input_mask with "whatever is in the middle".
+    get seedDefaultPoint() { return false; }
 }
 
 // ── background updating ─────────────────────────────────────────────────────
@@ -271,16 +340,12 @@ function installPlateSetter(node) {
     };
 }
 
-/** Strategy 1 — the strip returned by the last execution. */
-async function plateFromStrip(node, batchIdx) {
-    const strip = node._batSecStrip;
-    if (!strip?.frames?.length) return false;
-
-    const stride = Math.max(1, strip.stride || 1);
-    // The strip is every Nth frame, so land on the nearest one we actually have
-    // rather than failing. Clamp so an out-of-range index still shows something.
-    const slot = Math.min(strip.frames.length - 1, Math.max(0, Math.round(batchIdx / stride)));
-    const img = strip.frames[slot];
+/** Strategy 1 — the strip returned by the last execution. `exactOnly` limits
+ *  it to frames the strip really holds (see stripSlot). */
+async function plateFromStrip(node, batchIdx, { exactOnly = false } = {}) {
+    const strip = liveStrip(node);
+    const slot = stripSlot(strip, batchIdx, exactOnly);
+    const img = slot >= 0 ? strip.frames[slot] : null;
     if (!img) return false;
 
     node.batSecSetPlate(img, strip.w, strip.h);
@@ -292,7 +357,7 @@ async function plateFromStrip(node, batchIdx) {
  * Uses the frame-picker route rather than the video-loader one: it is the same
  * shape but also handles stills, EXR and image sequences.
  */
-async function plateFromUpstreamFile(node, batchIdx) {
+async function plateFromUpstreamFile(node, batchIdx, stale = () => false) {
     const source = findPathSource(node);
     if (!source) return false;
 
@@ -319,6 +384,10 @@ async function plateFromUpstreamFile(node, batchIdx) {
         const img = await loadImage(
             api.apiURL(`/bat/frame-picker/frame?path=${encPath}&frame=${fileFrame}&max_w=1024`)
         );
+        // Checked HERE, not by the caller after we return: by then a slow
+        // decode would already have painted over a newer scrub position.
+        // Report success so the caller doesn't fall through and paint too.
+        if (stale()) return true;
         node.batSecSetPlate(img, realW, realH);
         return true;
     } catch (_) {
@@ -327,7 +396,7 @@ async function plateFromUpstreamFile(node, batchIdx) {
 }
 
 /** Strategy 3 — whatever preview the immediate upstream node already has. */
-async function plateFromNodePreview(node) {
+async function plateFromNodePreview(node, stale = () => false) {
     const slots = (node.inputs ?? [])
         .map((inp, i) => (inp.name === "frames" ? i : -1))
         .filter((i) => i >= 0);
@@ -339,7 +408,8 @@ async function plateFromNodePreview(node) {
         if (source.isVideo && source.videoEl) {
             await new Promise((resolve) => {
                 captureVideoFrame(source.videoEl, (canvas) => {
-                    node.batSecSetPlate(canvas, canvas.width, canvas.height);
+                    // May fire long after the 2s timeout below gave up on it.
+                    if (!stale()) node.batSecSetPlate(canvas, canvas.width, canvas.height);
                     resolve();
                 });
                 // captureVideoFrame waits on loadeddata and may never fire.
@@ -350,7 +420,7 @@ async function plateFromNodePreview(node) {
         if (source.url) {
             try {
                 const img = await loadImage(source.url, { crossOrigin: true });
-                node.batSecSetPlate(img, img.width, img.height);
+                if (!stale()) node.batSecSetPlate(img, img.width, img.height);
                 return true;
             } catch (_) { /* try the next slot */ }
         }
@@ -382,11 +452,14 @@ async function refreshPlate(node, { allowNodePreview = true } = {}) {
 
     const stale = () => gen !== node._batSecPlateGen || !node.editor;
 
+    // An exact strip frame first; then the real frame from the file; only then
+    // the nearest strip frame, which beats strategy 3's frame-0-ish preview.
+    if (await plateFromStrip(node, batchIdx, { exactOnly: true })) return;
+    if (stale()) return;
+    if (await plateFromUpstreamFile(node, batchIdx, stale)) return;
+    if (stale()) return;
     if (await plateFromStrip(node, batchIdx)) return;
-    if (stale()) return;
-    if (await plateFromUpstreamFile(node, batchIdx)) return;
-    if (stale()) return;
-    if (allowNodePreview && await plateFromNodePreview(node)) return;
+    if (allowNodePreview && await plateFromNodePreview(node, stale)) return;
 }
 
 /** Paint a cached plate onto the editor. Returns false if there was nothing
@@ -423,31 +496,41 @@ async function applyCachedPlate(node, cached) {
  * bounds are left wide open — a max that's too small would block a perfectly
  * valid index, which is worse than no max at all.
  */
+// frame_index_select's max as declared in bat_sec_segmenter.py.
+const FRAME_INDEX_MAX = 999999;
+
+/** Undo a narrowing once the batch length can no longer be worked out. */
+function widenFrameBounds(node, widget) {
+    node._batSecBoundsSig = null;
+    if (!node._batSecBoundsNarrowed) return;
+    node._batSecBoundsNarrowed = false;
+    widget.options = widget.options || {};
+    widget.options.max = FRAME_INDEX_MAX;
+    node.graph?.setDirtyCanvas(true, true);
+}
+
 async function updateFrameBounds(node) {
     const widget = node.widgets?.find((w) => w.name === "frame_index_select");
     if (!widget) return;
 
-    let count = Number(node._batSecStrip?.frameCount) || 0;
+    // liveStrip, not the raw field: a strip from a clip that is no longer
+    // wired in would otherwise clamp the index to the OLD clip's length.
+    let count = Number(liveStrip(node)?.frameCount) || 0;
 
     if (!count) {
         const source = findPathSource(node);
-        if (!source) return;
+        // Unknown length — better no max than a wrong one. Actively reopen a
+        // max narrowed for a clip that is no longer wired in, or it would keep
+        // blocking valid indices into the new one.
+        if (!source) { widenFrameBounds(node, widget); return; }
         // Cache per (path + trim settings): this runs on every connection
         // change and every execution, and the answer only moves when one of
         // those inputs does.
-        const sig = [
-            source.path,
-            source.node.type,
-            widgetNum(source.node, "start_frame", ""),
-            widgetNum(source.node, "end_frame", ""),
-            widgetNum(source.node, "skip_first_frames", ""),
-            widgetNum(source.node, "frame_load_cap", ""),
-            widgetNum(source.node, "select_every_nth", ""),
-        ].join("|");
+        const sig = pathSourceSig(source.node, source.path);
         if (node._batSecBoundsSig === sig) return;
 
         const fileFrames = await fileFrameCount(source.path);
-        if (!fileFrames) return;   // unknown — better no max than a wrong one
+        if (!fileFrames) { widenFrameBounds(node, widget); return; }
 
         node._batSecBoundsSig = sig;
         count = sourceBatchLength(source.node, fileFrames);
@@ -459,6 +542,7 @@ async function updateFrameBounds(node) {
     widget.options = widget.options || {};
     widget.options.min = 0;
     widget.options.max = max;
+    node._batSecBoundsNarrowed = true;
     // Snap a now-illegal value into range rather than leaving it to fail at
     // execute time. Only ever narrows, so it can't silently move a valid pick.
     const current = Number(widget.value) || 0;
@@ -602,6 +686,7 @@ app.registerExtension({
                         w, h,
                         stride: Math.max(1, Number(one(message.stride)) || 1),
                         frameCount: Number(one(message.frame_count)) || images.length,
+                        sig: upstreamSignature(node),
                     };
 
                     // The strip's frame_count is the exact batch length, so
@@ -614,8 +699,7 @@ app.registerExtension({
 
                     // Cache only the annotation frame, not the whole strip —
                     // 240 base64 JPEGs would blow the localStorage quota.
-                    const stride = node._batSecStrip.stride;
-                    const slot = Math.min(frames.length - 1, Math.max(0, Math.round(idx / stride)));
+                    const slot = stripSlot(node._batSecStrip, idx, false);
                     saveCachedPlate(node, { frame: frames[slot], w, h });
                 })
                 .catch((e) => console.error("[Bat SeC] could not decode preview strip:", e));

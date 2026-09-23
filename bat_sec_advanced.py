@@ -53,8 +53,9 @@ class BatSecAdvancedParams:
                 }),
                 "device": (rt.device_choices(), {
                     "default": DEFAULTS["device"],
-                    "tooltip": "auto = gpu0 when CUDA is available, else CPU. "
-                               "CPU inference is forced to float32 and is very slow.",
+                    "tooltip": "auto = the GPU ComfyUI itself runs on (CPU under --cpu or on "
+                               "non-CUDA backends). CPU inference is forced to float32 and is "
+                               "very slow.",
                 }),
                 "tracking_direction": (TRACKING_DIRECTIONS, {
                     "default": DEFAULTS["tracking_direction"],
