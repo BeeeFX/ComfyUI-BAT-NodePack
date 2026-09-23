@@ -80,6 +80,38 @@ const clampWipe = (w) => Math.max(WIPE_MARGIN, Math.min(1 - WIPE_MARGIN,
 // completion, so a slow render costs latency and never responsiveness.
 const TRUTH_DEBOUNCE_MS = 80;
 
+/* ==========================================================================
+ * `ringing` in workflows saved before it existed
+ * ==========================================================================
+ *
+ * `ringing` was appended after `preview_frame`, but the viewer's DOM widget
+ * comes after both, and it only sets `options.serialize: false` (which keeps
+ * it out of the API prompt) — not `widget.serialize = false`, the flag the
+ * workflow serialiser checks. So every earlier save ends
+ * [..., preview_frame, <viewer value>], and positional restore hands that
+ * trailing "" / null to `ringing`: a combo value not in its list, which fails
+ * validation the moment the workflow is queued.
+ *
+ * Repaired after configure. A save that carries `widgets_values_named`
+ * answers the question exactly — no "ringing" key means it predates the
+ * widget. Otherwise anything that is not one of the options is taken as the
+ * stray viewer value. Both land on "off", the behaviour those workflows were
+ * saved with.
+ */
+export const RINGING_OPTIONS = ["off", "negative", "local"];
+
+export function repairLegacyRinging(node, info) {
+    const w = node?.widgets?.find((x) => x.name === "ringing");
+    if (!w) return false;
+    const named = info?.widgets_values_named;
+    const predates = !!named && typeof named === "object"
+        && !Object.prototype.hasOwnProperty.call(named, "ringing");
+    const opts = Array.isArray(w.options?.values) ? w.options.values : RINGING_OPTIONS;
+    if (!predates && opts.includes(w.value)) return false;
+    w.value = "off";
+    return true;
+}
+
 
 /* ==========================================================================
  * Size planning — the mirror of plan_size() in bat_rescale.py
@@ -217,7 +249,10 @@ function saveJson(key, value) {
 function buildViewer(node) {
     const track = batTrack(node);
 
-    const saved = loadJson(viewKey(node), {});
+    // View state starts at its defaults and is read in _batRescaleRestore:
+    // this runs inside onNodeCreated, before a loaded node has its real id, so
+    // a read here looked under the wrong key and never found anything.
+    const saved = {};
     const state = {
         // Source identity, filled in by a run (or restored from localStorage).
         token: null,
@@ -380,6 +415,7 @@ function buildViewer(node) {
             target: Number(val("target", 1024)),
             megapixels: Number(val("megapixels", 1)),
             filter: String(val("filter", "lanczos")),
+            ringing: String(val("ringing", "off")),
             multiple_of: Number(val("multiple_of", 1)),
             ref_h: state.refH || null,
             ref_w: state.refW || null,
@@ -513,7 +549,7 @@ function buildViewer(node) {
         return JSON.stringify([
             state.token, currentFrame(), v.roi, v.outW, v.outH,
             state.magnify, p.mode, p.scale, p.target, p.megapixels,
-            p.filter, p.multiple_of, p.ref_h, p.ref_w,
+            p.filter, p.ringing, p.multiple_of, p.ref_h, p.ref_w,
         ]);
     }
 
@@ -1177,7 +1213,7 @@ function buildViewer(node) {
 
     node._batRescaleWatch = () => {
         for (const name of ["mode", "scale", "target", "megapixels", "filter",
-                            "multiple_of"]) {
+                            "ringing", "multiple_of"]) {
             const w = W(name);
             if (!w || w._batRescaleHooked) continue;
             w._batRescaleHooked = true;
@@ -1253,6 +1289,19 @@ function buildViewer(node) {
     };
 
     node._batRescaleRestore = async () => {
+        // The view (zoom, pan, wipe, compare, magnify) is restored whatever
+        // happens below — a replay brings the picture back, not the framing.
+        const view = loadJson(viewKey(node), null);
+        if (view) {
+            state.zoom = view.zoom === undefined ? null : view.zoom;
+            state.cx = view.cx ?? null;
+            state.cy = view.cy ?? null;
+            state.wipe = clampWipe(view.wipe ?? 0.5);
+            state.compare = view.compare ?? "wipe";
+            state.magnify = view.magnify ?? "pixels";
+            paintChrome();
+            draw();
+        }
         // A full-res draft replayed from this session's last run beats the
         // cached thumbnail; both this decode and the token revalidation below
         // would otherwise land on top of it.
@@ -1343,6 +1392,13 @@ app.registerExtension({
             // Deferred: node.id is only final once litegraph has finished
             // constructing, and every localStorage key here is scoped by it.
             setTimeout(() => this._batRescaleRestore?.(), 0);
+            return r;
+        };
+
+        const onConfigure = nodeType.prototype.onConfigure;
+        nodeType.prototype.onConfigure = function (info) {
+            const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+            repairLegacyRinging(this, info);
             return r;
         };
 

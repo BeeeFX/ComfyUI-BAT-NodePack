@@ -419,7 +419,15 @@ function buildPreview(node) {
 
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
-    const saved = (() => { try { return JSON.parse(localStorage.getItem(viewKey(node)) || "{}") || {}; } catch (_) { return {}; } })();
+    // The saved view (mode, exposure, display transform) is read by
+    // restoreView() from the deferred restore, not here: this runs inside
+    // onNodeCreated, before a loaded node has its real id, so a read here
+    // looked under the wrong key and a reopened workflow never got it back.
+    const readView = () => {
+        try { return JSON.parse(localStorage.getItem(viewKey(node)) || "{}") || {}; }
+        catch (_) { return {}; }
+    };
+    const saved = {};
     const state = {
         plate: null,       // SourceBuffer, display-referred plate
         hdr: null,         // SourceBuffer, scene-linear HDR
@@ -762,7 +770,13 @@ function buildPreview(node) {
         reset.addEventListener("click", () => { state.exposure = 0; slider.value = "0"; commit(); });
         for (const e of [slider, reset, vtSel]) e.addEventListener("pointerdown", (ev) => ev.stopPropagation());
         refresh();
-        return { el, refresh };
+        // Push restored state back into the controls.
+        function sync() {
+            slider.value = String(state.exposure);
+            vtSel.value = state.viewTransform;
+            refresh();
+        }
+        return { el, refresh, sync };
     })();
     root.appendChild(bar.el);
 
@@ -881,7 +895,17 @@ function buildPreview(node) {
     // Restore something to look at on workflow reopen. Only the plate JPEG is
     // cached — the two 16-bit tiles are a few hundred KB each and localStorage
     // is a ~5MB origin-wide budget shared with every other BAT node's cache.
+    function restoreView() {
+        const v = readView();
+        if (VIEWS.some(x => x[0] === v.view)) state.view = v.view;
+        if (Number.isFinite(v.exposure)) state.exposure = v.exposure;
+        if (VIEW_TRANSFORMS.some(x => x[0] === v.viewTransform)) state.viewTransform = v.viewTransform;
+        bar.sync();
+        schedule();
+    }
+
     node._batHdrCompRestore = () => {
+        restoreView();      // the view comes back whether or not a replay does
         // A replay of this session's last run is coming with both 16-bit
         // tiles. This JPEG's decode could land after it and, having no HDR
         // tile of its own, blank the composite back to "plate only".

@@ -335,15 +335,17 @@ async function decodeEither(tile, jpeg, tag) {
  * the [0,1] slice and nothing else, and "did the highlights merge sensibly" is
  * a question about what is above it. Display only; never reaches the render.
  */
-function buildExposureStrip(storageKey, onChange, extra) {
+function buildExposureStrip(keyOf, onChange, extra) {
     const el = document.createElement("div");
     el.style.cssText = `display:flex; align-items:center; gap:5px; padding:4px 6px;
         background:#141414; border-top:1px solid #2a2a2a; font:11px monospace;
         color:#9aa; flex:0 0 auto; user-select:none; flex-wrap:wrap;`;
 
-    let saved = {};
-    try { saved = JSON.parse(localStorage.getItem(storageKey) || "{}") || {}; } catch (_) {}
-    const state = { exposure: Number.isFinite(saved.exposure) ? saved.exposure : 0 };
+    // `keyOf` is a function, read when used: the strip is built inside
+    // onNodeCreated, before a loaded node has its real id, so a key taken then
+    // was the same unassigned-id key for every node in the workflow. The saved
+    // value is read by restore(), from the node's deferred restore.
+    const state = { exposure: 0 };
 
     if (extra) el.appendChild(extra);
 
@@ -371,7 +373,7 @@ function buildExposureStrip(storageKey, onChange, extra) {
         readout.style.color = state.exposure === 0 ? "#788" : "#cde";
     }
     function commit() {
-        try { localStorage.setItem(storageKey, JSON.stringify({ exposure: state.exposure })); }
+        try { localStorage.setItem(keyOf(), JSON.stringify({ exposure: state.exposure })); }
         catch (_) {}
         refresh(); onChange?.();
     }
@@ -380,8 +382,17 @@ function buildExposureStrip(storageKey, onChange, extra) {
     for (const e of [slider, reset]) e.addEventListener("pointerdown", (ev) => ev.stopPropagation());
     refresh();
 
+    function restore() {
+        let saved = {};
+        try { saved = JSON.parse(localStorage.getItem(keyOf()) || "{}") || {}; } catch (_) {}
+        state.exposure = Number.isFinite(saved.exposure) ? saved.exposure : 0;
+        slider.value = String(state.exposure);
+        refresh(); onChange?.();
+    }
+
     return {
         el,
+        restore,
         // 0 EV must be exactly 1.0, not Math.pow(2, 0) rounding noise.
         get gain() { return state.exposure === 0 ? 1 : Math.pow(2, state.exposure); },
         get exposure() { return state.exposure; },
@@ -520,7 +531,7 @@ function buildBracketPreview(node) {
         });
 
     const bar = buildExposureStrip(
-        batNodeCacheKey(app, "bat_bracket_view", node), () => schedule(), clipBtn);
+        () => batNodeCacheKey(app, "bat_bracket_view", node), () => schedule(), clipBtn);
     root.appendChild(bar.el);
 
     /** Decode to linear on demand, caching against the current gamma mode. */
@@ -627,7 +638,9 @@ function buildBracketPreview(node) {
     node._batBracketNeedsRun = () => { state.needsRun = true; schedule(); };
 
     // ── ingest ───────────────────────────────────────────────────────────
-    const cacheKey = batNodeCacheKey(app, "bat_bracket_preview", node);
+    // A function for the same reason as the strip's key: node.id is not final
+    // yet when this runs.
+    const cacheKey = () => batNodeCacheKey(app, "bat_bracket_preview", node);
 
     node._batBracketIngest = async (msg) => {
         const one = (v) => (Array.isArray(v) ? v[0] : v);
@@ -651,17 +664,18 @@ function buildBracketPreview(node) {
         // origin-wide localStorage budget shared with every other BAT node's
         // cache. Reopening shows the fallback until the next run.
         if (jpeg) {
-            batCacheSet(cacheKey, JSON.stringify({ jpeg, meta: state.meta }));
+            batCacheSet(cacheKey(), JSON.stringify({ jpeg, meta: state.meta }));
         }
         schedule();
     };
 
     node._batBracketRestore = () => {
+        bar.restore();      // the viewer exposure comes back either way
         // A replay of this session's last run is on its way with the 16-bit
         // tile; an 8-bit JPEG decoded here could land after it and win.
         if (batPreviewWillReplay(node)) return;
         let c = null;
-        try { c = JSON.parse(localStorage.getItem(cacheKey) || "null"); } catch (_) {}
+        try { c = JSON.parse(localStorage.getItem(cacheKey()) || "null"); } catch (_) {}
         if (!c?.jpeg) return;
         node._batBracketIngest({
             plate_jpeg: [c.jpeg],
@@ -862,7 +876,7 @@ function buildMergePreview(node) {
     const str = (n, d) => { const w = W(n); return w == null ? d : String(w.value); };
 
     const bar = buildExposureStrip(
-        batNodeCacheKey(app, "bat_merge_view", node), () => schedule(), null);
+        () => batNodeCacheKey(app, "bat_merge_view", node), () => schedule(), null);
     root.appendChild(bar.el);
 
     let viewButtons = [];
@@ -1005,6 +1019,7 @@ function buildMergePreview(node) {
         });
     }
     node._batMergeRepaint = schedule;
+    node._batMergeRestore = () => bar.restore();
 
     // Value probe — reads the merged linear value and each pass's weight, which
     // together are the whole diagnosis for "why is this region wrong".
@@ -1216,6 +1231,8 @@ app.registerExtension({
                 clampNodeSize(this, 380, 420);
 
                 setTimeout(() => syncMergeInputs(this), 0);
+                // Deferred like the bracket's: the view key needs the final id.
+                setTimeout(() => this._batMergeRestore?.(), 0);
                 return r;
             };
             const onConn = nodeType.prototype.onConnectionsChange;

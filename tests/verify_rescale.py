@@ -28,6 +28,7 @@ argument:
     python tests/verify_rescale.py
 """
 
+import json
 import math
 import os
 import re
@@ -387,7 +388,9 @@ def test_preview_reference_and_memo():
     ref = torch.zeros(1, 45, 80, 3)
     res = rescale.BatRescale().run(src, "match_reference", 1.0, 1024, 1.0,
                                    "lanczos", 1, False, reference=ref)
-    ui = res["ui"]
+    # The ui is stashed to a sidecar now; load_ui gives back the full dict.
+    from batpack.bat_ui_ref import load_ui
+    ui = load_ui(res["ui"])
     check("run() ships the reference size in ui",
           ui.get("ref_w") == [80] and ui.get("ref_h") == [45],
           f"ref_w={ui.get('ref_w')} ref_h={ui.get('ref_h')}")
@@ -403,6 +406,75 @@ def test_preview_reference_and_memo():
           info["res"] == [80, 45], f"res={info['res']}")
     check("preview renders do not grow the matrix memo",
           len(cache) == before, f"{before} -> {len(cache)} entries")
+
+
+# ---------------------------------------------------------------------------
+# 4c. The ringing control and the mask output
+# ---------------------------------------------------------------------------
+
+def test_ringing_and_mask():
+    """`ringing` must leave "off" untouched (saved workflows render as before),
+    and the two clamps must do what they say — including in a region render,
+    which has to stay the crop of the full frame it always was."""
+    edge = torch.zeros(1, 16, 64, 3)
+    edge[:, :, 32:] = 50.0                         # a scene-linear hard edge
+    for filt in ("lanczos", "bicubic"):
+        for ow in (37, 128):
+            off = rescale.resample_region(edge, 16, ow, filt)
+            neg = rescale.resample_region(edge, 16, ow, filt, ringing="negative")
+            loc = rescale.resample_region(edge, 16, ow, filt, ringing="local")
+            check(f"ringing off is the plain resample  [{filt} ->{ow}]",
+                  torch.equal(off, rescale.resample_region(edge, 16, ow, filt, ringing="off"))
+                  and float(off.min()) < -1.0)
+            check(f"ringing negative clamps only below 0  [{filt} ->{ow}]",
+                  float(neg.min()) >= 0.0 and torch.equal(neg, off.clamp(min=0.0)))
+            check(f"ringing local stays inside the source range  [{filt} ->{ow}]",
+                  float(loc.min()) >= 0.0 and float(loc.max()) <= 50.0,
+                  f"[{float(loc.min()):.3f}, {float(loc.max()):.3f}]")
+
+    # Region exactness under the local clamp, same harness as test 1.
+    src = _plate(360, 480, seed=4) * 8.0
+    fh, fw = src.shape[1], src.shape[2]
+    for out_h, out_w in ((137, 211), (540, 720)):
+        full = rescale.resample_region(src, out_h, out_w, "lanczos", ringing="local")
+        sx, sy = out_w / fw, out_h / fh
+        worst = 0.0
+        for (dx0, dy0, dw, dh) in ((0, 0, 31, 23), (out_w - 40, out_h - 30, 40, 30),
+                                   (out_w // 3, out_h // 4, out_w // 5, out_h // 6)):
+            sl_x0, sl_x1 = rescale._pad_interval(dx0 / sx, (dx0 + dw) / sx, dw, "lanczos", 0, fw)
+            sl_y0, sl_y1 = rescale._pad_interval(dy0 / sy, (dy0 + dh) / sy, dh, "lanczos", 0, fh)
+            got = rescale.resample_region(
+                src[:, sl_y0:sl_y1, sl_x0:sl_x1], dh, dw, "lanczos",
+                src_x=dx0 / sx, src_y=dy0 / sy, src_w=dw / sx, src_h=dh / sy,
+                off_x=sl_x0, off_y=sl_y0, ringing="local")
+            worst = max(worst, float((got - full[:, dy0:dy0 + dh, dx0:dx0 + dw]).abs().max()))
+        check(f"region == full-frame crop with ringing=local  [->{out_w}x{out_h}]",
+              worst < 1e-3, f"max |Δ| = {worst:.2e}")
+
+    node = rescale.BatRescale()
+    check("mask is the last output", rescale.BatRescale.RETURN_TYPES[-1] == "MASK"
+          and rescale.BatRescale.RETURN_TYPES[:4] == ("IMAGE", "INT", "INT", "FLOAT"))
+    img = _plate(120, 160, seed=6)
+    r = node.run(img, "factor", 0.5, 1024, 1.0, "lanczos", 1, False)["result"]
+    check("no mask connected -> one empty frame at the output size",
+          tuple(r[4].shape) == (1, 60, 80) and float(r[4].abs().max()) == 0.0,
+          str(tuple(r[4].shape)))
+    m = torch.zeros(2, 120, 160)
+    m[:, 30:90, 40:120] = 1.0
+    for s_, want in ((0.5, (2, 60, 80)), (2.0, (2, 240, 320))):
+        r = node.run(img, "factor", s_, 1024, 1.0, "lanczos", 1, False, mask=m)["result"]
+        mo = r[4]
+        check(f"mask follows the image  [x{s_}]",
+              tuple(mo.shape) == want and tuple(r[0].shape[1:3]) == want[1:]
+              and 0.0 <= float(mo.min()) and float(mo.max()) <= 1.0
+              and abs(float(mo.mean()) - float(m.mean())) < 0.02,
+              f"{tuple(mo.shape)} mean {float(mo.mean()):.3f} vs {float(m.mean()):.3f}")
+    # A mask at a different size than the image still lands on the image's
+    # output size — it is the output image it has to register with.
+    r = node.run(img, "width", 1.0, 100, 1.0, "lanczos", 1, False,
+                 mask=torch.ones(1, 30, 40))["result"]
+    check("an odd-sized mask lands on the output size",
+          tuple(r[4].shape) == (1, 75, 100), str(tuple(r[4].shape)))
 
 
 # ---------------------------------------------------------------------------
@@ -450,12 +522,118 @@ def test_extension_loads():
           not bool(ctx.eval("globalThis.__touched")))
 
 
+# ---------------------------------------------------------------------------
+# 6. Workflows saved before `ringing` existed still load, and still queue
+# ---------------------------------------------------------------------------
+
+def test_legacy_ringing_restore():
+    """The viewer's DOM widget is serialised positionally after the Python
+    widgets (it sets only options.serialize), so every save made before
+    `ringing` ends [..., preview_frame, <viewer value>] and positional restore
+    hands that value to `ringing` — "Value not in list" on the next queue.
+
+    Drives the real prototype onConfigure the extension installs, after a
+    restore step that mirrors the frontend's (LGraphNode.configure: every
+    widget without `serialize === false` takes the next positional value, or
+    its named value when named restore is on)."""
+    try:
+        import quickjs           # noqa: F401
+    except ImportError:
+        print("SKIP  legacy ringing restore — pip install quickjs to run it")
+        return
+
+    ctx = _js_context()
+    ctx.eval("""
+        globalThis.__proto = null;
+        (async function () {
+            const nt = { prototype: {} };
+            await globalThis.__registered.beforeRegisterNodeDef(nt, { name: "Bat_Rescale" }, app);
+            globalThis.__proto = nt.prototype;
+        })();
+    """)
+    for _ in range(64):
+        try:
+            if not ctx.execute_pending_job():
+                break
+        except AttributeError:
+            break
+    ctx.eval("""
+        globalThis.__load = function (payload) {
+            const j = JSON.parse(payload);
+            const W = (name, value, extra) => Object.assign({ name, value, options: {} }, extra || {});
+            const node = Object.create(globalThis.__proto);
+            node.widgets = [
+                W("mode", "factor"), W("scale", 1.0), W("target", 1024),
+                W("megapixels", 1.0), W("filter", "lanczos"), W("multiple_of", 1),
+                W("clamp_output", false), W("preview_frame", 0),
+                W("ringing", "off", { options: { values: ["off", "negative", "local"] } }),
+                // The viewer: options.serialize only, like addBatDOMWidget.
+                W("bat_rescale_viewer", "", { options: { serialize: false } }),
+            ];
+            // Only saved slots survive configure — an old save has no mask.
+            node.inputs = j.inputs; node.outputs = j.outputs;
+            const info = { widgets_values: j.values, inputs: j.inputs, outputs: j.outputs };
+            if (j.named) info.widgets_values_named = j.named;
+            let i = 0;
+            for (const w of node.widgets) {
+                if (w.serialize === false) continue;
+                if (j.named && j.namedRestore) {
+                    if (Object.prototype.hasOwnProperty.call(j.named, w.name)) w.value = j.named[w.name];
+                } else if (i < j.values.length) {
+                    w.value = j.values[i];
+                }
+                i++;
+            }
+            node.onConfigure(info);
+            const get = (n) => node.widgets.find((w) => w.name === n).value;
+            return JSON.stringify([get("ringing"), get("preview_frame"), get("filter")]);
+        };
+    """)
+    load = ctx.get("__load")
+
+    OLD = ["factor", 0.5, 1024, 1.0, "bicubic", 8, False, 3]
+    old_in = [{"name": "image", "type": "IMAGE"}, {"name": "reference", "type": "IMAGE"}]
+    old_out = [{"name": n, "type": t} for n, t in
+               (("image", "IMAGE"), ("width", "INT"), ("height", "INT"), ("scale", "FLOAT"))]
+    new_in = old_in + [{"name": "mask", "type": "MASK"}]
+    new_out = old_out + [{"name": "mask", "type": "MASK"}]
+    named_old = dict(zip(["mode", "scale", "target", "megapixels", "filter",
+                          "multiple_of", "clamp_output", "preview_frame",
+                          "bat_rescale_viewer"], OLD + [""]))
+    cases = [
+        ("old save, trailing viewer ''",   OLD + [""],   None, False, old_in, old_out, "off"),
+        ("old save, trailing viewer null", OLD + [None], None, False, old_in, old_out, "off"),
+        ("old save, no trailing slot",     OLD,          None, False, old_in, old_out, "off"),
+        ("old save with named values (positional restore)",
+         OLD + [""], named_old, False, old_in, old_out, "off"),
+        ("old save with named values (named restore)",
+         OLD + [""], named_old, True, old_in, old_out, "off"),
+        ("new save holding 'local'",       OLD + ["local", ""], None, False, new_in, new_out, "local"),
+        ("new save, named 'negative'",     OLD + ["negative", ""],
+         dict(named_old, ringing="negative"), True, new_in, new_out, "negative"),
+    ]
+    for (name, values, named, named_restore, ins, outs, want) in cases:
+        got = json.loads(load(json.dumps({
+            "values": values, "named": named, "namedRestore": named_restore,
+            "inputs": ins, "outputs": outs})))
+        check(f"legacy restore: {name}",
+              got == [want, 3, "bicubic"], f"ringing={got[0]!r} preview_frame={got[1]} filter={got[2]}")
+
+    # The editor never addresses a slot by index, so the mask input/output an
+    # old save lacks cannot shift anything it reads.
+    src = open(os.path.join(PACK, "web", "bat_rescale.js"), encoding="utf-8").read()
+    check("viewer never indexes node.inputs / node.outputs",
+          not re.search(r"\.(inputs|outputs)\s*\[", src))
+
+
 if __name__ == "__main__":
     test_region_exact()
     test_blend_parity()
     test_plan_size_parity()
     test_divider_hit_test()
     test_preview_reference_and_memo()
+    test_ringing_and_mask()
+    test_legacy_ringing_restore()
     test_extension_loads()
     print()
     if FAILURES:

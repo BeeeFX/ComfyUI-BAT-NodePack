@@ -73,6 +73,7 @@ import torch
 from PIL import Image
 
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
 from . import bat_interrupt as _interrupt
 from .bat_hdr_tonal_composite import (
     _EPS, _K_MIN, _K_MAX, _encode_from_linear, _luminance, _to_linear,
@@ -320,7 +321,9 @@ class BatExposureBracket:
               "count": [len(stops)]}
         ui.update(self._preview_payload(plate, str(plate_gamma_mode),
                                         preview_frame))
-        return {"ui": ui, "result": (pipe, *padded)}
+        # The plate tile + JPEG are stashed to a sidecar so they stay out of
+        # the prompt history — see bat_ui_ref.py. The JS sees the same dict.
+        return {"ui": stash_ui(ui), "result": (pipe, *padded)}
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -477,7 +480,8 @@ class BatExposureMerge:
                                    float(well_exposed_sigma))
         ui = self._preview_payload(got, plate_lin, gamma_mode, scales, stops,
                                    align, reference, float(well_exposed_sigma))
-        return {"ui": ui, "result": (out,)}
+        # Up to nine 16-bit tiles: stashed, as the bracket's are.
+        return {"ui": stash_ui(ui), "result": (out,)}
 
     # ------------------------------------------------------------------
     @staticmethod

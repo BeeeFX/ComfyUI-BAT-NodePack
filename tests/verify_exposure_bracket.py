@@ -405,6 +405,43 @@ def main():
     if m.parse_stops("0 nan -2") is not None:
         failures.append(("parse_stops rejects nan", str(m.parse_stops("0 nan -2"))))
 
+    # ── 7. HDR Tonal Composite: shared plate work changes nothing ────────
+    # Several hdr_ai versions now share one `_plate_terms` per chunk instead
+    # of recomputing it per version. Each version's outputs must be
+    # bit-identical to compositing it on its own — a version writing into the
+    # shared terms would show up here as the NEXT version changing.
+    torch.manual_seed(5)
+    cplate = torch.rand(3, 40, 56, 3)
+    chdrs = [torch.rand(3, 40, 56, 3) * s for s in (3.0, 6.0, 11.0)]
+    cnode = comp.BatHDRTonalComposite()
+    for cfg in ({}, {"match_scope": "per_frame"},
+                {"detail_transfer": 0.7, "detail_radius": 5, "blur_radius": 2},
+                {"auto_match_mids": False, "linear_out_primaries": "acescg"}):
+        multi = cnode.composite(cplate, chdrs[0], hdr_ai_2=chdrs[1], hdr_ai_3=chdrs[2],
+                                preview_resolution="256", **cfg)["result"]
+        for v, h in enumerate(chdrs):
+            alone = cnode.composite(cplate, h, preview_resolution="256", **cfg)["result"]
+            if not (torch.equal(multi[2 * v], alone[0])
+                    and torch.equal(multi[2 * v + 1], alone[1])):
+                failures.append((f"composite version {v + 1} shared == alone {cfg}",
+                                 "outputs differ"))
+
+    # ── 8. the previews ride the sidecar ─────────────────────────────────
+    # Bracket and merge stash their tiles out of the prompt history; the JS
+    # gets the same dict back through bat_ui_ref, and so does load_ui here.
+    load_ui = sys.modules["batpack.bat_ui_ref"].load_ui
+    bres = m.BatExposureBracket().split(plate4.clamp(0, 1), "srgb", 3, 1.5, "down", "", 0)
+    bui = load_ui(bres["ui"])
+    if "bat_ui" not in bres["ui"] or not bui or "plate_tile" not in bui:
+        failures.append(("bracket ui stashed and resolvable", str(list(bres["ui"]))))
+    pipe = bres["result"][0]
+    mres = m.BatExposureMerge().merge(
+        pipe, "auto", 0.2, "auto",
+        **{f"hdr_{i + 1}": pipe["plate_lin"] * 2.0 ** ev for i, ev in enumerate(pipe["stops"])})
+    mui = load_ui(mres["ui"])
+    if "bat_ui" not in mres["ui"] or not mui or "pass_tiles" not in mui:
+        failures.append(("merge ui stashed and resolvable", str(list(mres["ui"]))))
+
     print(f"{n_align} merge configurations x {len(MODES)} transfer modes")
     print("  (residual = worst error as a fraction of its allowance; "
           "1.00 would be exactly at tolerance)")

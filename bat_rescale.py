@@ -70,6 +70,11 @@ implemented here rather than borrowed from ``comfy.utils.common_upscale`` for
 the same reason ``bat_advanced_blend`` gives: that module's lanczos path
 round-trips through PIL, which clamps to [0,1] and quantises to 8-bit.
 
+``ringing`` is the finer tool for the one artefact unclamped output implies:
+lanczos and bicubic overshoot a hard edge, and on scene-linear data that dips
+below 0. It can clamp just the negatives, or each pixel to its source
+neighbourhood's range, and is off by default so nothing changes unasked.
+
 The kernels themselves ARE borrowed from ``bat_advanced_blend`` — one
 definition of lanczos in the pack, not two. What is local is the phase-explicit
 matrix builder ``_map_matrix``, which resamples an arbitrary *source interval*
@@ -101,10 +106,15 @@ from PIL import Image
 # The kernels, and the request-value coercion, come from the blend node so the
 # pack has one lanczos rather than two that can drift apart.
 from .bat_advanced_blend import _kernel, _num
+from .bat_ui_ref import stash_ui
 
 logger = logging.getLogger("[Bat_Rescale]")
 
 FILTERS = ["lanczos", "bicubic", "bilinear", "area", "nearest"]
+RINGING = ["off", "negative", "local"]
+# The kernels with negative lobes — the only ones that can ring. The rest are
+# convex averages and already stay inside their inputs' range.
+_RINGING_FILTERS = ("lanczos", "bicubic")
 MODES = ["factor", "long_edge", "short_edge", "width", "height",
          "megapixels", "match_reference"]
 
@@ -287,16 +297,42 @@ def _nearest_index(src_lo, src_hi, slab_lo, n_slab, n_out, device):
             .clamp(0, max(0, n_slab - 1)))
 
 
+def _local_bounds(x, src_lo, src_hi, slab_lo, n_out, filt):
+    """Per-output (min, max) of the input samples under the kernel, last axis.
+
+    `x` is (..., n_slab). The window is the tap footprint — ``support`` input
+    pixels either side, widened by the minification ratio like the kernel —
+    taken around the pixel holding each output centre, so it can only be a
+    pixel wider than the true footprint, never narrower. Same coordinates as
+    `_map_matrix`, so a region render clamps exactly as the full frame does.
+    """
+    n = x.shape[-1]
+    span = max(float(src_hi) - float(src_lo), 1e-9)
+    scale = n_out / span
+    widen = 1.0 / scale if scale < 1.0 else 1.0
+    _fn, support = _kernel(filt)
+    r = int(math.ceil(support * widen))
+    centers = float(src_lo) + (torch.arange(n_out, device=x.device,
+                                            dtype=torch.float32) + 0.5) / scale
+    idx = (centers - float(slab_lo)).floor().long().clamp(0, n - 1)
+    flat = x.reshape(-1, 1, n)
+    hi = torch.nn.functional.max_pool1d(flat, 2 * r + 1, stride=1, padding=r)
+    lo = -torch.nn.functional.max_pool1d(-flat, 2 * r + 1, stride=1, padding=r)
+    return (lo.reshape(x.shape)[..., idx], hi.reshape(x.shape)[..., idx])
+
+
 def resample_region(img, out_h, out_w, filt,
                     src_x=0.0, src_y=0.0, src_w=None, src_h=None,
-                    off_x=0, off_y=0, memo=True):
+                    off_x=0, off_y=0, memo=True, ringing="off"):
     """Resample the source interval ``(src_x, src_y, src_w, src_h)`` of `img` to
     ``out_h`` x ``out_w``.
 
     `img` is (N, H, W, C) float. ``off_x`` / ``off_y`` say where `img` sits in
     the coordinate system the interval is expressed in, so a slab cut out of a
-    bigger frame can be passed straight in. Nothing is clamped or quantised.
-    ``memo`` is handed to `_map_matrix`.
+    bigger frame can be passed straight in. Nothing is clamped or quantised
+    unless ``ringing`` asks: "negative" clamps the result at 0, "local" clamps
+    each pass to the min/max of the input samples under its kernel. ``memo``
+    is handed to `_map_matrix`.
     """
     n, h, w, c = img.shape
     if src_w is None:
@@ -309,7 +345,9 @@ def resample_region(img, out_h, out_w, filt,
     if filt == "nearest":
         xs = _nearest_index(src_x, src_x + src_w, off_x, w, out_w, img.device)
         ys = _nearest_index(src_y, src_y + src_h, off_y, h, out_h, img.device)
-        return out[:, ys][:, :, xs]
+        out = out[:, ys][:, :, xs]
+        return out.clamp(min=0.0) if ringing == "negative" else out
+    local = ringing == "local" and filt in _RINGING_FILTERS
 
     mx = _map_matrix(src_x, src_x + src_w, off_x, w, out_w,
                      filt, img.device, img.dtype, memo)
@@ -318,22 +356,35 @@ def resample_region(img, out_h, out_w, filt,
     # `.contiguous()` before each matmul is worth 8-10x on CPU, where IMAGE
     # tensors live: a batched matmul on a movedim()ed, strided view falls off
     # BLAS's fast path (measured 2.6s -> 0.3s for one 4K frame to 540p).
-    out = (out.movedim(2, -1).contiguous() @ mx.transpose(0, 1)).movedim(-1, 2)
+    xin = out.movedim(2, -1).contiguous()
+    res = xin @ mx.transpose(0, 1)
+    if local:
+        lo, hi = _local_bounds(xin, src_x, src_x + src_w, off_x, out_w, filt)
+        res = torch.minimum(torch.maximum(res, lo), hi)
+    out = res.movedim(-1, 2)
     my = _map_matrix(src_y, src_y + src_h, off_y, h, out_h,
                      filt, img.device, img.dtype, memo)
-    out = (out.movedim(1, -1).contiguous() @ my.transpose(0, 1)).movedim(-1, 1)
+    yin = out.movedim(1, -1).contiguous()
+    res = yin @ my.transpose(0, 1)
+    if local:
+        lo, hi = _local_bounds(yin, src_y, src_y + src_h, off_y, out_h, filt)
+        res = torch.minimum(torch.maximum(res, lo), hi)
+    out = res.movedim(-1, 1)
+    if ringing == "negative":
+        out = out.clamp(min=0.0)
     return out
 
 
-def resize_batch(images, out_h, out_w, filt, chunk=CHUNK_FRAMES):
-    """Resize an (N,H,W,C) batch, chunked over frames. Unclamped."""
+def resize_batch(images, out_h, out_w, filt, chunk=CHUNK_FRAMES, ringing="off"):
+    """Resize an (N,H,W,C) batch, chunked over frames. Unclamped unless
+    ``ringing`` says otherwise (see `resample_region`)."""
     n, h, w, _c = images.shape
     if (h, w) == (int(out_h), int(out_w)):
         return images
     parts = []
     for i in range(0, n, chunk):
         blk = images[i:i + chunk].to(torch.float32)
-        parts.append(resample_region(blk, out_h, out_w, filt))
+        parts.append(resample_region(blk, out_h, out_w, filt, ringing=ringing))
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
 
@@ -524,12 +575,54 @@ class BatRescale:
                     "tooltip": "Only read by `match_reference` mode: the output "
                                "lands on exactly this image's size.",
                 }),
+                "mask": ("MASK", {
+                    "tooltip": "Resized to the output image's size alongside "
+                               "it — area when shrinking, bilinear when "
+                               "enlarging, per axis — so a matte stays "
+                               "registered with the rescaled plate.",
+                }),
+                # In `optional`, last: an API prompt saved before it existed
+                # then still validates (a missing REQUIRED input is an error),
+                # and it is still the last widget, after preview_frame, so
+                # positional widgets_values keep their slots. Absent = "off",
+                # the output those workflows rendered; web/bat_rescale.js
+                # repairs the stray viewer value an old UI save hands it.
+                "ringing": (RINGING, {
+                    "default": "off",
+                    "tooltip":
+                        "What to do about lanczos / bicubic ringing — the "
+                        "overshoot either side of a hard edge, which on a "
+                        "scene-linear plate can dip well below 0 (a 0 -> 50 "
+                        "edge undershoots to about -5).\n"
+                        "\n"
+                        "off — leave it, the resample as computed\n"
+                        "negative — clamp only values below 0; everything "
+                        "above white survives\n"
+                        "local — clamp each pixel to the min/max of the "
+                        "source pixels under the kernel: no overshoot past "
+                        "the edge in either direction, and no negatives from "
+                        "a non-negative plate\n"
+                        "\n"
+                        "Independent of clamp_output, which clamps to [0,1] "
+                        "afterwards.",
+                }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT")
-    RETURN_NAMES = ("image", "width", "height", "scale")
+    # `mask` is appended last so links saved against the first four keep their
+    # slot.
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "FLOAT", "MASK")
+    RETURN_NAMES = ("image", "width", "height", "scale", "mask")
+    OUTPUT_TOOLTIPS = (
+        "The rescaled batch.",
+        "Output width in pixels.",
+        "Output height in pixels.",
+        "Output width / input width.",
+        "The `mask` input at the output size. With nothing connected it is an "
+        "EMPTY mask (all zeros, one frame) at the output size — the same "
+        "convention as LoadImage for an image without alpha.",
+    )
     FUNCTION = "run"
     CATEGORY = "BAT/image"
     DESCRIPTION = (
@@ -542,8 +635,8 @@ class BatRescale:
     )
 
     def run(self, image, mode, scale, target, megapixels, filter,
-            multiple_of, clamp_output, preview_frame=0, reference=None,
-            unique_id=None):
+            multiple_of, clamp_output, preview_frame=0, ringing="off",
+            reference=None, mask=None, unique_id=None):
         if image.ndim != 4:
             raise ValueError(f"expected an (N,H,W,C) batch, got {tuple(image.shape)}")
         n, h, w = int(image.shape[0]), int(image.shape[1]), int(image.shape[2])
@@ -559,9 +652,11 @@ class BatRescale:
         out_h, out_w = plan_size(h, w, mode, scale, target, megapixels,
                                  multiple_of, ref_h, ref_w)
 
-        out = resize_batch(image, out_h, out_w, filt)
+        ringing = ringing if ringing in RINGING else "off"
+        out = resize_batch(image, out_h, out_w, filt, ringing=ringing)
         if clamp_output:
             out = out.clamp(0.0, 1.0)
+        out_mask = _resize_mask(mask, out_h, out_w, image.device)
 
         idx = max(0, min(int(preview_frame), n - 1))
         ui = {
@@ -584,8 +679,10 @@ class BatRescale:
                 logger.warning("Bat_Rescale: could not cache the preview frame "
                                "(%s); the viewer will ask for a re-run.", exc)
 
-        return {"ui": ui, "result": (out, int(out_w), int(out_h),
-                                     float(out_w) / w)}
+        # The thumbnail JPEG is stashed to a sidecar so it stays out of the
+        # prompt history — see bat_ui_ref.py. The viewer sees the same dict.
+        return {"ui": stash_ui(ui), "result": (out, int(out_w), int(out_h),
+                                               float(out_w) / w, out_mask)}
 
     # ------------------------------------------------------------------
     def _cache_preview(self, unique_id, image, idx, n, w, h,
@@ -612,6 +709,30 @@ class BatRescale:
         # small enough to keep in localStorage so a reopened workflow shows
         # something before the first Run.
         return {"token": [token], "thumb": [_b64_jpeg(frame[0])]}
+
+
+def _resize_mask(mask, out_h, out_w, device):
+    """The `mask` input at (out_h, out_w), or an empty mask when there is none.
+
+    Filter chosen per axis — area where that axis shrinks, bilinear where it
+    grows — because a mask wants neither lanczos's ringing (a matte that goes
+    negative or past 1 at its edge) nor nearest's stair-steps. Both are convex
+    averages, so the result stays inside the input's range with no clamp.
+    """
+    if mask is None:
+        return torch.zeros((1, int(out_h), int(out_w)), dtype=torch.float32,
+                           device=device)
+    m = mask if mask.ndim == 3 else mask.reshape(-1, *mask.shape[-2:])
+    m = m.unsqueeze(-1)
+    mh, mw = int(m.shape[1]), int(m.shape[2])
+    fx = "area" if out_w < mw else "bilinear"
+    fy = "area" if out_h < mh else "bilinear"
+    if fx != fy:
+        # One axis at a time: resample_region takes one filter, and an axis
+        # left at its own size is an exact identity under either of these.
+        m = resize_batch(m, mh, out_w, fx)
+    m = resize_batch(m, out_h, out_w, fy)
+    return m[..., 0]
 
 
 def _b64_jpeg(frame, max_dim: int = 768, quality: int = 88) -> str:
@@ -726,7 +847,8 @@ def render_pair(entry, p, roi, out_w, out_h, frame_index, magnify="smooth"):
         scaled = resample_region(slab, dh, dw, filt,
                                  src_x=dx0 / sx, src_y=dy0 / sy,
                                  src_w=dw / sx, src_h=dh / sy,
-                                 off_x=slab_x0, off_y=slab_y0, memo=False)
+                                 off_x=slab_x0, off_y=slab_y0, memo=False,
+                                 ringing=p.get("ringing", "off"))
         # Back up to the screen box. This is the display decision, and it is why
         # the picture does not change size when the resolution does.
         shown = resample_region(scaled, out_h, out_w, magnify_filt,
@@ -820,9 +942,13 @@ def params_from_request(body):
     filt = str(body.get("filter", "lanczos"))
     if filt not in FILTERS:
         filt = "lanczos"
+    ringing = str(body.get("ringing", "off"))
+    if ringing not in RINGING:
+        ringing = "off"
     return {
         "mode": mode,
         "filter": filt,
+        "ringing": ringing,
         "scale": _num(body.get("scale", 1.0), 1.0, 0.01, 8.0),
         "target": int(_num(body.get("target", 1024), 1024, 1, 16384)),
         "megapixels": _num(body.get("megapixels", 1.0), 1.0, 0.01, 256.0),

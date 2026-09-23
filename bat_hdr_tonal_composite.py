@@ -190,6 +190,7 @@ from PIL import Image
 
 from . import bat_interrupt as _interrupt
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
 
 logger = logging.getLogger("[Bat_HDRTonalComposite]")
 
@@ -799,11 +800,20 @@ def _composite_chunk(plate: torch.Tensor, hdr: torch.Tensor, k: float,
     pixel-for-pixel by `applyComposite()` in the sibling .js — the two have to
     be changed together or the preview starts lying.
     """
-    plate_lin = _to_linear(plate, p["plate_gamma_mode"])
-    hdr_m = (hdr * k).clamp(min=0.0)
+    return _composite_merge(_plate_terms(plate, p), hdr, k, p)
 
+
+def _plate_terms(plate: torch.Tensor, p: dict) -> dict:
+    """Everything `_composite_chunk` derives from the plate alone.
+
+    Split out so several hdr_ai versions of one plate share it: the decode,
+    the tonal key, both ramps (and their blurs), the plate's detail band and its
+    chroma direction are the same for every version, and were being recomputed
+    per version. Same ops in the same order as before the split, so the output
+    is bit-identical — tests/verify_exposure_bracket.py holds it to that.
+    """
+    plate_lin = _to_linear(plate, p["plate_gamma_mode"])
     y_src = _luminance(plate_lin)
-    y_hdr = _luminance(hdr_m)
     y_key = _key_luma(plate_lin, p["plate_gamma_mode"])
 
     w_sh, w_hi = _tonal_ramps(y_key, p)
@@ -812,13 +822,44 @@ def _composite_chunk(plate: torch.Tensor, hdr: torch.Tensor, k: float,
     # crossed the thresholds) the intent is "let the HDR in", not "twice".
     w = torch.maximum(w_sh, w_hi)
 
+    # Level amount — see stage 1 in `_composite_merge`.
+    a_tone = torch.maximum(w_sh * p["shadow_tone_transfer"],
+                           w_hi * p["highlight_tone_transfer"]).clamp(0.0, 1.0)
+    a_det = (w * p["detail_transfer"]).clamp(0.0, 1.0)
+    t = {"plate_lin": plate_lin, "y_src": y_src, "y_key": y_key, "w": w,
+         "a_tone": a_tone, "detail": False}
+    if p["detail_transfer"] > 0.0 and p["detail_radius"] > 0 and float(w.max()) > 0.0:
+        _, t["d_src"] = _log_detail(y_src, p["detail_radius"])
+        # The level lerp already dragged roughly `a_tone` of the HDR's detail
+        # along with it, so only inject the shortfall. This is what keeps
+        # tone_transfer = detail_transfer = 1 a clean pass-through to the HDR
+        # instead of applying its texture twice.
+        t["extra"] = (a_det - a_tone).clamp(min=0.0)
+        t["detail"] = True
+
+    t["ones"] = torch.ones_like(plate_lin)
+    t["dir_plate"] = torch.where(y_src.unsqueeze(-1) > _EPS,
+                                 plate_lin / y_src.unsqueeze(-1).clamp(min=_EPS),
+                                 t["ones"])
+    # How much plate chroma there actually is to preserve. Goes to 0 as the
+    # plate goes black, which is what stops "preserve_plate_chroma = 1" from
+    # meaning "preserve this pixel's meaningless near-zero hue".
+    conf = y_src / (y_src + _BLACK_FLOOR)
+    t["c"] = (conf * p["preserve_plate_chroma"]).unsqueeze(-1)
+    return t
+
+
+def _composite_merge(t: dict, hdr: torch.Tensor, k: float, p: dict) -> torch.Tensor:
+    """The HDR-dependent half of `_composite_chunk`, over `_plate_terms` `t`."""
+    plate_lin, y_src, w, a_tone = t["plate_lin"], t["y_src"], t["w"], t["a_tone"]
+    hdr_m = (hdr * k).clamp(min=0.0)
+    y_hdr = _luminance(hdr_m)
+
     # ── stage 1: level ───────────────────────────────────────────────────
     # Straight linear-light lerp of the target luminance, per tonal end.
     # Linear rather than geometric on purpose: a log-domain lerp here would
     # make deep-shadow behaviour a function of the log offset rather than of
     # the picture, and shadow recovery is exactly what this node must get right.
-    a_tone = torch.maximum(w_sh * p["shadow_tone_transfer"],
-                           w_hi * p["highlight_tone_transfer"]).clamp(0.0, 1.0)
     # Bounded by the inputs by construction — a lerp cannot leave
     # [min(y_src, y_hdr), max(y_src, y_hdr)] — so nothing here needs a
     # ceiling. Putting one here, as this node originally did (a ratio against
@@ -832,15 +873,9 @@ def _composite_chunk(plate: torch.Tensor, hdr: torch.Tensor, k: float,
     # ── stage 2: local contrast ──────────────────────────────────────────
     # Push the output's neighbourhood-relative structure toward the HDR's
     # without moving the level stage 1 just chose.
-    a_det = (w * p["detail_transfer"]).clamp(0.0, 1.0)
-    if p["detail_transfer"] > 0.0 and p["detail_radius"] > 0 and float(w.max()) > 0.0:
-        _, d_src = _log_detail(y_src, p["detail_radius"])
+    if t["detail"]:
+        d_src, extra = t["d_src"], t["extra"]
         _, d_hdr = _log_detail(y_hdr, p["detail_radius"])
-        # The level lerp already dragged roughly `a_tone` of the HDR's detail
-        # along with it, so only inject the shortfall. This is what keeps
-        # tone_transfer = detail_transfer = 1 a clean pass-through to the HDR
-        # instead of applying its texture twice.
-        extra = (a_det - a_tone).clamp(min=0.0)
         # The one genuinely unbounded term in the node. Frequency separation
         # haloes by nature, and an unclamped exponent turns a single noisy
         # pixel in a crushed black into a firefly.
@@ -858,18 +893,11 @@ def _composite_chunk(plate: torch.Tensor, hdr: torch.Tensor, k: float,
 
     # ── stage 3: get there without moving the colour ─────────────────────
     # Unit-luminance chroma directions. (1,1,1) is the neutral fallback and
-    # has Rec.709 luminance of exactly 1, so it belongs in this set.
-    ones = torch.ones_like(plate_lin)
-    dir_plate = torch.where(y_src.unsqueeze(-1) > _EPS,
-                            plate_lin / y_src.unsqueeze(-1).clamp(min=_EPS), ones)
+    # has Rec.709 luminance of exactly 1, so it belongs in this set. The
+    # plate's direction and its confidence `c` come from `_plate_terms`.
+    dir_plate, c = t["dir_plate"], t["c"]
     dir_hdr = torch.where(y_hdr.unsqueeze(-1) > _EPS,
-                          hdr_m / y_hdr.unsqueeze(-1).clamp(min=_EPS), ones)
-
-    # How much plate chroma there actually is to preserve. Goes to 0 as the
-    # plate goes black, which is what stops "preserve_plate_chroma = 1" from
-    # meaning "preserve this pixel's meaningless near-zero hue".
-    conf = y_src / (y_src + _BLACK_FLOOR)
-    c = (conf * p["preserve_plate_chroma"]).unsqueeze(-1)
+                          hdr_m / y_hdr.unsqueeze(-1).clamp(min=_EPS), t["ones"])
     direction = dir_plate * c + dir_hdr * (1.0 - c)
 
     # Additive form of the luminance transplant — algebraically identical to
@@ -1209,12 +1237,15 @@ class BatHDRTonalComposite:
             versions.append((f"hdr_ai_{i}", hdr_versions.get(f"hdr_ai_{i}")))
 
         used = self._consumed_slots(prompt, unique_id)
-        results = []
+        results = [None] * len(versions)
         first_plate = first_hdr = None
         k_first = 1.0
-        for name, img in versions:
+        # Versions whose aligned plate is the same (always, unless a
+        # single-frame plate was broadcast to different frame counts) run as
+        # one group, so the plate-side work is done once for all of them.
+        groups = {}
+        for i, (name, img) in enumerate(versions):
             if img is None:
-                results.append(None)
                 continue
             try:
                 pl, hd = self._align(plate_sdr, img)
@@ -1222,15 +1253,19 @@ class BatHDRTonalComposite:
                 # Name the offending input: with eight of them, "resolution
                 # mismatch" on its own is not enough to find the bad wire.
                 raise ValueError(f"{name}: {exc}") from None
-            slot = len(results) * 2
-            out, lin, k = self._run_one(
-                pl, hd, p, bool(auto_match_mids), str(match_scope),
-                str(linear_out_primaries),
-                want_display=(used is None or slot in used),
-                want_linear=(used is None or (slot + 1) in used))
-            results.append((out, lin))
-            if first_plate is None:
-                first_plate, first_hdr, k_first = pl, hd, k
+            slot = i * 2
+            groups.setdefault(int(pl.shape[0]), []).append(
+                (i, pl, hd, (used is None or slot in used,
+                             used is None or (slot + 1) in used)))
+        for members in groups.values():
+            done = self._run_many(
+                members[0][1], [hd for _i, _pl, hd, _w in members], p,
+                bool(auto_match_mids), str(match_scope), str(linear_out_primaries),
+                [wants for _i, _pl, _hd, wants in members])
+            for (i, pl, hd, _w), (out, lin, k) in zip(members, done):
+                results[i] = (out, lin)
+                if i == 0:
+                    first_plate, first_hdr, k_first = pl, hd, k
 
         if first_plate is None:
             raise ValueError(
@@ -1262,7 +1297,9 @@ class BatHDRTonalComposite:
         flat = []
         for r in results:
             flat.extend(r if r is not None else spare)
-        return {"ui": ui, "result": tuple(flat)}
+        # The tiles (and a view LUT) are hundreds of KB; stashed to a sidecar
+        # so they stay out of the prompt history — see bat_ui_ref.py.
+        return {"ui": stash_ui(ui), "result": tuple(flat)}
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -1295,30 +1332,40 @@ class BatHDRTonalComposite:
 
     def _run_one(self, plate, hdr, p, auto_match_mids, match_scope, primaries,
                  want_display=True, want_linear=True):
-        """One plate + one HDR reconstruction -> (image_out, linear_out, k).
+        """One plate + one HDR reconstruction -> (image_out, linear_out, k)."""
+        return self._run_many(plate, [hdr], p, auto_match_mids, match_scope,
+                              primaries, [(want_display, want_linear)])[0]
+
+    def _run_many(self, plate, hdrs, p, auto_match_mids, match_scope, primaries,
+                  wants):
+        """One plate + several HDR reconstructions -> [(image_out, linear_out, k)].
 
         Split out of `composite` so several hdr_ai inputs share one set of
         settings. Each version gets its OWN exposure match: separate LTX runs
         have no reason to land on the same absolute scale, and reusing version
-        1's ratio would drag the others off.
+        1's ratio would drag the others off. What they do share is the plate:
+        its decode, key, ramps and detail band are worked out once per chunk
+        (`_plate_terms`) rather than once per version. `wants` holds each
+        version's (want_display, want_linear).
         """
         b, h, w, _ = plate.shape
         per_chunk = max(1, int(_CHUNK_BYTES // max(h * w * 3 * 4, 1)))
+        mode, lo, hi = p["plate_gamma_mode"], p["mid_low"], p["mid_high"]
 
-        # Pass 1 — the exposure match. Accumulated over chunks as two scalars
-        # so a 300-frame clip costs no more memory than a 10-frame one.
-        k_batch = 1.0
+        # Pass 1 — the exposure match. Accumulated over chunks as scalars so a
+        # 300-frame clip costs no more memory than a 10-frame one.
+        k_batch = [1.0] * len(hdrs)
         if auto_match_mids and match_scope == "whole_batch":
-            num = den = 0.0
+            num, den = 0.0, [0.0] * len(hdrs)
             for s in range(0, b, per_chunk):
                 _interrupt.check()
-                pl = _to_linear(plate[s:s + per_chunk].float(), p["plate_gamma_mode"])
-                hd = _sanitise_hdr(hdr[s:s + per_chunk])
-                m = _mid_mask(_key_luma(pl, p["plate_gamma_mode"]),
-                              p["mid_low"], p["mid_high"])
+                pl = _to_linear(plate[s:s + per_chunk].float(), mode)
+                m = _mid_mask(_key_luma(pl, mode), lo, hi)
                 num += float((_luminance(pl) * m).sum())
-                den += float((_luminance(hd) * m).sum())
-            k_batch = self._ratio(num, den)
+                for v, hdr in enumerate(hdrs):
+                    hd = _sanitise_hdr(hdr[s:s + per_chunk])
+                    den[v] += float((_luminance(hd) * m).sum())
+            k_batch = [self._ratio(num, d) for d in den]
 
         # Not empty_like: `plate` may be an expand()ed view with zero strides
         # after single-frame broadcasting, and preserve_format would inherit them.
@@ -1326,10 +1373,11 @@ class BatHDRTonalComposite:
         # keeps the return arity right for the executor's index mapping without
         # paying for a full-size buffer nobody asked for.
         stub = torch.zeros((1, 1, 1, 3), dtype=torch.float32, device=plate.device)
-        out = (torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
-               if want_display else stub)
-        lin = (torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
-               if want_linear else stub)
+        outs = [(torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
+                 if want_display else stub,
+                 torch.empty(plate.shape, dtype=torch.float32, device=plate.device)
+                 if want_linear else stub)
+                for want_display, want_linear in wants]
         # Resolved once, outside the chunk loop — an OCIO config lookup per
         # chunk would be absurd, and the cache makes it once per process anyway.
         pm = _primaries_matrix(primaries, plate.device, torch.float32)
@@ -1338,35 +1386,38 @@ class BatHDRTonalComposite:
             # flag read per frame — free, and it is what makes Cancel work.
             _interrupt.check()
             e = min(s + per_chunk, b)
-            pl_raw = plate[s:e].float()
-            hd = _sanitise_hdr(hdr[s:e])
+            t = _plate_terms(plate[s:e].float(), p)
+            if auto_match_mids and match_scope != "whole_batch":
+                m = _mid_mask(t["y_key"], lo, hi)
+                num = float((t["y_src"] * m).sum())
 
-            if not auto_match_mids:
-                k = 1.0
-            elif match_scope == "whole_batch":
-                k = k_batch
-            else:
-                pl_lin = _to_linear(pl_raw, p["plate_gamma_mode"])
-                m = _mid_mask(_key_luma(pl_lin, p["plate_gamma_mode"]),
-                              p["mid_low"], p["mid_high"])
-                k = self._ratio(float((_luminance(pl_lin) * m).sum()),
-                                float((_luminance(hd) * m).sum()))
-
-            merged = _composite_chunk(pl_raw, hd, k, p)
-            # image_out first: it must stay in the plate's primaries, so it is
-            # derived before any gamut conversion.
-            if want_display:
-                out[s:e] = _display(merged, p)
-            # linear_out is the merge itself: no exposure, no tonemap, no clamp
-            # at the top. preview_exposure is a look control on the preview and
-            # has no business baking itself into a linear deliverable.
-            if want_linear:
-                if pm is None:
-                    lin[s:e] = merged
+            for v, hdr in enumerate(hdrs):
+                hd = _sanitise_hdr(hdr[s:e])
+                if not auto_match_mids:
+                    k = 1.0
+                elif match_scope == "whole_batch":
+                    k = k_batch[v]
                 else:
-                    # (B,H,W,3) @ Mt -> row vectors through the matrix.
-                    lin[s:e] = torch.matmul(merged, pm.transpose(0, 1))
-        return out, lin, k_batch
+                    k = self._ratio(num, float((_luminance(hd) * m).sum()))
+
+                merged = _composite_merge(t, hd, k, p)
+                out, lin = outs[v]
+                want_display, want_linear = wants[v]
+                # image_out first: it must stay in the plate's primaries, so it
+                # is derived before any gamut conversion.
+                if want_display:
+                    out[s:e] = _display(merged, p)
+                # linear_out is the merge itself: no exposure, no tonemap, no
+                # clamp at the top. preview_exposure is a look control on the
+                # preview and has no business baking itself into a linear
+                # deliverable.
+                if want_linear:
+                    if pm is None:
+                        lin[s:e] = merged
+                    else:
+                        # (B,H,W,3) @ Mt -> row vectors through the matrix.
+                        lin[s:e] = torch.matmul(merged, pm.transpose(0, 1))
+        return [(out, lin, k) for (out, lin), k in zip(outs, k_batch)]
 
     # ------------------------------------------------------------------
     @staticmethod
