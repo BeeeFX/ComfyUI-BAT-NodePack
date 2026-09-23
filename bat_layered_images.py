@@ -75,6 +75,7 @@ from PIL import Image
 
 from .bat_blend_modes import MODES, NON_SEPARABLE, SEPARABLE, blend
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
 
 logger = logging.getLogger("[Bat_LayeredImages]")
 
@@ -226,7 +227,9 @@ def composite(layers, settings, clamp_output=False):
 # Resampling / helpers (shared with Bat_AdvancedBlend)
 # ---------------------------------------------------------------------------
 
-from .bat_advanced_blend import _num, _resize          # noqa: E402
+from . import bat_interrupt as _interrupt                  # noqa: E402
+from .bat_advanced_blend import (                          # noqa: E402
+    _chunk_frames, _compute_devices, _num, _on_device, _resize)
 
 
 def _b64_jpeg(arr_hwc: np.ndarray, max_dim: int = PREVIEW_TILE_DIM,
@@ -397,13 +400,19 @@ class BatLayeredImages:
         # Preallocated and written by slice, not gathered into lists and
         # torch.cat'ed: that held every chunk AND the concatenated copy at once,
         # doubling the peak. Same fix, same reasoning as Bat_AdvancedBlend.
-        out = torch.empty((n, out_h, out_w, 3), dtype=torch.float32, device=device)
-        alpha = torch.empty((n, out_h, out_w), dtype=torch.float32, device=device)
-        for s in range(0, n, CHUNK_FRAMES):
-            e = min(s + CHUNK_FRAMES, n)
+        # Computed on ComfyUI's torch device a chunk at a time, stored on its
+        # intermediate device — see _compute_devices() in bat_advanced_blend.py.
+        dev, store = _compute_devices(device)
+        out = torch.empty((n, out_h, out_w, 3), dtype=torch.float32, device=store)
+        alpha = torch.empty((n, out_h, out_w), dtype=torch.float32, device=store)
+        # Per layer a conformed frame and a matte, plus the accumulator's colour,
+        # alpha and blend temporaries.
+        step = _chunk_frames(dev, out_h * out_w * 4 * 4, len(imgs) + 6, CHUNK_FRAMES)
+
+        def run_chunk(s, e, device):
             chunk = []
             for t, m in zip(imgs, masks):
-                c = _resize(t[s:e], out_h, out_w, resize_filter)
+                c = _resize(t[s:e].to(device), out_h, out_w, resize_filter)
                 a = None
                 if m is not None:
                     a = _mask_frames(m, s, e, device, torch.float32).unsqueeze(-1)
@@ -413,25 +422,38 @@ class BatLayeredImages:
                             mode="bilinear", align_corners=False,
                         ).permute(0, 2, 3, 1)
                 chunk.append((c, a))
-            o, al = composite(chunk, settings, clamp_output)
+            return composite(chunk, settings, clamp_output), chunk
+
+        s = 0
+        while s < n:
+            _interrupt.check()
+            e = min(s + step, n)
+            ((o, al), chunk), used = _on_device(
+                lambda device: run_chunk(s, e, device), dev, store, "the composite")
+            if used != dev:
+                dev, step = used, CHUNK_FRAMES
             out[s:e] = o
             alpha[s:e] = al[..., 0]
             del o, al
             if pv is None and s <= idx < e:
                 k = idx - s
-                # .clone(), not a view: a view pins the whole chunk, which for a
-                # deep stack at 4K is most of a gigabyte.
-                pv = [(c[k:k + 1].clone(),
-                       None if a is None else a[k:k + 1].clone())
+                # A copy, not a view: a view pins the whole chunk, which for a
+                # deep stack at 4K is most of a gigabyte — and on the GPU.
+                pv = [(c[k:k + 1].to(store, copy=True),
+                       None if a is None else a[k:k + 1].to(store, copy=True))
                       for (c, a) in chunk]
+            del chunk
+            s = e
 
         ui = self._preview_payload(pv, found, settings, idx, n, out_w, out_h,
-                                   unique_id)
-        return {"ui": ui, "result": (out, alpha)}
+                                   unique_id, out[idx])
+        # One lossless tile per layer: kept out of the prompt history
+        # (bat_ui_ref.py).
+        return {"ui": stash_ui(ui), "result": (out, alpha)}
 
     # ------------------------------------------------------------------
     def _preview_payload(self, pv, found, settings, idx, frames, out_w, out_h,
-                         unique_id):
+                         unique_id, result_frame=None):
         """Tiles and metadata for the two preview layers.
 
         One tile per layer, all conformed and all off the same area-sampler, so
@@ -481,10 +503,12 @@ class BatLayeredImages:
             ui["tiles"] = [tiles]
             ui["masks"] = [mask_pngs]
 
-        # 8-bit fallback of the bottom layer, so a reopened workflow has
-        # something to show before the first run.
-        u8 = (pv[0][0][0].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-        ui["jpeg_base"] = [_b64_jpeg(u8)]
+        # The composite as an 8-bit JPEG — what a reopened workflow shows
+        # before its next run (the JS caches it). The composite rather than the
+        # bottom layer, which is what this used to ship and nothing ever read.
+        frame = result_frame if result_frame is not None else pv[0][0][0]
+        u8 = (frame.clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        ui["jpeg_result"] = [_b64_jpeg(u8)]
 
         if unique_id is not None:
             try:
@@ -575,10 +599,9 @@ def render_region(entry, settings, roi, out_w, out_h, view="result",
     w = max(1, min(w, fw - x))
     h = max(1, min(h, fh - y))
 
-    device = torch.device("cuda") if torch.cuda.is_available() else layers[0][0].device
-
-    def slab(t):
-        return None if t is None else t[:, y:y + h, x:x + w].to(device, non_blocking=True)
+    # ComfyUI's device (honours --cpu, finds MPS / XPU), with a retry on the
+    # host for anything it can't do — a preview never fails a render.
+    device, _ = _compute_devices(layers[0][0].device)
 
     def pick(chunk):
         # Every view here must be the one `paintLayered()` draws in the JS, or
@@ -603,15 +626,13 @@ def render_region(entry, settings, roi, out_w, out_h, view="result",
         img, _ = composite(chunk, settings, clamp_output)
         return img
 
-    try:
-        img = pick([(slab(c), slab(a)) for (c, a) in layers])
-    except torch.cuda.OutOfMemoryError:
-        logger.warning("full-resolution preview did not fit in VRAM; falling "
-                       "back to CPU for this request")
-        torch.cuda.empty_cache()
-        img = pick([(None if c is None else c[:, y:y + h, x:x + w],
-                     None if a is None else a[:, y:y + h, x:x + w])
-                    for (c, a) in layers])
+    def run(dev):
+        def slab(t):
+            return None if t is None else t[:, y:y + h, x:x + w].to(dev, non_blocking=True)
+        return pick([(slab(c), slab(a)) for (c, a) in layers])
+
+    img, _ = _on_device(run, device, layers[0][0].device,
+                        "the full-resolution preview")
 
     if (out_h, out_w) != (img.shape[1], img.shape[2]):
         filt = "area" if (out_w < img.shape[2] or out_h < img.shape[1]) else "lanczos"

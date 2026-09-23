@@ -111,7 +111,8 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batTrack, registerCleanup, batNodeCacheKey, batCacheSet, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
+import { batTrack, registerCleanup, batNodeCacheKey, batCacheSet, isNodeAlive, batReplayLastExecution,
+         batPreviewWillReplay } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 import { blendTile, makeBlurCache, paintView, neutralHigh } from "./bat_blend_core.js";
 
@@ -391,7 +392,14 @@ function buildPreview(node) {
     const track = batTrack(node);
 
     const root = document.createElement("div");
-    root.style.cssText = `position:relative; display:flex; flex-direction:column;
+    // Focusable, so the wheel can be ours under Nodes 2.0: TransformPane
+    // forwards every wheel to the graph unless the target sits inside a
+    // `[data-capture-wheel]` element that holds focus (useCanvasInteractions).
+    // attachZoomControl marks `root` (its `scope`) and a click in the picture
+    // focuses it; from then the wheel zooms the preview. No key is handled
+    // here, so none is stopped — Delete, Escape and the rest still reach core.
+    root.tabIndex = 0;
+    root.style.cssText = `position:relative; display:flex; flex-direction:column; outline:none;
         background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; overflow:hidden;`;
 
     // The Advanced switch. A DOM button rather than a litegraph widget — see
@@ -440,6 +448,11 @@ function buildPreview(node) {
 
     const stage = document.createElement("div");
     stage.style.cssText = "position:relative; flex:1 1 auto; min-height:0; display:flex; background:#000;";
+    // Capture phase: hold-to-compare and the zoom control both stop
+    // pointerdown, and focus has to follow the click regardless.
+    stage.addEventListener("pointerdown", () => {
+        try { root.focus({ preventScroll: true }); } catch (_) {}
+    }, true);
     // The VISIBLE canvas is sized to its CSS box; the draft tile and the
     // server's full-resolution PNG are both drawn into it through the same
     // zoom/pan transform. See the "Two layers" note at the top.
@@ -505,11 +518,17 @@ function buildPreview(node) {
     const off = document.createElement("canvas");
     const offCtx = off.getContext("2d", { willReadFrequently: true });
 
-    const viewKey = batNodeCacheKey(app, "bat_advblend_view", node);
-    const saved = (() => {
-        try { return JSON.parse(localStorage.getItem(viewKey) || "{}") || {}; }
+    // Keys are built when USED. This runs inside onNodeCreated, where a node
+    // being loaded still has id -1 and no graph, so a key built here was the
+    // same for every Advanced Blend node: they restored (and overwrote) one
+    // another's plates and view. The restore re-reads the view once the id is
+    // final.
+    const viewKey = () => batNodeCacheKey(app, "bat_advblend_view", node);
+    const readSaved = () => {
+        try { return JSON.parse(localStorage.getItem(viewKey()) || "{}") || {}; }
         catch (_) { return {}; }
-    })();
+    };
+    const saved = readSaved();
 
     const state = {
         a: null, b: null,          // full-resolution SourceBuffers
@@ -561,8 +580,11 @@ function buildPreview(node) {
 
     function saveView() {
         try {
-            localStorage.setItem(viewKey, JSON.stringify({
+            localStorage.setItem(viewKey(), JSON.stringify({
                 view: state.view, amp: state.amp, dispZoom: state.dispZoom,
+                // Read back on load but was never written, so the drag
+                // setting reset to Full on every reopen.
+                quality: state.quality,
             }));
         } catch (_) { /* quota / disabled storage — still works this session */ }
     }
@@ -1271,7 +1293,7 @@ function buildPreview(node) {
     let zoomCtl = null;
     try {
         zoomCtl = attachZoomControl({
-            wrap: stage, canvas, state,
+            wrap: stage, canvas, state, scope: root,
             onChange: () => {
                 saveView();
                 // A pan or zoom changes which region the full layer should
@@ -1361,7 +1383,7 @@ function buildPreview(node) {
     };
 
     // ── ingest ───────────────────────────────────────────────────────────
-    const cacheKey = batNodeCacheKey(app, "bat_advblend_preview", node);
+    const cacheKey = () => batNodeCacheKey(app, "bat_advblend_preview", node);
 
     async function decodePlate(tile, jpeg, which) {
         if (tile && hdrSupported()) {
@@ -1466,7 +1488,7 @@ function buildPreview(node) {
         if (jpegA && jpegB) {
             // Within the pack's budget; a refusal just means the preview
             // repopulates on the next run.
-            batCacheSet(cacheKey, JSON.stringify({
+            batCacheSet(cacheKey(), JSON.stringify({
                 jpeg_a: jpegA, jpeg_b: jpegB, meta: state.meta,
             }));
         }
@@ -1475,8 +1497,19 @@ function buildPreview(node) {
     };
 
     node._batAdvBlendRestore = () => {
+        const sv = readSaved();
+        if (VIEWS.some((v) => v[0] === sv.view)) state.view = sv.view;
+        if (AMP_STEPS.includes(sv.amp)) state.amp = sv.amp;
+        if (Number.isFinite(sv.dispZoom)) state.dispZoom = sv.dispZoom;
+        if (DRAFT_LEVELS.some((q) => q[0] === sv.quality)) {
+            state.quality = sv.quality; qualSel.value = sv.quality;
+        }
+        refreshBar();
+        // A replay of this session's run is coming, and it is the better
+        // picture: the thumbnail's async decode could otherwise land after it.
+        if (state.a || batPreviewWillReplay(node)) return;
         let c = null;
-        try { c = JSON.parse(localStorage.getItem(cacheKey) || "null"); } catch (_) {}
+        try { c = JSON.parse(localStorage.getItem(cacheKey()) || "null"); } catch (_) {}
         if (!c?.jpeg_a || !c?.jpeg_b) return;
         node._batAdvBlendIngest({
             jpeg_a: [c.jpeg_a], jpeg_b: [c.jpeg_b],

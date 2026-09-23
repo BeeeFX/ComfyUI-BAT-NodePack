@@ -440,6 +440,16 @@ def main():
             js = json.loads(js_modes(json.dumps({"mode": mode, "cb": cb, "cs": cs})))
         check(f"mode[{mode}]", py, js)
 
+    # Divide by a black source: Photoshop's answer (white where there is a
+    # backdrop, black where there is none), not cb / EPS — a 5e5 firefly.
+    t = lambda v: torch.tensor(v, dtype=torch.float32)
+    got = modes_py.blend(t([0.5, 0.0, -0.2, 3.0, 0.5]), t([0.0, 0.0, 0.0, 1e-7, 0.25]),
+                         "divide").tolist()
+    assert got == [1.0, 0.0, 0.0, 1.0, 2.0], got
+    js = json.loads(js_modes(json.dumps({"mode": "divide", "cb": [0.5, 0.0, -0.2, 3.0, 0.5],
+                                         "cs": [0.0, 0.0, 0.0, 1e-7, 0.25]})))
+    assert js == got, js
+
     # ── 2. the composite ─────────────────────────────────────────────────
     torch.manual_seed(19)
     H, W = 17, 23
@@ -565,7 +575,8 @@ def main():
                                    {"slot": 2, "mode": "multiply"},
                                    {"slot": 3, "mode": "screen", "opacity": 0.7}]})
     res = m.BatLayeredImages().run(layers=state, image_1=base, image_3=top,
-                                   mask_3=mk, resize_filter="area")
+                                   mask_3=mk, resize_filter="area",
+                                   unique_id="12:5")
     cfg = [{"mode": "normal", "opacity": 1.0, "enabled": True},
            {"mode": "screen", "opacity": 0.7, "enabled": True}]
     for f in range(n_fr):
@@ -573,8 +584,41 @@ def main():
         want_rgb, want_a = m.composite([(base[f:f + 1], None), (top, a)], cfg)
         assert torch.allclose(res["result"][0][f:f + 1], want_rgb, atol=1e-6), f
         assert torch.allclose(res["result"][1][f:f + 1], want_a[..., 0], atol=1e-6), f
-    assert res["ui"]["settings"][0][1]["mode"] == "screen", res["ui"]["settings"]
+    # The payload now lives in a sidecar (bat_ui_ref.py): the history keeps only
+    # the token, and the JS resolves it back to exactly this dict.
+    assert set(res["ui"]) == {"bat_ui"}, sorted(res["ui"])
+    ui = sys.modules["batpack.bat_ui_ref"].load_ui(res["ui"])
+    assert ui["settings"][0][1]["mode"] == "screen", ui["settings"]
+    assert ui["slots"] == [[1, 3]] and len(ui["tiles"][0]) == 2, sorted(ui)
+    # The subgraph execution id rides along for the full-resolution request,
+    # and the thumbnail a reopened workflow shows is the COMPOSITE.
+    assert ui["node_id"] == ["12:5"], ui.get("node_id")
+    import base64, io
+    from PIL import Image
+    thumb = np.asarray(Image.open(io.BytesIO(base64.b64decode(ui["jpeg_result"][0]))),
+                       dtype=np.float32) / 255.0
+    want = res["result"][0][0].clamp(0, 1).numpy()
+    # The plates are noise, which JPEG cannot hold per pixel — so compare the
+    # means: the composite's, not the bottom layer's (what it used to ship).
+    d_comp = abs(float(thumb.mean()) - float(want.mean()))
+    d_base = abs(float(thumb.mean()) - float(base[0].numpy().mean()))
+    assert thumb.shape == want.shape and d_comp < 0.02 and d_comp < d_base, (d_comp, d_base)
     print("node run: slot-keyed settings across a gap, short mask held, chunked: OK")
+
+    # Chunks run on ComfyUI's device and fall back to the host for anything it
+    # can't do. "meta" stands in for a failing GPU (the resampler reads a value
+    # back, which meta cannot); the result must be exactly the CPU one.
+    kw = dict(layers=state, image_1=base, image_3=top[:, ::2, ::2], mask_3=mk,
+              resize_filter="bilinear")
+    ref = m.BatLayeredImages().run(**kw)
+    real = m._compute_devices
+    m._compute_devices = lambda fb: (torch.device("meta"), torch.device("cpu"))
+    try:
+        got = m.BatLayeredImages().run(**kw)
+    finally:
+        m._compute_devices = real
+    assert all(torch.equal(g, r) for g, r in zip(got["result"], ref["result"]))
+    print("device fallback reproduces the CPU composite: OK")
 
     for label in sorted(worst):
         if worst[label] > 0.05:

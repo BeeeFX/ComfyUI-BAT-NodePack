@@ -135,7 +135,13 @@ def _minus(cb, cs):
 
 
 def _divide(cb, cs):
-    return cb / torch.where(cs.abs() < EPS, torch.full_like(cs, EPS), cs)
+    # A black source is Photoshop's answer: white where there is backdrop to
+    # divide, black where there is none. Dividing by EPS instead turned every
+    # black source pixel into a ~1e5 firefly that clamp_output (off) let
+    # through and any blur downstream spread.
+    zero = cs.abs() < EPS
+    return torch.where(zero, (cb > 0.0).to(cb.dtype),
+                       cb / torch.where(zero, torch.ones_like(cs), cs))
 
 
 SEPARABLE = {

@@ -31,7 +31,8 @@ import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
 import { hdrSupported, decodeHdrTile, imageDataToSource } from "./bat_hdr_preview.js";
-import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution } from "./bat_lifecycle.js";
+import { batTrack, registerCleanup, batNodeCacheKey, isNodeAlive, batReplayLastExecution,
+         batPreviewWillReplay, batCacheSet } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 import { compositeStack, paintLayered } from "./bat_layered_core.js";
 import { MODES, MODE_LABELS } from "./bat_blend_modes.js";
@@ -42,6 +43,11 @@ const MAX_LAYERS = 8;          // must match MAX_LAYERS in bat_layered_images.py
 
 /** Letters for the view buttons and the panel rows. A is the bottom layer. */
 const LETTERS = "ABCDEFGH";
+
+/** A layer's letter, by its input slot: image_1 is A, image_3 is C. */
+function letterFor(slot) {
+    return LETTERS[slot - 1] || String(slot);
+}
 
 const DEFAULT_LAYER = { mode: "normal", opacity: 1.0, enabled: true };
 
@@ -233,11 +239,24 @@ function buildEditor(node) {
     const track = batTrack(node);
 
     const root = document.createElement("div");
-    root.style.cssText = `position:relative; display:flex; flex-direction:column;
+    // Focusable, so the wheel can be ours under Nodes 2.0: TransformPane
+    // forwards every wheel to the graph unless the target sits inside a
+    // `[data-capture-wheel]` element that holds focus (useCanvasInteractions).
+    // attachZoomControl marks `root` (its `scope`); a click in the picture
+    // focuses it. After that the wheel zooms the picture and scrolls the layer
+    // list instead of zooming the graph. No key is handled here, so none is
+    // stopped — Delete, Escape and the rest still reach core.
+    root.tabIndex = 0;
+    root.style.cssText = `position:relative; display:flex; flex-direction:column; outline:none;
         background:#0a0a0a; border:1px solid #2a2a2a; border-radius:4px; overflow:hidden;`;
 
     const stage = document.createElement("div");
     stage.style.cssText = "position:relative; flex:1 1 auto; min-height:0; display:flex; background:#000;";
+    // Capture phase: the zoom control and the canvas stop pointerdown for
+    // their own reasons, and this has to run regardless.
+    stage.addEventListener("pointerdown", () => {
+        try { root.focus({ preventScroll: true }); } catch (_) {}
+    }, true);
     const canvas = document.createElement("canvas");
     canvas.style.cssText = "width:100%; height:100%; display:block;";
     stage.appendChild(canvas);
@@ -276,11 +295,17 @@ function buildEditor(node) {
     const off = document.createElement("canvas");
     const offCtx = off.getContext("2d", { willReadFrequently: true });
 
-    const viewKey = batNodeCacheKey(app, "bat_layered_view", node);
-    const saved = (() => {
-        try { return JSON.parse(localStorage.getItem(viewKey) || "{}") || {}; }
+    // Keys are built when USED, not here. This runs inside onNodeCreated, where
+    // a node being loaded still has id -1 and no graph — so a key built now was
+    // the same for every Layered Images node, and they all restored (and saved)
+    // one another's view and picture.
+    const viewKey = () => batNodeCacheKey(app, "bat_layered_view", node);
+    const cacheKey = () => batNodeCacheKey(app, "bat_layered_preview", node);
+    const readSaved = () => {
+        try { return JSON.parse(localStorage.getItem(viewKey()) || "{}") || {}; }
         catch (_) { return {}; }
-    })();
+    };
+    const saved = readSaved();
 
     const state = {
         layers: [],          // [{data, mask, width, height}] bottom first
@@ -299,6 +324,9 @@ function buildEditor(node) {
         full: null, fullKey: null, fullRect: null, fullPending: false, fullStale: false,
         serverMs: 0,
         serverId: null,
+        // Showing the cached thumbnail of an earlier session's run, which has
+        // no tiles behind it to recomposite.
+        restored: false,
     };
     node._batLayeredState = state;
 
@@ -418,6 +446,13 @@ function buildEditor(node) {
             ? (state.fullStale ? "full res — updating…" : "full res")
             : (state.fullPending ? `draft${cost} — rendering…` : `draft${cost}`)));
         if (state.needsRun) lines.push("⟳ Run to apply preview_frame / resize");
+        // The panel follows the sockets; the picture is the last run's stack.
+        if (state.restored) {
+            lines.push("⟳ Restored thumbnail — run to edit live");
+        } else if (state.layers.length
+                   && connectedLayers(node).join(",") !== state.slots.join(",")) {
+            lines.push("⟳ Run to preview the rewired stack");
+        }
         badge.textContent = lines.join("\n");
         badge.style.display = lines.length ? "block" : "none";
     }
@@ -531,7 +566,9 @@ function buildEditor(node) {
     }
 
     async function requestFull() {
-        if (!isNodeAlive(node) || !state.tw || node.id == null) return;
+        // No tiles means a restored thumbnail is on screen: the settings to
+        // render with are not known to match any cached run, so wait for one.
+        if (!isNodeAlive(node) || !state.tw || !state.layers.length || node.id == null) return;
         const region = visibleRegion();
         if (!region) return;
         const key = fullKeyFor(region);
@@ -640,7 +677,9 @@ function buildEditor(node) {
         };
         mk("result", "Result", "The composited stack.");
         state.layers.forEach((_, i) => {
-            const letter = LETTERS[i] || String(i + 1);
+            // By input slot, like the sockets and the panel rows: with image_2
+            // unwired, image_3 is still "C" everywhere.
+            const letter = letterFor(state.slots[i] ?? (i + 1));
             mk(`layer:${i}`, letter,
                `Layer ${letter} on its own, through its mask, over black.\n`
                + "Shown at full opacity in Normal — the layer itself, rather than "
@@ -654,7 +693,7 @@ function buildEditor(node) {
 
     function saveView() {
         try {
-            localStorage.setItem(viewKey, JSON.stringify({
+            localStorage.setItem(viewKey(), JSON.stringify({
                 view: state.view, dispZoom: state.dispZoom,
             }));
         } catch (_) {}
@@ -667,11 +706,17 @@ function buildEditor(node) {
      * Displayed TOP layer first, the reverse of the input order, because that is
      * how every compositing application shows a stack. `image_1` is the bottom
      * of the stack and the bottom row.
+     *
+     * One row per CONNECTED layer, read off the sockets now — not per layer of
+     * the last run. A newly wired layer can be set up before it is ever run, and
+     * one just unwired stops offering controls that no longer mean anything.
+     * Settings are keyed by slot, so the rows and the preview (which composites
+     * the last run's layers) read the same entries.
      */
     function rebuildPanel() {
         panel.textContent = "";
-        const cfg = settings();
-        const n = state.layers.length;
+        const slots = connectedLayers(node);
+        const n = slots.length;
 
         if (!n) {
             const empty = document.createElement("div");
@@ -681,15 +726,25 @@ function buildEditor(node) {
             panel.appendChild(empty);
             return;
         }
+        const cfg = readLayerState(node, n, slots);
+        const edit = (i, fn) => {
+            const cur = readLayerState(node, n, slots);
+            fn(cur[i]);
+            writeLayerState(node, cur, slots);
+        };
 
         for (let i = n - 1; i >= 0; i--) {
+            const slot = slots[i];
+            const letter = letterFor(slot);
+            // Where this layer sits in the last run's tiles, if it was in it.
+            const tile = state.slots.indexOf(slot);
+            const soloId = tile >= 0 && tile < state.layers.length ? `layer:${tile}` : null;
+            const soloed = soloId !== null && state.view === soloId;
+
             const row = document.createElement("div");
             row.style.cssText = `display:flex; align-items:center; gap:5px;
-                padding:2px 3px; border:1px solid ${state.view === `layer:${i}` ? "#4a7fa8" : "#232323"};
+                padding:2px 3px; border:1px solid ${soloed ? "#4a7fa8" : "#232323"};
                 border-radius:3px; background:#141414;`;
-
-            const letter = LETTERS[i] || String(i + 1);
-            const slot = state.slots[i] ?? (i + 1);
 
             // Visibility. Not the same thing as opacity 0 — this is the thing you
             // flick on and off to see what a layer is contributing.
@@ -699,21 +754,23 @@ function buildEditor(node) {
             eye.style.cssText = `background:none; border:none; cursor:pointer;
                 color:${cfg[i].enabled ? "#cde" : "#556"}; font:12px monospace; padding:0 2px;`;
             eye.addEventListener("click", () => {
-                const s = settings();
-                s[i].enabled = !s[i].enabled;
-                writeLayerState(node, s, state.slots);
+                edit(i, (c) => { c.enabled = !c.enabled; });
                 rebuildPanel(); schedule(false);
             });
             eye.addEventListener("pointerdown", (e) => e.stopPropagation());
 
             const tag = document.createElement("button");
             tag.textContent = letter;
-            tag.title = `Solo layer ${letter} in the preview (input image_${slot})`;
-            tag.style.cssText = `background:${state.view === `layer:${i}` ? "#2b4a63" : "#1c1c1c"};
-                color:#cde; border:1px solid #333; border-radius:3px; width:18px;
-                font:11px monospace; cursor:pointer;`;
+            tag.title = soloId !== null
+                ? `Solo layer ${letter} in the preview (input image_${slot})`
+                : `Layer ${letter} (input image_${slot}) is not in the preview yet — run to include it`;
+            tag.style.cssText = `background:${soloed ? "#2b4a63" : "#1c1c1c"};
+                color:${soloId !== null ? "#cde" : "#667"}; border:1px solid #333;
+                border-radius:3px; width:18px; font:11px monospace;
+                cursor:${soloId !== null ? "pointer" : "default"};`;
             tag.addEventListener("click", () => {
-                state.view = state.view === `layer:${i}` ? "result" : `layer:${i}`;
+                if (soloId === null) return;
+                state.view = state.view === soloId ? "result" : soloId;
                 saveView(); rebuildViewRow(); rebuildPanel(); schedule(false);
             });
             tag.addEventListener("pointerdown", (e) => e.stopPropagation());
@@ -740,9 +797,7 @@ function buildEditor(node) {
                 mode.style.opacity = "0.45";
             }
             mode.addEventListener("change", () => {
-                const s = settings();
-                s[i].mode = mode.value;
-                writeLayerState(node, s, state.slots);
+                edit(i, (c) => { c.mode = mode.value; });
                 schedule(false);
             });
             mode.addEventListener("pointerdown", (e) => e.stopPropagation());
@@ -758,9 +813,7 @@ function buildEditor(node) {
                 format: (v) => `${Math.round(v * 100)}%`,
                 title: `Layer ${letter} opacity, multiplied with its mask`,
                 onInput: (v) => {
-                    const s = settings();
-                    s[i].opacity = v;
-                    writeLayerState(node, s, state.slots);
+                    edit(i, (c) => { c.opacity = v; });
                     schedule(true);
                 },
                 // The drag itself already repainted; this asks for the settled
@@ -768,22 +821,24 @@ function buildEditor(node) {
                 onCommit: () => schedule(false),
             });
 
+            // Read off the socket, so it is right before the first run too.
+            const mat = inputIndex(node, `mask_${slot}`);
+            const hasMask = mat !== -1 && node.inputs[mat].link != null;
             const mk = document.createElement("span");
-            mk.textContent = state.layers[i].mask ? "▦" : " ";
-            mk.title = state.layers[i].mask
-                ? "This layer has a mask wired" : "No mask on this layer";
+            mk.textContent = hasMask ? "▦" : " ";
+            mk.title = hasMask ? "This layer has a mask wired" : "No mask on this layer";
             mk.style.cssText = "color:#7a8b96; font:10px monospace; width:9px; flex:0 0 auto;";
 
             row.append(eye, tag, mode, op.el, mk);
             panel.appendChild(row);
         }
     }
-    node._batLayeredSyncPanel = () => { rebuildPanel(); rebuildViewRow(); };
+    node._batLayeredSyncPanel = () => { rebuildPanel(); rebuildViewRow(); paintBadge(); };
 
     // ── zoom / pan ───────────────────────────────────────────────────────
     try {
         attachZoomControl({
-            wrap: stage, canvas, state,
+            wrap: stage, canvas, state, scope: root,
             onChange: () => {
                 saveView();
                 invalidateFull(false, true);
@@ -816,6 +871,9 @@ function buildEditor(node) {
                 : "This browser has no DecompressionStream, so the preview tiles "
                   + "can't be inflated.";
             hint.style.display = "block";
+            // Still show the run's composite, just not live.
+            const jpeg = one(msg.jpeg_result);
+            if (jpeg && !state.layers.length) showThumbnail(jpeg, state.meta, true);
             return;
         }
 
@@ -855,6 +913,7 @@ function buildEditor(node) {
         }
 
         state.layers = decoded;
+        state.restored = false;
         state.tw = w0; state.th = h0;
         state.runId++;
         state.needsRun = false;
@@ -894,6 +953,53 @@ function buildEditor(node) {
         }
         rebuildViewRow(); rebuildPanel();
         schedule(false);
+
+        // The composite as an 8-bit JPEG, so a reopened workflow shows this
+        // run's picture before the next one. Only that: the tiles are megabytes
+        // and localStorage is a small budget shared across the pack (see
+        // batCacheSet), which is also why this goes through it.
+        const jpeg = one(msg.jpeg_result);
+        if (jpeg) {
+            batCacheSet(cacheKey(), JSON.stringify({
+                jpeg, meta: state.meta, slots: state.slots,
+            }));
+        }
+    };
+
+    /**
+     * Put the last cached thumbnail on screen after a reopen.
+     *
+     * A picture and nothing else: without tiles there is nothing to
+     * recomposite, so panel edits wait for a run and the full-resolution layer
+     * stays off (the server's cached frame, if it has one, may not be this
+     * run's). A real ingest always wins — it clears `restored`, and a decode
+     * that lands after one is dropped.
+     */
+    function showThumbnail(b64, meta, keepHint) {
+        const img = new Image();
+        img.onload = () => {
+            if (!isNodeAlive(node) || state.layers.length) return;
+            off.width = img.naturalWidth; off.height = img.naturalHeight;
+            offCtx.drawImage(img, 0, 0);
+            state.tw = off.width; state.th = off.height;
+            state.meta = meta || null;
+            state.restored = true;
+            if (!keepHint) hint.style.display = "none";
+            present(); paintBadge();
+        };
+        img.src = `data:image/jpeg;base64,${b64}`;
+    }
+
+    node._batLayeredRestore = () => {
+        // Keys are only right now the id is final — re-read the view too.
+        const sv = readSaved();
+        if (typeof sv.view === "string" && !state.layers.length) state.view = sv.view;
+        if (Number.isFinite(sv.dispZoom)) state.dispZoom = sv.dispZoom;
+        rebuildViewRow();
+        if (state.layers.length || batPreviewWillReplay(node)) return;
+        let c = null;
+        try { c = JSON.parse(localStorage.getItem(cacheKey()) || "null"); } catch (_) {}
+        if (c?.jpeg) showThumbnail(c.jpeg, c.meta);
     };
 
     try {
@@ -970,8 +1076,13 @@ app.registerExtension({
             clampNodeSize(this, 420, 520);
 
             // Deferred: the node is not in the graph yet, and addInput before
-            // that point has nowhere to register links.
-            setTimeout(() => syncLayerInputs(this), 0);
+            // that point has nowhere to register links. The restore waits for
+            // the same reason — its cache key needs the final node id.
+            setTimeout(() => {
+                if (!isNodeAlive(this)) return;
+                syncLayerInputs(this);
+                this._batLayeredRestore?.();
+            }, 0);
             return r;
         };
 

@@ -755,6 +755,37 @@ def main():
                 if d > 0:
                     roi_bad.append((name, view, (rx, ry, rw, rh), d))
 
+    # ── the compute device ───────────────────────────────────────────────
+    # Chunks go to ComfyUI's torch device and come back to the intermediate
+    # one; anything the device can't do (OOM, a missing operator) finishes on
+    # the host. No GPU here, so stand a "meta" device in for one that fails:
+    # the resampler reads a value back (`dead.any()`), which meta cannot. The
+    # result must be exactly the CPU render, preview payload included.
+    small_b = plate_b.unsqueeze(0)[:, ::2, ::2]
+    kw = dict(image_a=plate_a.unsqueeze(0).repeat(3, 1, 1, 1), image_b=small_b,
+              resize_mode="match_a", resize_filter="lanczos", blend_mode="screen",
+              mix=0.8, frequency_separation=True, split_radius=3.0,
+              detail_mode="subtract", low_mix=1.0, high_mix=0.4, detail_gain=1.0,
+              detail_limit=0.0, soften_a=1.0, soften_b=0.0, clamp_output=False,
+              preview_frame=1, mask=mask, unique_id="4:2")
+    ref = node.blend(**kw)
+    real = m._compute_devices
+    m._compute_devices = lambda fb: (torch.device("meta"), torch.device("cpu"))
+    try:
+        got = node.blend(**kw)
+    finally:
+        m._compute_devices = real
+    for k in range(3):
+        assert got["result"][k].device.type == "cpu"
+        assert torch.equal(got["result"][k], ref["result"][k]), f"output {k} differs"
+    ui_mod = sys.modules["batpack.bat_ui_ref"]
+    # The payload lives in a sidecar; resolved, it is the dict the JS reads.
+    assert set(ref["ui"]) == {"bat_ui"}, sorted(ref["ui"])
+    ui_ref, ui_got = ui_mod.load_ui(ref["ui"]), ui_mod.load_ui(got["ui"])
+    assert ui_ref["node_id"] == ["4:2"] and ui_ref["preview_frame"] == [1], ui_ref.keys()
+    assert ui_ref["tile_a"] == ui_got["tile_a"] and "mask_png" in ui_ref
+    print("device fallback reproduces the CPU render; payload stashed and resolves: OK")
+
     # split_radius 0.5 is the widget's minimum, and round(0.5) == 0 used to make
     # it no blur at all: an empty high band, so high_mix 0 still returned A
     # exactly. Pin that it now splits, and that .5 rounds up on both sides.
