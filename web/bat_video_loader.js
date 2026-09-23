@@ -222,6 +222,7 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             this._last_y = y;
             const st = this._trim;
             const L = this._layout(width, y);
+            if (globalThis.LiteGraph?.vueNodesMode) this._bindHoverCanvas(ctx.canvas, width, y);
 
             // ── Thumbnails ────────────────────────────────────────────────
             this._drawThumb(ctx, L, "start", L.left,                                st.startImg, this._start);
@@ -424,6 +425,67 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             ctx.fill();
         },
 
+        // ── Hover ──────────────────────────────────────────────────────────
+        // Point the hover state (hairline, tooltip, and the frame the I / O
+        // keys set) at widget-local (lx, ly) on layout L. True when it moved.
+        _hoverAt(lx, ly, L) {
+            const st = this._trim;
+            const inTL = ly >= L.timelineY - 4 && ly <= L.timelineY + L.timelineH + 4;
+            const newHover = (inTL && st.frameCount > 1) ? this._xToFrame(lx, L) : null;
+            if (newHover === st.hoverFrame && inTL === st.hoverInTimeline) return false;
+            st.hoverFrame = newHover;
+            st.hoverInTimeline = inTL;
+            return true;
+        },
+
+        // Nodes 2.0 only. WidgetLegacy.vue forwards a press and its drag to
+        // mouse(), but never a plain hover move, so the hairline and the I / O
+        // keys were dead there. The ctx.canvas handed to draw() IS that
+        // component's own <canvas>, so listen on it directly — in the same
+        // widget-local pixels draw() used (it paints at the CSS size; offsetX
+        // is in the element's own, untransformed, box).
+        //
+        // One entry per element: the widget can be drawn by two components at
+        // once (the node and the parameters panel), each with its own width,
+        // and a remount hands over a fresh <canvas>. Detached ones are
+        // released here; the rest on node removal (_unbindHover).
+        _bindHoverCanvas(el, width, y) {
+            if (!el || typeof el.addEventListener !== "function") return;
+            const bound = (this._hoverEls ||= new Map());
+            for (const [old, entry] of bound) {
+                if (old !== el && old.isConnected === false) {
+                    entry.off();
+                    bound.delete(old);
+                }
+            }
+            const known = bound.get(el);
+            if (known) { known.width = width; known.y = y; return; }
+            const entry = { width, y };
+            const self = this;
+            const move = (e) => {
+                // A press is a drag, and mouse() owns those.
+                if (e.buttons || self._trim.dragMode != null) return;
+                const L = self._layout(entry.width, entry.y);
+                if (self._hoverAt(e.offsetX, e.offsetY, L)) redrawTrim(self._batOwner, self);
+            };
+            const leave = () => {
+                const L = self._layout(entry.width, entry.y);
+                if (self._hoverAt(-1, -1e9, L)) redrawTrim(self._batOwner, self);
+            };
+            el.addEventListener("pointermove", move);
+            el.addEventListener("pointerleave", leave);
+            entry.off = () => {
+                el.removeEventListener("pointermove", move);
+                el.removeEventListener("pointerleave", leave);
+            };
+            bound.set(el, entry);
+        },
+
+        _unbindHover() {
+            for (const entry of this._hoverEls?.values() || []) entry.off();
+            this._hoverEls?.clear();
+        },
+
         // ── Mouse / wheel ──────────────────────────────────────────────────
         mouse(event, pos, n) {
             const st = this._trim;
@@ -467,15 +529,7 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             }
 
             if (isMove && st.dragMode == null) {
-                const lx = localX(event);
-                const ly = localY(event);
-                const inTL = ly >= L.timelineY - 4 && ly <= L.timelineY + L.timelineH + 4;
-                const newHover = (inTL && st.frameCount > 1) ? this._xToFrame(lx, L) : null;
-                if (newHover !== st.hoverFrame || inTL !== st.hoverInTimeline) {
-                    st.hoverFrame = newHover;
-                    st.hoverInTimeline = inTL;
-                    redrawTrim(n, this);
-                }
+                if (this._hoverAt(localX(event), localY(event), L)) redrawTrim(n, this);
                 return false;
             }
 
@@ -1184,12 +1238,14 @@ app.registerExtension({
             // it isn't persisted in the workflow JSON.
             const preview = makePreviewWidget();
             this._batPreview = preview;
-            // Release the <video> (preload="auto" keeps buffering the file) and
-            // any info lookup still in flight when the node is deleted.
+            // Release the <video> (preload="auto" keeps buffering the file),
+            // any info lookup still in flight, and the trim widget's Nodes 2.0
+            // hover listeners when the node is deleted.
             const node = this;
             batTrack(this).dispose(() => {
                 preview.dispose();
                 if (node._batInfoAbort) { try { node._batInfoAbort.abort(); } catch (_) {} }
+                node.widgets?.find(w => w.name === "trim")?._unbindHover?.();
             });
             // Dual-mode sizing. The preview pane's own height is declared here
             // (PREVIEW_H) so Nodes 2.0 can size the node from the widget rather
@@ -1230,6 +1286,34 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function (info) {
             const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
             queueMicrotask(() => fetchVideoInfo(this));
+            return r;
+        };
+
+        // Hover under Nodes 1.0. LGraphCanvas forwards pointermove to
+        // widget.mouse() only while a press is in progress (node_widget is set
+        // by processWidgetClick), so a plain hover never reached the trim
+        // widget and the hairline and I / O keys were dead here too. The node
+        // does get every hover move, in node-local graph units — the space the
+        // widget was drawn in at (_last_w, _last_y). Under 2.0 the widget's own
+        // canvas listener covers it (_bindHoverCanvas), so this stays out.
+        const trimHover = (node, lx, ly) => {
+            if (globalThis.LiteGraph?.vueNodesMode) return;
+            const trim = node.widgets?.find(w => w.type === "BAT.TRIM");
+            if (!trim || trim._last_y == null || trim._trim.dragMode != null) return;
+            const L = trim._layout(trim._last_w || node.size[0], trim._last_y);
+            // Off the timeline rows _hoverAt clears it; redraw only on a change.
+            if (trim._hoverAt(lx, ly, L)) redrawTrim(node, trim);
+        };
+        const onMouseMove = nodeType.prototype.onMouseMove;
+        nodeType.prototype.onMouseMove = function (e, pos) {
+            const r = onMouseMove ? onMouseMove.apply(this, arguments) : undefined;
+            if (pos) trimHover(this, pos[0], pos[1]);
+            return r;
+        };
+        const onMouseLeave = nodeType.prototype.onMouseLeave;
+        nodeType.prototype.onMouseLeave = function () {
+            const r = onMouseLeave ? onMouseLeave.apply(this, arguments) : undefined;
+            trimHover(this, -1, -1e9);
             return r;
         };
     },

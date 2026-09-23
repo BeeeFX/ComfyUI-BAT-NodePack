@@ -45,6 +45,14 @@ _FRAME_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 # Entry-count cap is kept as a secondary guard against pathological tiny entries.
 _FRAME_CACHE_MAX = 8
 _FRAME_CACHE_MAX_BYTES = 4 * 1024 ** 3   # 4 GiB
+# ...and never more than this share of the RAM free at the time. ComfyUI's own
+# output cache (RAM_PRESSURE by default) evicts under memory pressure, and
+# "Free node cache" / "Unload models" clear it, but none of that reaches a
+# module-level cache here: there is no free-memory callback a custom node can
+# register for (POST /free only sets prompt-queue flags that main.py's worker
+# consumes itself). So the budget follows the machine instead — 4 GiB on a
+# roomy one, a quarter of what's left on a tight one, measured at every insert.
+_FRAME_CACHE_RAM_FRACTION = 0.25
 
 
 def _tensor_nbytes(t) -> int:
@@ -67,10 +75,23 @@ def _entry_nbytes(entry) -> int:
     return total
 
 
+def frame_cache_budget() -> int:
+    """Bytes a frame cache may hold right now: the fixed cap, or a fraction of
+    the system RAM currently available, whichever is smaller. psutil ships
+    with ComfyUI; without it the fixed cap applies, as before."""
+    try:
+        import psutil
+        available = psutil.virtual_memory().available
+    except Exception:
+        return _FRAME_CACHE_MAX_BYTES
+    return min(_FRAME_CACHE_MAX_BYTES, int(available * _FRAME_CACHE_RAM_FRACTION))
+
+
 def _trim_frame_cache():
     """Evict oldest entries until both the byte budget and the entry cap hold."""
     total = sum(_entry_nbytes(v) for v in _FRAME_CACHE.values())
-    while _FRAME_CACHE and (total > _FRAME_CACHE_MAX_BYTES
+    budget = frame_cache_budget()
+    while _FRAME_CACHE and (total > budget
                             or len(_FRAME_CACHE) > _FRAME_CACHE_MAX):
         _key, victim = _FRAME_CACHE.popitem(last=False)
         total -= _entry_nbytes(victim)

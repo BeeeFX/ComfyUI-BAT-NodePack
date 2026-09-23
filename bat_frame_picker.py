@@ -27,8 +27,9 @@ import server
 
 from .bat_loader import read_still
 from .bat_sequence import SequenceHandler
-from .bat_video_loader import (THUMB_DECODE_SLOTS, _fingerprint, load_frames,
-                               path_allowed, probe_video)
+from .bat_video_loader import (THUMB_DECODE_SLOTS, _fingerprint, _tensor_nbytes,
+                               frame_cache_budget, load_frames, path_allowed,
+                               probe_video)
 
 logger = logging.getLogger(__name__)
 
@@ -280,8 +281,14 @@ class BatFramePicker:
 
         tensor = torch.from_numpy(arr).unsqueeze(0).contiguous()  # (1,H,W,3)
         _FRAME_CACHE[key] = tensor
-        while len(_FRAME_CACHE) > _FRAME_CACHE_MAX:
-            _FRAME_CACHE.popitem(last=False)
+        # By count AND bytes: eight float32 4K frames is ~800 MB, which no
+        # cache-clear in ComfyUI reaches — so it shrinks with free RAM, on the
+        # same budget as 🦇 Video Loader's cache (frame_cache_budget).
+        budget = frame_cache_budget()
+        total = sum(_tensor_nbytes(t) for t in _FRAME_CACHE.values())
+        while _FRAME_CACHE and (len(_FRAME_CACHE) > _FRAME_CACHE_MAX or total > budget):
+            _key, victim = _FRAME_CACHE.popitem(last=False)
+            total -= _tensor_nbytes(victim)
         return (tensor,)
 
 

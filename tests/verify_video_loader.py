@@ -394,6 +394,31 @@ def test_cache(clip, tmp):
         vl._FRAME_CACHE_MAX_BYTES = saved
         vl._FRAME_CACHE.clear()
 
+    # Nothing in ComfyUI frees this cache, so its budget follows free RAM: a
+    # machine with little left keeps (here) nothing, one with plenty keeps it.
+    try:
+        import psutil
+    except ImportError:
+        print("SKIP  RAM-aware budget — no psutil")
+        return
+    real = psutil.virtual_memory
+    try:
+        entry = vl._entry_nbytes({"images": first})
+        psutil.virtual_memory = lambda: types.SimpleNamespace(available=entry)
+        check("the budget is a fraction of free RAM",
+              vl.frame_cache_budget() == int(entry * vl._FRAME_CACHE_RAM_FRACTION))
+        node.load(clip, 0, -1, 1)
+        check("low free RAM evicts the entry", len(vl._FRAME_CACHE) == 0,
+              f"{len(vl._FRAME_CACHE)} entries left")
+        psutil.virtual_memory = lambda: types.SimpleNamespace(available=64 * 1024 ** 3)
+        check("plenty of free RAM leaves the fixed cap in charge",
+              vl.frame_cache_budget() == vl._FRAME_CACHE_MAX_BYTES)
+        node.load(clip, 0, -1, 1)
+        check("...and the entry stays", len(vl._FRAME_CACHE) == 1)
+    finally:
+        psutil.virtual_memory = real
+        vl._FRAME_CACHE.clear()
+
 
 # ---------------------------------------------------------------------------
 # 6. The output signature
@@ -620,6 +645,121 @@ def test_rotated_deep(tmp):
     check("...and the pixels are the source turned, not sheared", any(matches))
 
 
+def test_trim_hover_js():
+    """Nodes 2.0 hover on the trim widget, under quickjs with a fake <canvas>.
+
+    WidgetLegacy.vue never forwards a plain hover move to widget.mouse(), so
+    the widget listens on the <canvas> its draw() is handed. Checks: hover
+    lands on the right frame in widget-local pixels, a press is left to
+    mouse(), leaving clears it, a remount moves the listener to the new element
+    and drops the detached one, 1.0 binds nothing, node removal unbinds.
+    """
+    try:
+        import quickjs
+    except ImportError:
+        print("SKIP  trim hover JS — pip install quickjs to run it")
+        return
+    import re
+    ctx = quickjs.Context()
+    ctx.eval(r"""
+        var LiteGraph = { NODE_WIDGET_HEIGHT: 20, vueNodesMode: true };
+        var window = { addEventListener() {}, removeEventListener() {} };
+        var ext = null;
+        var app = { registerExtension(e) { ext = e; }, graph: { _nodes: [] },
+                    canvas: { ds: { scale: 1, offset: [0, 0] },
+                              canvas: { getBoundingClientRect() { return { left: 0, top: 0 }; } } } };
+        var api = { apiURL(u) { return u; } };
+        var setTimeout = function () { return 0; }, clearTimeout = function () {};
+        var batTrack = function () { return { dispose() {} }; };
+        class Image {}
+        function fakeCanvas() {
+            return { isConnected: true, on: {},
+                     addEventListener(t, f) { (this.on[t] = this.on[t] || []).push(f); },
+                     removeEventListener(t, f) { this.on[t] = (this.on[t] || []).filter(g => g !== f); },
+                     fire(t, e) { for (const f of this.on[t] || []) f(e); },
+                     count() { return Object.values(this.on).reduce((n, a) => n + a.length, 0); } };
+        }
+        function fakeCtx(el) {
+            return new Proxy({ canvas: el, measureText: (t) => ({ width: t.length * 6 }) },
+                             { get: (o, k) => (k in o ? o[k] : function () {}), set: () => true });
+        }
+    """)
+    for name in ("bat_node_layout.js", "bat_path_widget.js", "bat_video_loader.js"):
+        src = open(os.path.join(PACK, "web", name), encoding="utf-8").read()
+        src = re.sub(r"^import [\s\S]*?;\s*$", "", src, flags=re.M)
+        src = re.sub(r"^export ", "", src, flags=re.M)
+        ctx.eval(src)
+    ctx.eval("""
+        var node = { size: [420, 400], pos: [5000, 5000], widgets: [], setDirtyCanvas() {} };
+        var startInt = { value: 0 }, endInt = { value: 100 };
+        var w = bindTrimAccessors(makeTrimWidget(node, startInt, endInt), startInt, endInt);
+        node.widgets.push(w);
+        w._trim.frameCount = 101;
+        var draws = 0; w.triggerDraw = () => { draws++; };
+        var el = fakeCanvas();
+        w.draw(fakeCtx(el), node, 400, 1, 200);          // WidgetLegacy: y = 1
+        var L = w._layout(400, 1);
+        var xAt = (f) => L.left + (f / 100) * L.inner;
+        var tlY = L.timelineY + L.timelineH / 2;
+    """)
+    check("2.0: draw() binds hover on the widget's own canvas",
+          ctx.eval("el.count()") == 2, str(ctx.eval("el.count()")))
+    ctx.eval("el.fire('pointermove', { offsetX: xAt(37), offsetY: tlY, buttons: 0 })")
+    check("2.0: hovering the timeline sets the hover frame (widget-local maths)",
+          ctx.eval("w._trim.hoverFrame") == 37 and ctx.eval("draws") == 1,
+          f"{ctx.eval('w._trim.hoverFrame')} draws={ctx.eval('draws')}")
+    ctx.eval("el.fire('pointermove', { offsetX: xAt(60), offsetY: tlY, buttons: 1 })")
+    check("2.0: a move with a button down is left to mouse()",
+          ctx.eval("w._trim.hoverFrame") == 37)
+    ctx.eval("el.fire('pointermove', { offsetX: xAt(60), offsetY: L.thumbY + 5, buttons: 0 })")
+    check("2.0: off the timeline clears the hover frame",
+          ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""el.fire('pointermove', { offsetX: xAt(12), offsetY: tlY, buttons: 0 });
+                el.fire('pointerleave', {});""")
+    check("2.0: leaving the canvas clears the hover frame",
+          ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""el.isConnected = false; var el2 = fakeCanvas();
+                w.draw(fakeCtx(el2), node, 300, 1, 200);""")
+    check("2.0: a remount rebinds to the new canvas and releases the old one",
+          ctx.eval("el.count()") == 0 and ctx.eval("el2.count()") == 2)
+    ctx.eval("el2.fire('pointermove', { offsetX: w._layout(300, 1).left + w._layout(300, 1).inner / 2,"
+             " offsetY: tlY, buttons: 0 })")
+    check("2.0: ...using the new canvas's own width", ctx.eval("w._trim.hoverFrame") == 50,
+          str(ctx.eval("w._trim.hoverFrame")))
+    ctx.eval("w._unbindHover()")
+    check("node removal releases the listeners", ctx.eval("el2.count()") == 0)
+    ctx.eval("LiteGraph.vueNodesMode = false; var el3 = fakeCanvas();"
+             " w.draw(fakeCtx(el3), node, 400, 150, 200);")
+    check("1.0: draw() binds nothing (unchanged)", ctx.eval("el3.count()") == 0)
+
+    # Nodes 1.0: plain hover reaches node.onMouseMove(e, [x - pos0, y - pos1]),
+    # never widget.mouse(), so the node hook feeds the widget. Drawn above at
+    # y=150 (node-local graph units), width 400.
+    ctx.eval("""
+        var proto = {};
+        ext.beforeRegisterNodeDef({ prototype: proto }, { name: "Bat_VideoLoader" });
+        node.widgets = [w];
+        var L1 = w._layout(400, 150);
+        var tl1 = L1.timelineY + L1.timelineH / 2;
+        draws = 0;
+        proto.onMouseMove.call(node, {}, [L1.left + 0.25 * L1.inner, tl1], app.canvas);
+    """)
+    check("1.0: node hover sets the hover frame",
+          ctx.eval("w._trim.hoverFrame") == 25 and ctx.eval("draws") == 1,
+          f"{ctx.eval('w._trim.hoverFrame')} draws={ctx.eval('draws')}")
+    ctx.eval("proto.onMouseMove.call(node, {}, [L1.left + 0.25 * L1.inner + 0.1, tl1], app.canvas)")
+    check("1.0: no redraw when the frame doesn't change", ctx.eval("draws") == 1)
+    ctx.eval("proto.onMouseMove.call(node, {}, [L1.left + 10, L1.thumbY + 5], app.canvas)")
+    check("1.0: leaving the timeline rows clears it", ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""proto.onMouseMove.call(node, {}, [L1.left + 0.5 * L1.inner, tl1], app.canvas);
+                proto.onMouseLeave.call(node, {});""")
+    check("1.0: leaving the node clears it", ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""LiteGraph.vueNodesMode = true; draws = 0;
+                proto.onMouseMove.call(node, {}, [L1.left + 0.5 * L1.inner, tl1], app.canvas);""")
+    check("2.0: the node hook stays out (the canvas listener owns hover)",
+          ctx.eval("w._trim.hoverFrame") is None and ctx.eval("draws") == 0)
+
+
 def test_banner_parser():
     cases = [
         # (banner line, pix_fmt, alpha, depth)
@@ -705,6 +845,7 @@ if __name__ == "__main__":
                   "(install decord, opencv-python, or torchvision)")
             sys.exit(1)
         test_banner_parser()
+        test_trim_hover_js()
         test_trim(clip)
         test_outputs(clip)
         test_scale_exact(clip)
