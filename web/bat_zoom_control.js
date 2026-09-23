@@ -58,9 +58,25 @@ const clampZoom = (z) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
  * @param {object}   opts.state        editor state object (gets .dispZoom/.panX/.panY)
  * @param {Function} opts.onChange     called after any view change (→ render)
  * @param {string}   [opts.corner]     "tl"|"tr"|"bl"|"br" (default "bl")
+ * @param {HTMLElement} [opts.scope]   the element that holds keyboard focus
+ *                                     while the artist works in the editor
+ *                                     (default `wrap`) — see below
  * @returns {{setZoom:Function, getZoom:Function, resetView:Function, refresh:Function}}
  */
-export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl" }) {
+export function attachZoomControl({ wrap, canvas, state, onChange, corner = "bl", scope = null }) {
+    // Nodes 2.0: TransformPane forwards every wheel event to the graph in the
+    // CAPTURE phase (GraphCanvas.vue → useCanvasInteractions.forwardEventToCanvas)
+    // and stops it there, so the canvas listener below never ran — the wheel
+    // zoomed the graph instead. The one exemption is a target inside a
+    // `[data-capture-wheel="true"]` element that contains the focused element.
+    // So mark the element the editor focuses: after one click in the editor the
+    // wheel is ours, before it the graph still pans over the node, which is the
+    // frontend's own convention. Inert under Nodes 1.0 and inert if nothing
+    // inside `scope` ever takes focus — only an editor that focuses itself
+    // gains wheel zoom here; one that doesn't would have to take focus first,
+    // and then stop its keys reaching core's Delete binding (see bat_roto.js).
+    try { (scope || wrap)?.setAttribute?.("data-capture-wheel", "true"); } catch (_) {}
+
     if (typeof state.dispZoom !== "number" || !isFinite(state.dispZoom)) {
         state.dispZoom = 1;
     }

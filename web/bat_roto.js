@@ -81,6 +81,29 @@ function _loadCachedPreview(node) {
 const lerp2 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 
 /**
+ * Interpolate two keyframes' point lists at t — a line-for-line port of
+ * `_interp_points` in bat_roto.py, because the canvas must show what the MASK
+ * renders. When the point counts differ (the pen tool appends to the current
+ * keyframe only), the shorter list is padded with its last point, so the shared
+ * prefix keeps animating. The preview used to hold keyframe A instead, while the
+ * render animated: the in-betweens on screen were not the ones in the output.
+ */
+function lerpKeyframes(a, b, t) {
+    if (!a || !a.length) return b || [];
+    if (!b || !b.length) return a;
+    let pa = a, pb = b;
+    if (pa.length !== pb.length) {
+        const pad = (l, n) => l.concat(Array(n - l.length).fill(l[l.length - 1]));
+        if (pa.length < pb.length) pa = pad(pa, pb.length);
+        else pb = pad(pb, pa.length);
+    }
+    // A malformed point (component counts differ) is the one case the backend
+    // can't lerp either — it holds A, so do we.
+    if (pa.some((p, i) => p.length !== pb[i].length)) return a;
+    return pa.map((p, i) => p.map((v, k) => v + (pb[i][k] - v) * t));
+}
+
+/**
  * De Casteljau subdivision of a cubic bezier at parameter t.
  *
  * Returns the new control points needed to insert a new anchor between
@@ -744,13 +767,7 @@ function buildEditor(node) {
         }
         if (prev === nxt) return kfs[String(prev)];
         const t = (f - prev) / (nxt - prev);
-        const a = kfs[String(prev)], b = kfs[String(nxt)];
-        if (a.length !== b.length) return a;
-        return a.map((pa, i) => {
-            const pb = b[i];
-            if (pa.length !== pb.length) return pa.slice();
-            return pa.map((v, k) => v + (pb[k] - v) * t);
-        });
+        return lerpKeyframes(kfs[String(prev)], kfs[String(nxt)], t);
     }
 
     // Returns the keyframe TO MODIFY when the user drags a point. When
@@ -1212,12 +1229,7 @@ function buildEditor(node) {
         }
         if (prev === nxt) return kfs[String(prev)];
         const t = (frame - prev) / (nxt - prev);
-        const a = kfs[String(prev)], b = kfs[String(nxt)];
-        if (a.length !== b.length) return a;
-        return a.map((pa, i) => {
-            const pb = b[i];
-            return pa.map((v, k) => v + (pb[k] - v) * t);
-        });
+        return lerpKeyframes(kfs[String(prev)], kfs[String(nxt)], t);
     }
 
     // ── handle helpers ──────────────────────────────────────────────
@@ -2029,18 +2041,26 @@ function buildEditor(node) {
     }
 
     // ── keyboard ─────────────────────────────────────────────────────
+    // Every key this editor USES stops here. The frontend's keybinding
+    // handler sits on `window`, never checks defaultPrevented, and scopes
+    // Delete / Backspace to #graph-canvas-container — which contains this
+    // editor. And focusing the editor selects the node (DomWidget.vue
+    // selectOn), so a Delete meant for an anchor also ran "Delete Selected
+    // Items" and removed the Roto node itself. Keys we leave unhandled still
+    // bubble, so a no-op Escape reaches bat_fullscreen.js and core.
+    const consume = (e) => { e.preventDefault(); e.stopPropagation(); };
     root.addEventListener("keydown", (e) => {
         if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
         // Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z (or Ctrl+Y) = redo.
         if ((e.ctrlKey || e.metaKey) && !e.altKey) {
             if (e.key === "z" || e.key === "Z") {
                 if (e.shiftKey) redo(); else undo();
-                e.preventDefault();
+                consume(e);
                 return;
             }
             if (e.key === "y" || e.key === "Y") {
                 redo();
-                e.preventDefault();
+                consume(e);
                 return;
             }
         }
@@ -2129,7 +2149,7 @@ function buildEditor(node) {
                 break;
             default: handled = false;
         }
-        if (handled) e.preventDefault();
+        if (handled) consume(e);
     });
 
     // ── playback ─────────────────────────────────────────────────────
@@ -3054,7 +3074,9 @@ function buildEditor(node) {
 
     // Display-only zoom control (bottom-left of the canvas). Lets the artist
     // pull back to see and roto shapes that extend past the frame edge.
-    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl" });
+    // `scope: root` — root is what takes focus on a canvas click, so it is what
+    // the Nodes 2.0 wheel exemption has to be declared on.
+    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl", scope: root });
 
     _restoreCachedPreview();
 

@@ -11,12 +11,13 @@ Runs the real module under quickjs with the ComfyUI globals stubbed.
 """
 
 import os
-import re
 import sys
 import json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(PACK, "tests"))
+from _harness import auto_stub_js, strip_modules  # noqa: E402
 
 STUB = r"""
 var __vue = false;                       // Comfy.VueNodes.Enabled
@@ -65,12 +66,13 @@ def load():
     import quickjs
 
     src = open(os.path.join(PACK, "web", "bat_node_layout.js"), encoding="utf-8").read()
-    src = re.sub(r"^import\s[\s\S]*?from\s+['\"][^'\"]+['\"];", "", src, flags=re.M)
-    src = re.sub(r"^export ", "", src, flags=re.M)
 
     ctx = quickjs.Context()
+    # Derived no-op stubs first (markBatWidget from bat_paste_guard.js, and any
+    # helper imported later), then the curated ones, which must win.
+    ctx.eval(auto_stub_js(src))
     ctx.eval(STUB)
-    ctx.eval(src)
+    ctx.eval(strip_modules(src))
     return ctx
 
 
@@ -153,10 +155,31 @@ def main():
           ctx.eval("node4.graph._v") > 0, True)
 
     # ── refreshBatLayout, Nodes 2.0 ─────────────────────────────────────
+    # node.size is the stored height FLOOR under the Vue node's DOM content
+    # (frontend 1.55, graphLayoutAttachment.ts), so a collapse has to lower it —
+    # this used to assert it was left alone, which kept the old height.
     ctx.eval("__vue = true; node4.size = [400, 500];")
-    ctx.eval("refreshBatLayout(node4, w4, { shrink: true })")
-    check("under Nodes 2.0 node.size is left alone (the layout derives it)",
+    ctx.eval("refreshBatLayout(node4, w4)")
+    check("under Nodes 2.0 a plain refresh writes nothing (the DOM grows the node)",
           json.loads(ctx.eval("JSON.stringify(node4.size)")), [400, 500])
+    ctx.eval("refreshBatLayout(node4, w4, { shrink: true })")
+    check("...but a shrink lowers the stored height floor, width untouched",
+          json.loads(ctx.eval("JSON.stringify(node4.size)")), [400, 120])
+    ctx.eval("node4.size = [400, 80]; refreshBatLayout(node4, w4, { shrink: true })")
+    check("...and never raises it",
+          json.loads(ctx.eval("JSON.stringify(node4.size)")), [400, 80])
+    ctx.eval("__vue = false;")
+
+    # ── clampNodeSize ───────────────────────────────────────────────────
+    ctx.eval("var n6 = mkNode(mkEl()); n6.size = [250, 90]; clampNodeSize(n6, 640, 540);")
+    check("Nodes 1.0: both floors apply",
+          json.loads(ctx.eval("JSON.stringify(n6.size)")), [640, 540])
+    ctx.eval("__vue = true; var n7 = mkNode(mkEl()); n7.size = [250, 90]; clampNodeSize(n7, 640, 540);")
+    check("Nodes 2.0: a fresh node gets the width floor (its height stays DOM-derived)",
+          json.loads(ctx.eval("JSON.stringify(n7.size)")), [640, 90])
+    ctx.eval("var n8 = mkNode(mkEl()); n8.size = [700, 90]; clampNodeSize(n8, 640, 540);")
+    check("...and a node already wider is left alone",
+          json.loads(ctx.eval("JSON.stringify(n8.size)")), [700, 90])
     ctx.eval("__vue = false;")
 
     # ── setBatWidgetHidden ──────────────────────────────────────────────

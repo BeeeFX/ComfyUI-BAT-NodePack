@@ -49,22 +49,43 @@ const KEY = "_batLifecycle";
  * imgW/imgH, and shapes drew against a bogus reference. Including the workflow
  * identity makes the key unique across graphs.
  *
+ * The identity is the root graph's UUID. `LGraph.serialize()` writes it out as
+ * the workflow's top-level `id` and `_configureBase()` restores it on load, so
+ * it is stable across reloads of the same workflow and distinct between
+ * workflows. (This used to read `graph.extra.workflow_id`, which nothing — core
+ * or this pack — ever sets, so every key fell through to the page path and the
+ * collision above was still there.)
+ *
  * `app` is imported lazily (inside the call) so this module stays usable in
  * contexts where the ComfyUI app module isn't loaded.
  */
 export function batWorkflowKey(app) {
     try {
-        const g = app?.graph;
-        const id = g?.extra?.workflow_id || g?.extra?.workflowId
-                || g?.extra?.ds?.workflow_id || "";
+        const g = app?.graph;           // the root graph (app.graph === app.rootGraph)
+        const id = g?.rootGraph?.id ?? g?.id;
         if (id) return String(id);
     } catch (_) { /* fall through */ }
     try { return String(window.location?.pathname || "_"); } catch (_) { return "_"; }
 }
 
-/** Build a workflow-scoped, node-scoped localStorage key. */
+/**
+ * Build a workflow-scoped, node-scoped localStorage key.
+ *
+ * Node ids are only unique within one graph, and every subgraph numbers its
+ * own nodes, so a node inside a subgraph also folds in that subgraph's id —
+ * the same scoping `execKey()` below uses. Root-graph nodes keep the plain
+ * form. The node's OWN root graph is preferred over `app.graph` when the node
+ * is attached, so the key never follows whichever workflow happens to be active.
+ */
 export function batNodeCacheKey(app, prefix, node) {
-    return `${prefix}_${batWorkflowKey(app)}_${node?.id ?? "_"}`;
+    let wf = null, sub = "";
+    try {
+        const g = node?.graph;
+        const root = g?.rootGraph;
+        if (root?.id) wf = String(root.id);
+        if (g && root && g !== root && g.id) sub = `${g.id}_`;
+    } catch (_) { /* detached node: fall back to the app's graph */ }
+    return `${prefix}_${wf ?? batWorkflowKey(app)}_${sub}${node?.id ?? "_"}`;
 }
 
 function bag(node) {

@@ -15,6 +15,14 @@
  * A direct `node.size = [...]` assignment is simply ignored there (and actively
  * recomputed away when `Comfy.VueNodes.AutoScaleLayout` is on).
  *
+ * (Frontend 1.55 correction: the Vue renderer now sizes from the DOM. The widget
+ * grid only asks whether `computeLayoutSize` EXISTS — it gets a stretchy `auto`
+ * row (WidgetGrid.vue) — and never reads the numbers; the element's own CSS
+ * min-height is what holds the editor open. `node.size` is no longer ignored:
+ * it is the layout store's stored rect, which the Vue node uses as its WIDTH and
+ * as a height FLOOR under the measured content (graphLayoutAttachment.ts,
+ * LGraphNode.vue). clampNodeSize / refreshBatLayout below act on that.)
+ *
  * None of the canvas editors implemented any of that, which produced two
  * distinct failures under 2.0:
  *
@@ -39,7 +47,7 @@
  *       height: 540,          // number, or () => number for measured content
  *       growable: true,       // canvas editors: absorb extra node height
  *   });
- *   clampNodeSize(node, 640, 540);   // no-op under Nodes 2.0
+ *   clampNodeSize(node, 640, 540);   // width only under Nodes 2.0
  *
  * Side effect worth knowing about: addBatDOMWidget() also marks the element for
  * bat_paste_guard.js, so a middle-click inside any BAT DOM widget cannot paste
@@ -152,13 +160,14 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
     const getMin = () => Math.max(1, Math.round(measure()));
     // A growable widget with no explicit cap used to advertise
     // Number.MAX_SAFE_INTEGER. Under Nodes 1.0 that was harmless — clampNodeSize
-    // pinned node.size straight after. Under Nodes 2.0 clampNodeSize is a no-op
-    // and height is derived from this ceiling, so "unbounded" reads as "absorb
-    // all available height" and the node grew past the bottom of the viewport
-    // (and resisted manual resize, since the layout re-derived every frame).
-    // Default to a multiple of the design height instead: the node opens at its
-    // design size, the artist can still drag it taller, and it never self-expands
-    // to fill the canvas. An explicit maxHeight still wins.
+    // pinned node.size straight after. On earlier 2.0 builds height was derived
+    // from this ceiling, so "unbounded" read as "absorb all available height" and
+    // the node grew past the bottom of the viewport. Default to a multiple of the
+    // design height instead: the node opens at its design size, the artist can
+    // still drag it taller, and it never self-expands to fill the canvas. An
+    // explicit maxHeight still wins. (On frontend 1.55 only the Nodes 1.0 layout
+    // reads the ceiling — `_arrangeWidgets` — so there a node dragged past it
+    // leaves a band below the editor; the Vue grid ignores it and just fills.)
     // `maxHeight` is resolved per call, not captured, so a collapsible editor
     // can hand back a different ceiling once it has been collapsed.
     const capOf = typeof maxHeight === "function" ? maxHeight : () => maxHeight;
@@ -276,9 +285,14 @@ export function addBatDOMWidget(node, name, type, el, opts = {}) {
  *   setDirtyCanvas(true, true) → ...and repaints.
  *
  * with one addition: `expandToFitContent` only ever GROWS (it is a pair of
- * Math.max), so collapsing needs an explicit shrink to `computeSize()`. The
- * node.size writes are gated on Nodes 1.0 — under 2.0 they are ignored and the
- * derived height is already right.
+ * Math.max), so collapsing needs an explicit shrink to `computeSize()`.
+ *
+ * Under Nodes 2.0 growing needs no write — the DOM content pushes the node
+ * taller by itself — but shrinking does: node.size is the stored height FLOOR
+ * the Vue node keeps under its content (`min-h-(--node-height)`), so a node that
+ * was loaded from a workflow or dragged taller kept its old height after a
+ * collapse, with an empty band below. Lowering the floor is always safe there:
+ * the rendered size is max(stored, measured content).
  *
  * @param {object} node
  * @param {object} widget  the widget whose height changed (optional)
@@ -288,7 +302,20 @@ export function refreshBatLayout(node, widget, opts = {}) {
     if (!node) return;
     try { widget?._batPublishVars?.(); } catch (_) {}
     try { node.graph?.incrementVersion?.(); } catch (_) {}
-    if (!vueNodesEnabled()) {
+    if (vueNodesEnabled()) {
+        if (opts.shrink) {
+            try {
+                const natural = node.computeSize?.() || node.size;
+                const h = Math.min(node.size[1], natural[1]);
+                if (h < node.size[1]) {
+                    if (typeof node.setSize === "function") node.setSize([node.size[0], h]);
+                    else node.size = [node.size[0], h];
+                }
+            } catch (e) {
+                console.error("[BAT.layout] refreshBatLayout shrink failed:", e);
+            }
+        }
+    } else {
         try {
             const natural = node.computeSize?.() || node.size;
             const h = opts.shrink ? natural[1] : Math.max(node.size[1], natural[1]);
@@ -331,16 +358,24 @@ export function setBatWidgetHidden(node, widget, hidden) {
 }
 
 /**
- * Clamp the node's size — a NO-OP under Nodes 2.0, where height is derived from
- * computeLayoutSize and writing node.size fights the layout.
+ * Clamp the node's size. Under Nodes 2.0 only the WIDTH floor applies.
+ *
+ * The height there comes from the DOM (the editor's CSS min-height), and the
+ * stored height is only a floor under it, so it is left alone. The width is not:
+ * the Vue node is exactly `node.size[0]` wide, and core sizes a new node
+ * (setInitialSize) in its constructor — before onNodeCreated has added the
+ * editor — so skipping this left a freshly placed 640-wide editor squeezed into
+ * a ~250 px node until the workflow was reloaded. A width written here, before
+ * the node is added, seeds its layout-store rect.
  *
  * Use this in place of every post-addDOMWidget `this.size = [...]`.
  */
 export function clampNodeSize(node, minW, minH) {
-    if (vueNodesEnabled()) return;
+    const vue = vueNodesEnabled();
     try {
         const w = Math.max(minW || 0, node.size?.[0] || 0);
-        const h = Math.max(minH || 0, node.size?.[1] || 0);
+        const h = vue ? (node.size?.[1] || 0) : Math.max(minH || 0, node.size?.[1] || 0);
+        if (vue && w === node.size?.[0]) return;
         if (typeof node.setSize === "function") node.setSize([w, h]);
         else node.size = [w, h];
         node.setDirtyCanvas?.(true, true);
