@@ -29,6 +29,7 @@ from PIL import Image
 
 from . import bat_sec_advanced as adv
 from . import bat_sec_runtime as rt
+from .bat_ui_ref import stash_ui
 
 # Preview strip pushed back to the editor after a run, so scrubbing
 # frame_index_select re-previews without re-running a multi-minute
@@ -66,8 +67,9 @@ class BatSecSegmenter:
                 "auto_unload_model": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Free the 4B model after each run. Leave on unless you're "
-                               "iterating — off keeps it resident so the next run skips the "
-                               "~30s load, at the cost of the VRAM.",
+                               "iterating — off keeps it loaded so the next run skips the "
+                               "~30s build. ComfyUI can still move it to RAM when another "
+                               "model needs the VRAM, and 'Unload models' frees the VRAM.",
                 }),
                 # Appended rather than slotted next to frame_index_select: ComfyUI
                 # stores widget values as a positional array, so inserting in the
@@ -174,6 +176,8 @@ device, tracking direction and the rest.
             use_flash_attn=settings["use_flash_attn"],
             allow_mask_overlap=settings["allow_mask_overlap"],
             auto_download=settings["auto_download"],
+            memory_required=rt.inference_memory_estimate(
+                frames.shape[0], settings["offload_video_to_cpu"]),
         )
 
         try:
@@ -199,10 +203,15 @@ device, tracking direction and the rest.
                 offload_video_to_cpu=settings["offload_video_to_cpu"],
             )
         finally:
+            # Ours must be the last reference to go: release() can only give
+            # the memory back once nothing else holds the model.
+            model = None
             if auto_unload_model:
                 rt.release(cache_key)
 
         return {
-            "ui": self._preview_payload(frames),
+            # The strip is up to 240 JPEGs (15-20 MB); kept out of the prompt
+            # history via a sidecar file that web/bat_ui_ref.js resolves.
+            "ui": stash_ui(self._preview_payload(frames)),
             "result": (masks, rt.draw_mask_overlay(frames, masks, mask_preview)),
         }

@@ -324,8 +324,110 @@ def resolve_device(device):
 # Merging the loader into the node removes the constraint: "reload" is just a
 # cache miss. Load fresh, keep it keyed by everything that affects
 # construction, and on unload drop the reference and let Python free it.
+#
+# The cache entry is a ComfyUI ModelPatcher, and ComfyUI — not this module —
+# moves the weights. The model is built in RAM; load_models_gpu() then evicts
+# whatever else is resident to make room before SeC lands on the GPU, and
+# ComfyUI's own free_memory() / "Unload models" can push SeC back to RAM when
+# another model needs the VRAM. Before this, SeC was invisible to ComfyUI: a
+# resident Flux/SDXL made the ~7GB load OOM, and with auto-unload off SeC was
+# pinned in VRAM where nothing could evict it. The patcher is the only strong
+# reference to the model, so dropping it from the cache still frees it.
 _MODEL_CACHE = {}
 _CACHE_LOCK = threading.RLock()
+
+# VRAM SeC needs beyond its weights, so ComfyUI evicts enough up front: SAM2's
+# per-frame features and memory bank plus the MLLM's attention over ~13 frames
+# of image tokens on a scene change. A generous estimate, not a limit.
+_INFERENCE_VRAM = 3 * 1024 ** 3
+# SAM2 holds every frame as a 1024x1024 fp32 RGB tensor — on the GPU unless
+# offload_video_to_cpu is on.
+_FRAME_VRAM = 1024 * 1024 * 3 * 4
+
+
+def inference_memory_estimate(num_frames, offload_video_to_cpu=True):
+    """Bytes of VRAM a run needs on top of the weights (for load_models_gpu)."""
+    return _INFERENCE_VRAM + (0 if offload_video_to_cpu else int(num_frames) * _FRAME_VRAM)
+
+
+class _SeCHolder(torch.nn.Module):
+    """The nn.Module ComfyUI's ModelPatcher manages.
+
+    ModelPatcher assigns ``model.device`` on every load and offload, but SeCModel
+    is a transformers PreTrainedModel whose ``device`` is a read-only property.
+    The holder owns SeC as a submodule — moving the holder moves SeC — and
+    carries a plain ``device`` attribute for the patcher to write.
+    """
+
+    def __init__(self, sec):
+        super().__init__()
+        self.sec = sec
+        self.device = torch.device("cpu")
+
+
+def _model_management():
+    """comfy.model_management, or None outside ComfyUI (tests)."""
+    try:
+        import comfy.model_management as mm
+        import comfy.model_patcher  # noqa: F401  (imported for _make_entry)
+        return mm
+    except Exception:
+        return None
+
+
+def _make_entry(model, device):
+    """Wrap a freshly built (CPU-resident) model for the cache."""
+    holder = _SeCHolder(model)
+    mm = _model_management()
+    if mm is None:
+        return holder
+    import comfy.model_patcher
+
+    load_device = torch.device(device)
+    # unet_offload_device() is RAM, or the GPU itself under --highvram /
+    # --gpu-only — the same place ComfyUI parks its own diffusion models.
+    offload_device = torch.device("cpu") if load_device.type == "cpu" else mm.unet_offload_device()
+    return comfy.model_patcher.CoreModelPatcher(holder, load_device=load_device, offload_device=offload_device)
+
+
+def _load_entry(entry, device, memory_required):
+    """Have ComfyUI put a cached model on its device; returns the SeC model."""
+    if isinstance(entry, _SeCHolder):  # no ComfyUI (tests): move it ourselves
+        entry.to(device)
+        return entry.sec
+
+    mm = _model_management()
+    # force_full_load: SeC's layers are plain torch modules without ComfyUI's
+    # weight-casting hooks, so a partial "lowvram" load would leave some weights
+    # in RAM under GPU inputs and fail mid-run. Full load makes ComfyUI evict
+    # other models instead; if SeC still doesn't fit, it OOMs as it always did.
+    mm.load_models_gpu([entry], memory_required=memory_required, force_full_load=True)
+    if getattr(entry.model, "model_lowvram", False):
+        # Only --novram gets here: ComfyUI loads partially regardless.
+        raise RuntimeError(
+            "ComfyUI loaded the SeC model only partially (--novram?). SeC can't "
+            "stream weights; run it on the CPU via 🦇 SeC Advanced Params instead."
+        )
+    return entry.model.sec
+
+
+def _unload_entry(entry):
+    """Take one cached model off ComfyUI's loaded list (weights back to RAM)."""
+    if isinstance(entry, _SeCHolder):
+        return
+    try:
+        _model_management().unload_model_and_clones(
+            entry, unload_additional_models=False, all_devices=True)
+    except Exception as e:
+        print(f"[Bat SeC] ComfyUI could not unload the model cleanly: {e}")
+
+
+def _empty_cache():
+    mm = _model_management()
+    if mm is not None:
+        mm.soft_empty_cache()
+    elif torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _cache_key(spec, device, use_flash_attn, allow_mask_overlap):
@@ -337,10 +439,13 @@ def unload_all(reason=""):
     with _CACHE_LOCK:
         if _MODEL_CACHE:
             print(f"[Bat SeC] unloading {len(_MODEL_CACHE)} cached model(s){f' ({reason})' if reason else ''}")
+        entries = list(_MODEL_CACHE.values())
         _MODEL_CACHE.clear()
+    for entry in entries:
+        _unload_entry(entry)
+    del entries
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
 
 
 def _register_dtype_hooks(model, torch_dtype):
@@ -412,10 +517,8 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
     # SAM2 takes is "non_overlap_masks".
     config.hydra_overrides_extra = [f"++model.non_overlap_masks={'false' if allow_mask_overlap else 'true'}"]
 
-    if device.startswith("cuda"):
-        gc.collect()
-        torch.cuda.empty_cache()
-
+    # Built in RAM whatever the target: ComfyUI moves it onto the GPU in
+    # get_model(), after evicting other models to make room.
     if spec["is_single_file"]:
         state_dict = load_file(spec["path"])
         if spec["precision"] == "fp8":
@@ -432,18 +535,18 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
 
             with init_empty_weights():
                 model = SeCModel(config, use_flash_attn=use_flash_attn)
-            # dtype + target device explicitly: without a dtype, accelerate casts
-            # each value to the meta param's dtype (float32), which built a
-            # ~15GB fp32 copy on the CPU next to the 7GB state_dict before the
-            # final .to(). Integer tensors are left alone by accelerate.
+            # dtype explicitly: without it, accelerate casts each value to the
+            # meta param's dtype (float32), which built a ~15GB fp32 copy on
+            # the CPU next to the 7GB state_dict before the final .to().
+            # Integer tensors are left alone by accelerate.
             for name, param in state_dict.items():
-                set_module_tensor_to_device(model, name, device=device, value=param, dtype=torch_dtype)
+                set_module_tensor_to_device(model, name, device="cpu", value=param, dtype=torch_dtype)
         except (ImportError, RuntimeError):
             model = SeCModel(config, use_flash_attn=use_flash_attn)
             model.load_state_dict(state_dict, strict=True)
 
         del state_dict
-        model = model.eval().to(device=device, dtype=torch_dtype)
+        model = model.eval().to(dtype=torch_dtype)
     else:
         load_kwargs = {
             "config": config,
@@ -451,8 +554,6 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
             "use_flash_attn": use_flash_attn,
             "low_cpu_mem_usage": True,
         }
-        if device.startswith("cuda"):
-            load_kwargs["device_map"] = {"": device}
         model = SeCModel.from_pretrained(spec["path"], **load_kwargs).eval()
 
     tokenizer = AutoTokenizer.from_pretrained(spec["config_path"], trust_remote_code=True)
@@ -465,12 +566,13 @@ def _build_model(spec, device, torch_dtype, use_flash_attn, allow_mask_overlap):
 
 
 def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap=True,
-              auto_download=True):
-    """Load ``model_file`` (or return the cached instance).
+              auto_download=True, memory_required=0):
+    """Load ``model_file`` (or reuse the cached instance) onto its device.
 
     Downloads the default checkpoint first if nothing is installed and
     ``auto_download`` is set, so the node works on a fresh machine with nothing
-    wired to it.
+    wired to it. ``memory_required`` is the run's VRAM on top of the weights
+    (:func:`inference_memory_estimate`), so ComfyUI frees enough for both.
 
     Returns ``(model, cache_key)``. Pass the key to :func:`release` to unload.
     """
@@ -530,9 +632,11 @@ def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap
     key = _cache_key(spec, resolved_device, use_flash_attn, allow_mask_overlap)
 
     with _CACHE_LOCK:
-        model = _MODEL_CACHE.get(key)
-        if model is not None:
-            return model, key
+        entry = _MODEL_CACHE.get(key)
+        if entry is not None:
+            # Possibly offloaded to RAM by ComfyUI since the last run; this
+            # brings it back (a no-op when it is still resident).
+            return _load_or_drop(key, entry, resolved_device, memory_required), key
 
         # Only one SeC model fits in VRAM at a time in practice, and holding a
         # stale one just to lose the next load to OOM is a bad trade.
@@ -549,26 +653,45 @@ def get_model(model_file, device="auto", use_flash_attn=True, allow_mask_overlap
               f"{'' if use_flash_attn else ' (flash-attn off)'}")
 
         try:
-            model = _build_model(spec, resolved_device, torch_dtype, use_flash_attn, allow_mask_overlap)
+            entry = _make_entry(
+                _build_model(spec, resolved_device, torch_dtype, use_flash_attn, allow_mask_overlap),
+                resolved_device)
         except Exception as e:
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _empty_cache()
             raise RuntimeError(f"Failed to load SeC model '{label}': {e}") from e
 
-        _MODEL_CACHE[key] = model
+        _MODEL_CACHE[key] = entry
+        model = _load_or_drop(key, entry, resolved_device, memory_required)
         print(f"[Bat SeC] ready on {resolved_device}")
         return model, key
 
 
+def _load_or_drop(key, entry, device, memory_required):
+    """_load_entry, but a model that failed to load (OOM) leaves the cache —
+    otherwise ~7GB would sit in RAM after a failed run even with auto-unload on."""
+    try:
+        return _load_entry(entry, device, memory_required)
+    except BaseException:
+        del entry
+        release(key)
+        raise
+
+
 def release(key):
-    """Unload one cached model."""
+    """Unload one cached model.
+
+    Drop every reference to the model returned by :func:`get_model` first —
+    memory only comes back once the last one is gone.
+    """
     with _CACHE_LOCK:
-        if _MODEL_CACHE.pop(key, None) is None:
-            return
+        entry = _MODEL_CACHE.pop(key, None)
+    if entry is None:
+        return
+    _unload_entry(entry)
+    del entry
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    _empty_cache()
 
 
 # ── prompt parsing ──────────────────────────────────────────────────────────

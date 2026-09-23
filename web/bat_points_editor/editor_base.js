@@ -293,10 +293,13 @@ export class BaseEditorCanvas {
     this.onDataChanged();
   };
 
-  processImage = (img, { resize = true } = {}) => {
+  // `coord` ({width, height}) overrides the coord space when `img` is itself a
+  // downscaled preview — the Points Editor's post-run plate arrives capped at
+  // 1024 px with the true size alongside (bg_w / bg_h).
+  processImage = (img, { resize = true, coord = null } = {}) => {
     // Capture original dimensions BEFORE any downscale, so reloading
     // from the cached (downscaled) copy can restore the right coord space.
-    const origWidth = img.width, origHeight = img.height;
+    const origWidth = coord?.width ?? img.width, origHeight = coord?.height ?? img.height;
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
@@ -315,7 +318,7 @@ export class BaseEditorCanvas {
 
     const onStored = () => {
       if (resize) {
-        this.handleImageLoad(img, canvas);
+        this.handleImageLoad(img, canvas, coord);
       } else {
         this.bgImage = canvas;
         this.render();
@@ -691,10 +694,15 @@ export class BaseEditorCanvas {
       let bg_image = message["bg_image"];
       if (Array.isArray(bg_image)) bg_image = bg_image[0];
       if (bg_image) {
+        // bg_w/bg_h: the plate's true size. Absent from older servers, which
+        // sent the plate at full resolution — then the image's own size is it.
+        const one = (v) => (Array.isArray(v) ? v[0] : v);
+        const w = Number(one(message.bg_w)) || 0, h = Number(one(message.bg_h)) || 0;
+        const coord = w && h ? { width: w, height: h } : null;
         const img = new Image();
         img.src = `data:image/jpeg;base64,${bg_image}`;
         img.onload = () => {
-          if (this.editor) this.editor.processImage(img);
+          if (this.editor) this.editor.processImage(img, { coord });
         };
       }
     });

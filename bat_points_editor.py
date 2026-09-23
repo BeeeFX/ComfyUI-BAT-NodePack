@@ -2,9 +2,9 @@
 Bat Points Editor — forked copy of KJNodes' PointsEditor with a
 fix on the JS side: Reset canvas no longer collapses the coord
 space back to the downscaled (≤1024) cached-image dimensions on
-the first execution. The Python class itself is byte-equivalent
-to upstream so the node behaves identically once correct width
-and height widgets reach it.
+the first execution. The Python class matches upstream apart from
+the fixes noted inline, so the node behaves identically once correct
+width and height widgets reach it.
 """
 
 import base64
@@ -13,7 +13,15 @@ from io import BytesIO
 
 import numpy as np
 import torch
+from PIL import Image
 from torchvision import transforms
+
+from .bat_ui_ref import stash_ui
+
+# The editor never draws or caches the plate above 1024 px on the long edge
+# (maxDisplayDim in web/bat_points_editor/editor_base.js), so shipping more is
+# only history bloat.
+BG_PREVIEW_MAX_DIM = 1024
 
 
 class BatPointsEditor:
@@ -161,11 +169,20 @@ to 1024 on the longest side; original image dimensions are kept.
                 frame = frame[..., :3]
             transform = transforms.ToPILImage()
             image = transform(frame.permute(2, 0, 1))
+            # Downscale for the editor, but send the true size alongside: the
+            # coord space (the width/height widgets, and so every point) must
+            # stay in plate pixels, not preview pixels.
+            full_w, full_h = image.size
+            if max(full_w, full_h) > BG_PREVIEW_MAX_DIM:
+                r = BG_PREVIEW_MAX_DIM / max(full_w, full_h)
+                image = image.resize((max(1, round(full_w * r)), max(1, round(full_h * r))), Image.BILINEAR)
             buffered = BytesIO()
             image.save(buffered, format="JPEG", quality=75)
             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
             return {
-                "ui": {"bg_image": [img_base64]},
+                # Sidecar'd so the plate stays out of the prompt history;
+                # web/bat_ui_ref.js hands the editor the resolved dict.
+                "ui": stash_ui({"bg_image": [img_base64], "bg_w": [full_w], "bg_h": [full_h]}),
                 "result": (json.dumps(pos_coordinates), json.dumps(neg_coordinates), bboxes, mask_tensor, cropped_image)
             }
