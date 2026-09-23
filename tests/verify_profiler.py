@@ -38,6 +38,28 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
+def prefer_cpu_without_gpu():
+    """Let `import execution` succeed on a machine with no GPU (CI, a laptop).
+
+    ComfyUI's model_management initialises a CUDA device at import unless the
+    CLI asked for the CPU, and it only reads the CLI once args parsing is
+    enabled — so do both, before anything imports comfy. Leaves a GPU box alone.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return
+        sys.path.insert(0, COMFY)
+        import comfy.options
+        sys.argv = [sys.argv[0], "--cpu"]
+        comfy.options.enable_args_parsing()
+    except Exception:
+        pass    # no ComfyUI importable: [4] reports it
+
+
+prefer_cpu_without_gpu()
+
+
 def load_profiler():
     """Load bat_profiler.py standalone.
 
