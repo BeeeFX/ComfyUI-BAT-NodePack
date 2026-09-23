@@ -326,15 +326,13 @@ export function registerCleanup(nodeType) {
  *
  * One residual side effect
  * ------------------------
- * Roto / AnimatedCrop / AnimatedGrade stamp the plate's imgW/imgH/frameCount
- * into their `state` JSON widget from inside the ingest, so a replay writes
- * them too. In the case that matters — undoing something that happened AFTER
- * the run — the widget already holds those numbers and the write is
- * byte-identical, so the ChangeTracker sees no diff. Undoing back to BEFORE
- * that node's first run does stamp them onto a state that lacked them, which
- * marks the workflow modified and can cost one extra undo step. The values are
- * correct metadata about the plate on screen (they are what makes shapes draw
- * at the right relative scale), so this is left as-is deliberately rather than
+ * Roto / AnimatedCrop / AnimatedGrade keep the plate's imgW/imgH/frameCount in
+ * `node.properties` (they used to stamp them into the serialised `state` JSON,
+ * which put them in the cache key and re-ran the node after its first run). A
+ * replay therefore rewrites a property, not a prompt input. Undoing back to
+ * BEFORE a node's first run does add that property, which marks the workflow
+ * modified and can cost one extra undo step. The values are correct metadata
+ * about the plate on screen, so this is left as-is deliberately rather than
  * papered over with a suppress-persist flag whose lifetime cannot be defined:
  * the ingests settle asynchronously, so there is no honest moment to clear it.
  *

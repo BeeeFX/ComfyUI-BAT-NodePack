@@ -10,15 +10,26 @@ State model (matches what the JS editor serialises into the hidden
     {
         "keyframes": {
             "0":  {"x": 0, "y": 0, "w": 512, "h": 512, "angle": 0.0},
-            "24": {"x": 48, "y": 12, "w": 512, "h": 512, "angle": 0.0},
+            "24": {"x": 48, "y": 12, "w": 512, "h": 512, "angle": 0.0,
+                   "ease": "ease_in_out"},
             ...
-        }
+        },
+        "seed": "centre"
     }
 
-Between keyframes every field lerps independently. Before the first
-keyframe / after the last we hold (no extrapolation). With zero
-keyframes we fall back to a 512×512 rect at the origin so the node
-doesn't explode on a freshly placed graph.
+Between keyframes every field interpolates independently, through the
+curve named by the EARLIER key's optional `ease` (bat_easing.py; absent =
+linear, so older states interpolate exactly as before). Before the first
+keyframe / after the last we hold (no extrapolation).
+
+With zero keyframes a state carrying `"seed": "centre"` (the default for
+new nodes) renders the centred half-size rect the editor draws before the
+first edit. A state without it renders the old 512×512 rect at the origin,
+which is what such a saved workflow always produced on its first run.
+
+The clip's size and frame count are NOT in the state: `state` is a prompt
+input, so the editor keeps them in node.properties (older states still
+carry `imgW` / `imgH` / `frameCount`; they are ignored here).
 
 Output resolution: snapped from the FIRST keyframe's `w` and `h`
 using `snap_to`. Each frame's rect is scaled about its centre by the same
@@ -33,10 +44,13 @@ authoritative per-frame source-rect; Bat_Uncrop reads it when present.
 """
 
 import base64
+import functools
 import hashlib
 import json
 import logging
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 import numpy as np
@@ -47,15 +61,17 @@ from PIL import Image
 # Reuse the crop primitives from Bat_Crop so the math is identical
 # between the static and animated nodes.
 from .bat_crop import (
+    _GRAY_VALUE,
+    _GRID_PAD,
     _broadcast_mask_to_n,
     _extract_axis_aligned,
-    _rotated_crop,
-    _rotated_crop_mask,
+    _make_crop_grid,
     _rotated_rect_mask,
     _snap,
     constrain_rotated_rect,
-    rotated_bbox_size,
 )
+from .bat_easing import apply_ease, ease_name
+from .bat_ui_ref import stash_ui
 
 logger = logging.getLogger("[Bat_AnimatedCrop]")
 
@@ -64,12 +80,39 @@ def _first(img):
     return img[0:1] if img is not None and img.shape[0] > 1 else img
 
 
-def _resolve_rect_at_frame(kfs: dict, frame: int) -> dict:
+# Frames per batched slice / grid_sample / resize are capped by this much
+# scratch memory (inputs gathered for the batch, grids, pre-resize crops).
+_CHUNK_BYTES = 256 << 20
+
+
+def _seed_rect(doc, W, H) -> dict:
+    """The rect a state with no keyframes renders on a W×H clip.
+
+    It used to be 512×512 at the origin whatever the clip, while the editor
+    drew (and on its first ingest wrote) a centred half-size rect, so the very
+    first run never matched the canvas. New nodes carry `"seed": "centre"` in
+    their default state and get the editor's rect; a state saved without the
+    marker keeps the origin rect it has always rendered.
+    """
+    if isinstance(doc, dict) and doc.get("seed") == "centre":
+        # floor(v + 0.5) is the editor's Math.round; round() is banker's and
+        # would land an odd-sized plate's rect a pixel off the canvas.
+        def rnd(v):
+            return int(math.floor(v + 0.5))
+        return {"x": rnd(W * 0.25), "y": rnd(H * 0.25),
+                "w": max(1, rnd(W * 0.5)), "h": max(1, rnd(H * 0.5)),
+                "angle": 0.0}
+    return {"x": 0, "y": 0, "w": 512, "h": 512, "angle": 0.0}
+
+
+def _resolve_rect_at_frame(kfs: dict, frame: int, empty: dict = None) -> dict:
     """Interpolate the rect (x, y, w, h, angle) at `frame` from a
-    `{"<int frame>": rect}` keyframe dict. Holds at the ends; lerps
-    between adjacent keyframes."""
+    `{"<int frame>": rect}` keyframe dict. Holds at the ends; between
+    adjacent keyframes each field follows the earlier key's `ease`
+    (linear when it has none). `empty` is the rect for an empty dict
+    (see _seed_rect)."""
     if not kfs:
-        return {"x": 0, "y": 0, "w": 512, "h": 512, "angle": 0.0}
+        return dict(empty) if empty else {"x": 0, "y": 0, "w": 512, "h": 512, "angle": 0.0}
     keys = sorted(int(k) for k in kfs.keys())
     if frame <= keys[0]:
         return dict(kfs[str(keys[0])])
@@ -87,7 +130,7 @@ def _resolve_rect_at_frame(kfs: dict, frame: int) -> dict:
         return dict(kfs[str(prev)])
     a = kfs[str(prev)]
     b = kfs[str(nxt)]
-    t = (frame - prev) / (nxt - prev)
+    t = apply_ease((frame - prev) / (nxt - prev), ease_name(a))
     return {
         "x": a["x"] + (b["x"] - a["x"]) * t,
         "y": a["y"] + (b["y"] - a["y"]) * t,
@@ -107,9 +150,11 @@ def _resize_nhwc(t, h, w, mode="bicubic"):
         kw["align_corners"] = False
     out = F.interpolate(nchw, **kw)
     # Clamp bicubic overshoot to the source's OWN range, not [0,1] — the
-    # latter clipped HDR plates on every resized frame.
-    return out.permute(0, 2, 3, 1).clamp(
-        t.amin().item(), t.amax().item()).contiguous()
+    # latter clipped HDR plates on every resized frame. Per frame, so a
+    # batched resize clamps exactly as resizing each frame alone did.
+    lo = t.amin(dim=(1, 2, 3), keepdim=True)
+    hi = t.amax(dim=(1, 2, 3), keepdim=True)
+    return out.permute(0, 2, 3, 1).clamp(lo, hi).contiguous()
 
 
 def _resize_nhw(t, h, w):
@@ -119,6 +164,130 @@ def _resize_nhw(t, h, w):
     nchw = t.unsqueeze(1).to(torch.float32)
     out = F.interpolate(nchw, size=(h, w), mode="bilinear", align_corners=False)
     return out.squeeze(1).clamp(0, 1).contiguous()
+
+
+def _axis_key(r):
+    return int(round(r["x"])), int(round(r["y"]))
+
+
+def _rot_key(r):
+    return r["x"], r["y"], r["angle"]
+
+
+def _runs(rects, idx, key):
+    """Split `idx` (ascending frame indices) into (i0, i1) spans of
+    consecutive frames whose rects share `key` — one slice / one grid each."""
+    spans = []
+    i0 = 0
+    for i in range(1, len(idx) + 1):
+        if (i == len(idx) or idx[i] != idx[i - 1] + 1
+                or key(rects[idx[i]]) != key(rects[idx[i0]])):
+            spans.append((i0, i))
+            i0 = i
+    return spans
+
+
+def _frames(idx, device):
+    """Index for a list of frames: a slice (a view) when they are a run."""
+    if idx[-1] - idx[0] + 1 == len(idx):
+        return slice(idx[0], idx[-1] + 1)
+    return torch.tensor(idx, device=device)
+
+
+def _put(dst, idx, val):
+    dst[_frames(idx, dst.device)] = val
+
+
+def _crop_axis_chunk(image, in_mask, rect_mask, rects, idx, w, h, fill):
+    """Axis-aligned frames of one size: an exact slice per run of identical
+    integer rects, filling the outside area per `fill`. rect_mask / the
+    cropped mask reflect only the real image overlap (the filled area isn't
+    real coverage). Without an input mask the cropped mask is one plane of
+    ones, broadcast on write."""
+    _, H, W, _ = image.shape
+    device, dtype = image.device, image.dtype
+    crops, masks = [], []
+    for i0, i1 in _runs(rects, idx, _axis_key):
+        a, b = idx[i0], idx[i1 - 1] + 1
+        ix, iy = _axis_key(rects[a])
+        src_x0 = max(0, ix)
+        src_y0 = max(0, iy)
+        src_x1 = min(W, ix + w)
+        src_y1 = min(H, iy + h)
+        dst_x0 = src_x0 - ix
+        dst_y0 = src_y0 - iy
+        overlap = src_x1 > src_x0 and src_y1 > src_y0
+        crops.append(_extract_axis_aligned(image[a:b], ix, iy, w, h, fill))
+        if overlap:
+            rect_mask[a:b, src_y0:src_y1, src_x0:src_x1] = 1.0
+        if in_mask is not None:
+            m = torch.zeros((b - a, h, w), device=device, dtype=dtype)
+            if overlap:
+                m[:, dst_y0:dst_y0 + (src_y1 - src_y0),
+                     dst_x0:dst_x0 + (src_x1 - src_x0)] = \
+                    in_mask[a:b, src_y0:src_y1, src_x0:src_x1]
+            masks.append(m)
+    cropped = crops[0] if len(crops) == 1 else torch.cat(crops)
+    if in_mask is None:
+        return cropped, torch.ones((1, h, w), device=device, dtype=dtype)
+    return cropped, masks[0] if len(masks) == 1 else torch.cat(masks)
+
+
+def _crop_rotated_chunk(image, in_mask, rect_mask, rects, idx, w, h, fill,
+                        memo):
+    """Rotated frames of one size in one grid_sample. The (k, h, w, 2) grid
+    is built a run of identical rects at a time (a static rotated rect is a
+    single expanded grid); the sampling is bat_crop._rotated_crop /
+    _rotated_crop_mask, which only take one rect for a whole batch. `memo`
+    carries the last rect's grid and full-canvas rect mask into the next
+    chunk, so a static rect builds each once for the whole clip.
+
+    x/y stay float: grid_sample is sub-pixel, and Uncrop pastes at the float
+    rect it reads from `frames`. Rounding them made the paste land up to
+    0.5px off, alternating frame to frame on an interpolated move (shimmer)."""
+    _, H, W, _ = image.shape
+    device, dtype = image.device, image.dtype
+    f32 = torch.float32
+    k = len(idx)
+    runs = _runs(rects, idx, _rot_key)
+    grid = None
+    for i0, i1 in runs:
+        a, b = idx[i0], idx[i1 - 1] + 1
+        r = rects[a]
+        key = (w, h) + _rot_key(r)
+        if memo.get("key") != key:
+            memo["key"] = key
+            memo["grid"] = _make_crop_grid(r["x"], r["y"], w, h, H, W,
+                                           r["angle"], 1, device, f32)
+            memo["rect"] = _rotated_rect_mask(
+                H, W, r["x"] + (w - 1) / 2.0, r["y"] + (h - 1) / 2.0,
+                w, h, r["angle"], 1, device, dtype)
+        g = memo["grid"].expand(b - a, h, w, 2)
+        if len(runs) == 1:
+            grid = g
+        else:
+            if grid is None:
+                grid = torch.empty((k, h, w, 2), device=device, dtype=f32)
+            grid[i0:i1] = g
+        rect_mask[a:b] = memo["rect"]
+    sel = _frames(idx, device)
+    pad_mode = _GRID_PAD.get(fill, "zeros")      # gray samples zeros too
+    out = F.grid_sample(image[sel].permute(0, 3, 1, 2).to(f32), grid,
+                        mode="bilinear", padding_mode=pad_mode,
+                        align_corners=True)
+    if fill == "gray":
+        # Where the sample fell outside (coverage 0), paint grey.
+        ones = torch.ones((1, 1, H, W), device=device, dtype=f32).expand(k, 1, H, W)
+        cov = F.grid_sample(ones, grid, mode="bilinear",
+                            padding_mode="zeros", align_corners=True)
+        out = out + (1.0 - cov) * _GRAY_VALUE
+    cropped = out.permute(0, 2, 3, 1).contiguous()
+    if in_mask is None:
+        return cropped, torch.ones((1, h, w), device=device, dtype=dtype)
+    cropped_m = F.grid_sample(in_mask[sel].unsqueeze(1).to(f32), grid,
+                              mode="bilinear", padding_mode=pad_mode,
+                              align_corners=True)
+    return cropped, cropped_m.squeeze(1).clamp(0, 1).contiguous()
 
 
 def _b64_jpeg(arr_hwc: np.ndarray, max_dim: int = 720, quality: int = 78) -> str:
@@ -135,6 +304,28 @@ def _b64_jpeg(arr_hwc: np.ndarray, max_dim: int = 720, quality: int = 78) -> str
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def _preview_strip(image):
+    """Input frames as base64 JPEGs for the canvas editor, and their stride
+    (same subsampling pattern as Bat_Roto so long sequences don't blow up
+    the ui payload)."""
+    n = image.shape[0]
+    max_preview_frames = 240
+    # ceil, not floor: n // 240 is 1 for anything under 480 frames, so the
+    # "cap" let up to 479 thumbnails through.
+    stride = max(1, math.ceil(n / max_preview_frames))
+
+    def one(i):
+        arr = (image[i].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+        return _b64_jpeg(arr)
+
+    # PIL releases the GIL while it resizes and encodes, so the thumbnails go
+    # in parallel (same bytes, same order). Once the crop itself was batched,
+    # encoding them one by one was ~90% of this node's run time.
+    with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+        frames_b64 = list(pool.map(one, range(0, n, stride)))
+    return frames_b64, stride
+
+
 class BatAnimatedCrop:
     """Keyframed crop rect across a frame batch. Compatible with Bat_Uncrop."""
 
@@ -143,8 +334,10 @@ class BatAnimatedCrop:
         return {
             "required": {
                 "image": ("IMAGE",),
+                # New nodes carry the seed marker (see _seed_rect); a saved
+                # workflow keeps whatever state string it was saved with.
                 "state": ("STRING", {
-                    "default": '{"keyframes":{}}',
+                    "default": '{"keyframes":{},"seed":"centre"}',
                     "multiline": False,
                 }),
                 "snap_to":      ("INT", {"default": 8, "min": 1, "max": 256}),
@@ -203,6 +396,7 @@ class BatAnimatedCrop:
             logger.warning("Bat_AnimatedCrop: state JSON invalid; using empty.")
             doc = {}
         kfs = doc.get("keyframes") or {}
+        empty = _seed_rect(doc, W, H)
 
         # Bring any input mask up to (n, H, W).
         in_mask = None
@@ -215,9 +409,9 @@ class BatAnimatedCrop:
                     mode="bilinear", align_corners=False,
                 ).squeeze(1).clamp(0, 1)
 
-        # Uniform output size = snap of the first keyframe's dimensions.
-        # Falls back to 512×512 (snapped) when no keyframes exist.
-        first_rect = _resolve_rect_at_frame(kfs, 0)
+        # Uniform output size = snap of the first keyframe's dimensions
+        # (of the seed rect when no keyframes exist).
+        first_rect = _resolve_rect_at_frame(kfs, 0, empty)
         ref_w = max(1, int(round(first_rect["w"])))
         ref_h = max(1, int(round(first_rect["h"])))
         out_w = _snap(ref_w, snap_to)
@@ -233,13 +427,17 @@ class BatAnimatedCrop:
         scale_w = out_w / ref_w
         scale_h = out_h / ref_h
 
-        out_frames = []
-        out_masks = []
-        rect_masks = []
+        # Every frame's rect is resolved first, then frames sharing an output
+        # shape are cropped as batches: one slice per run of identical integer
+        # rects, one grid_sample per chunk of rotated frames, one resize per
+        # chunk, all written into preallocated outputs. Frame-at-a-time
+        # (a full-canvas mask allocated per frame, a resize per frame, three
+        # lists torch.cat'd at the end) made this ~25x slower than Bat_Crop
+        # on the same static rect. The maths per frame is unchanged, so the
+        # result is bit-identical (tests/verify_animated_crop.py).
         per_frame_rects = []
-
         for f in range(n):
-            rect = _resolve_rect_at_frame(kfs, f)
+            rect = _resolve_rect_at_frame(kfs, f, empty)
             w = max(1, int(round(float(rect["w"]) * scale_w)))
             h = max(1, int(round(float(rect["h"]) * scale_h)))
             # Keep the drawn centre where the artist put it.
@@ -267,64 +465,44 @@ class BatAnimatedCrop:
                     x, y = float(cx_), float(cy_)
             per_frame_rects.append({"x": x, "y": y, "w": w, "h": h, "angle": angle})
 
-            frame_img = image[f:f + 1]   # (1, H, W, 3)
-            if in_mask is not None:
-                frame_mask_in = in_mask[f:f + 1]
-            else:
-                frame_mask_in = None
+        rotated = [not abs(r["angle"]) < 1e-3 for r in per_frame_rects]
+        # Output dtypes exactly as torch.cat promoted the per-frame pieces:
+        # rotated crops and resized masks come back float32. (All float32 for
+        # a normal IMAGE; this only matters for another input dtype.)
+        f32 = torch.float32
+        img_dts = {f32 if rot else dtype for rot in rotated}
+        mask_dts = {
+            f32 if ((r["w"], r["h"]) != (out_w, out_h)
+                    or (rot and in_mask is not None)) else dtype
+            for r, rot in zip(per_frame_rects, rotated)}
+        img_dt = functools.reduce(torch.promote_types, img_dts, next(iter(img_dts), dtype))
+        mask_dt = functools.reduce(torch.promote_types, mask_dts, next(iter(mask_dts), dtype))
+        out_image = torch.empty((n, out_h, out_w, c), dtype=img_dt, device=device)
+        out_mask = torch.empty((n, out_h, out_w), dtype=mask_dt, device=device)
+        rect_mask = torch.zeros((n, H, W), dtype=dtype, device=device)
 
-            if abs(angle) < 1e-3:
-                # Axis-aligned: exact slice, filling the outside area per
-                # `outside_fill`. rect_m / cropped_m reflect only the real
-                # image overlap (the filled area isn't real coverage).
-                ix = int(round(x))
-                iy = int(round(y))
-                src_x0 = max(0, ix)
-                src_y0 = max(0, iy)
-                src_x1 = min(W, ix + w)
-                src_y1 = min(H, iy + h)
-                dst_x0 = src_x0 - ix
-                dst_y0 = src_y0 - iy
-                cropped = _extract_axis_aligned(frame_img, ix, iy, w, h, outside_fill)
-                rect_m = torch.zeros((1, H, W), dtype=dtype, device=device)
-                if src_x1 > src_x0 and src_y1 > src_y0:
-                    rect_m[:, src_y0:src_y1, src_x0:src_x1] = 1.0
-                if frame_mask_in is not None:
-                    cropped_m = torch.zeros((1, h, w), device=device, dtype=dtype)
-                    if src_x1 > src_x0 and src_y1 > src_y0:
-                        cropped_m[:, dst_y0:dst_y0 + (src_y1 - src_y0),
-                                     dst_x0:dst_x0 + (src_x1 - src_x0)] = \
-                            frame_mask_in[:, src_y0:src_y1, src_x0:src_x1]
+        groups = {}
+        for f, r in enumerate(per_frame_rects):
+            groups.setdefault((rotated[f], r["w"], r["h"]), []).append(f)
+        memo = {}
+        for (rot, w, h), frames in groups.items():
+            per_frame = 4 * (H * W * (c + 1) + 3 * h * w * (c + 2)
+                             + out_h * out_w * (c + 1))
+            step = max(1, _CHUNK_BYTES // per_frame)
+            for s in range(0, len(frames), step):
+                idx = frames[s:s + step]
+                if rot:
+                    cropped, cropped_m = _crop_rotated_chunk(
+                        image, in_mask, rect_mask, per_frame_rects, idx,
+                        w, h, outside_fill, memo)
                 else:
-                    cropped_m = torch.ones((1, h, w), device=device, dtype=dtype)
-            else:
-                # Float x/y: grid_sample is sub-pixel, and Uncrop pastes at the
-                # float rect it reads from `frames`. Rounding here made the
-                # paste land up to 0.5px off, alternating frame to frame on
-                # an interpolated move (visible shimmer).
-                cropped = _rotated_crop(frame_img, x, y, w, h, angle, outside_fill)
-                cx = x + (w - 1) / 2.0
-                cy = y + (h - 1) / 2.0
-                rect_m = _rotated_rect_mask(H, W, cx, cy, w, h, angle, 1,
-                                            device, dtype)
-                if frame_mask_in is not None:
-                    cropped_m = _rotated_crop_mask(
-                        frame_mask_in, x, y, w, h, angle, outside_fill,
-                    )
-                else:
-                    cropped_m = torch.ones((1, h, w), device=device, dtype=dtype)
-
-            # Resize this frame's cropped image / mask to the uniform output.
-            cropped = _resize_nhwc(cropped, out_h, out_w)
-            cropped_m = _resize_nhw(cropped_m, out_h, out_w)
-
-            out_frames.append(cropped)
-            out_masks.append(cropped_m)
-            rect_masks.append(rect_m)
-
-        out_image = torch.cat(out_frames, dim=0).contiguous()
-        out_mask = torch.cat(out_masks, dim=0).contiguous()
-        rect_mask = torch.cat(rect_masks, dim=0).contiguous()
+                    cropped, cropped_m = _crop_axis_chunk(
+                        image, in_mask, rect_mask, per_frame_rects, idx,
+                        w, h, outside_fill)
+                cropped = _resize_nhwc(cropped, out_h, out_w)
+                cropped_m = _resize_nhw(cropped_m, out_h, out_w)
+                _put(out_image, idx, cropped)
+                _put(out_mask, idx, cropped_m)
 
         first = per_frame_rects[0] if per_frame_rects else {
             "x": 0.0, "y": 0.0, "w": out_w, "h": out_h, "angle": 0.0,
@@ -351,25 +529,17 @@ class BatAnimatedCrop:
             "outside_fill": outside_fill,
         }
 
-        # Push input frames as base64 JPEGs for the canvas editor (same
-        # subsampling pattern as Bat_Roto so long sequences don't blow up
-        # the ui payload).
-        frames_b64 = []
-        max_preview_frames = 240
-        # ceil, not floor: n // 240 is 1 for anything under 480 frames, so the
-        # "cap" let up to 479 thumbnails through.
-        stride = max(1, math.ceil(n / max_preview_frames))
-        for i in range(0, n, stride):
-            arr = (image[i].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-            frames_b64.append(_b64_jpeg(arr))
+        frames_b64, stride = _preview_strip(image)
 
+        # The strip goes to a sidecar file (bat_ui_ref): inline, every run
+        # kept MBs of base64 in ComfyUI's prompt history.
         return {
-            "ui": {
+            "ui": stash_ui({
                 "frames": frames_b64,
                 "w": [int(W)],
                 "h": [int(H)],
                 "stride": [int(stride)],
                 "frame_count": [int(n)],
-            },
+            }),
             "result": (out_image, crop_info, out_mask, rect_mask),
         }
