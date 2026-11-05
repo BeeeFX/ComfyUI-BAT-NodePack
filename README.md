@@ -4,7 +4,7 @@
 
 # 🦇 ComfyUI-BAT-NodePack
 
-[![47 nodes](https://img.shields.io/badge/nodes-47-13b8ad?style=flat-square)](#all-nodes)
+[![48 nodes](https://img.shields.io/badge/nodes-48-13b8ad?style=flat-square)](#all-nodes)
 [![Last commit](https://img.shields.io/github/last-commit/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square&label=updated)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/commits/main/)
 [![GitHub stars](https://img.shields.io/github/stars/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/stargazers)
 [![MIT license](https://img.shields.io/github/license/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](LICENSE)
@@ -50,7 +50,7 @@ For EXRs, **EXR Layer** selects passes and **Cryptomatte Matte** builds masks fr
 
 ### Keying clean-up
 
-**Despill** removes screen spill from a keyed foreground and reviews the key on the node: comp, alpha, premultiplied and spill views with zoom to real pixels. Built for CorridorKey 2, where changing the despill no longer re-keys the clip. **Matte Temporal Smooth** takes frame-to-frame flicker out of a matte without smearing moving edges.
+**Despill** removes screen spill from a keyed foreground and reviews the key on the node: comp, alpha, premultiplied and spill views with zoom to real pixels. Built for CorridorKey 2, where changing the despill no longer re-keys the clip. **Matte Temporal Smooth** takes frame-to-frame flicker out of a matte without smearing moving edges. **Merge Mattes** combines two mattes (say CorridorKey 2 and MEMatte) without the over-brightening of an add: the second only fills the first's holes and adds detail near its edge.
 
 ### Profiler
 
@@ -98,6 +98,7 @@ Names match the Add Node menu; the 🦇 prefix is omitted here.
 | **Erode Mask** | Shrink mask edges. |
 | **Matte Temporal Smooth** | Remove frame-to-frame flicker from a matte. |
 | **Despill** | Despill a keyed foreground; review comp, alpha and spill. |
+| **Merge Mattes** | Combine two mattes: fill holes and add edge detail from the second, keep everything in the first. |
 
 ### Colour and compositing
 
@@ -194,6 +195,7 @@ To prevent the SeC model download, connect **SeC Advanced Params** and turn off 
 | **Object mask** | Loader → Points Editor + Cryptomatte Matte. |
 | **Tracked mask** | Video Loader → SAM 3.1 Segmenter (or SeC Segmenter for cut-heavy clips). |
 | **Clean key** | CorridorKey 2 (despill 0) → Matte Temporal Smooth → Despill. |
+| **Two-model matte** | CorridorKey 2 alpha + MEMatte alpha → Merge Mattes. |
 
 ## Help
 

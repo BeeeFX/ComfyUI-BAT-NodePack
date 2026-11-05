@@ -100,6 +100,7 @@ from .bat_filename_prefix import BatFilenamePrefix
 from .bat_mask_morph import BatGrowMask, BatErodeMask
 from .bat_matte_temporal_smooth import BatMatteTemporalSmooth
 from .bat_despill import BatDespill
+from .bat_merge_mattes import BatMergeMattes
 from .bat_framehold import BatFramehold
 from .bat_sec_segmenter import BatSecSegmenter
 from .bat_sec_advanced import BatSecAdvancedParams
@@ -160,6 +161,7 @@ NODE_CLASS_MAPPINGS = {
     "Bat_ErodeMask":            BatErodeMask,
     "Bat_MatteTemporalSmooth":  BatMatteTemporalSmooth,
     "Bat_Despill":              BatDespill,
+    "Bat_MergeMattes":          BatMergeMattes,
     "Bat_Framehold":            BatFramehold,
     "Bat_SecSegmenter":         BatSecSegmenter,
     "Bat_SecAdvancedParams":    BatSecAdvancedParams,
@@ -215,6 +217,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_ErodeMask":            "🦇 Erode Mask",
     "Bat_MatteTemporalSmooth":  "🦇 Matte Temporal Smooth",
     "Bat_Despill":              "🦇 Despill",
+    "Bat_MergeMattes":          "🦇 Merge Mattes",
     "Bat_Framehold":            "🦇 Framehold",
     "Bat_SecSegmenter":         "🦇 SeC Segmenter",
     "Bat_SecAdvancedParams":    "🦇 SeC Advanced Params",
