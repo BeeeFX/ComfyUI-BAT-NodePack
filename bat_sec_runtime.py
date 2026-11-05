@@ -36,6 +36,18 @@ import folder_paths
 
 MODEL_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bat_sec", "model_config")
 
+# ComfyUI core has no "sams" folder type. Upstream SecNodes registers it in its
+# own __init__ (art-venture does too), so while either was installed the lookup
+# worked by accident. BAT has to work with both removed, so it registers the
+# folder itself. Without this, get_folder_paths("sams") raises KeyError and
+# list_sec_models() reports "no models" even with the checkpoint on disk.
+_SAMS_DIR = os.path.join(folder_paths.models_dir, "sams")
+if "sams" not in folder_paths.folder_names_and_paths:
+    folder_paths.folder_names_and_paths["sams"] = (
+        [_SAMS_DIR], set(folder_paths.supported_pt_extensions))
+else:
+    folder_paths.add_model_folder_path("sams", _SAMS_DIR)
+
 # Single-file checkpoints, highest priority first. The order sets which one a
 # fresh node defaults to when several are present.
 _SINGLE_FILE_MODELS = [
