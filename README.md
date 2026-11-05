@@ -4,7 +4,7 @@
 
 # 🦇 ComfyUI-BAT-NodePack
 
-[![43 nodes](https://img.shields.io/badge/nodes-43-13b8ad?style=flat-square)](#all-nodes)
+[![47 nodes](https://img.shields.io/badge/nodes-47-13b8ad?style=flat-square)](#all-nodes)
 [![Last commit](https://img.shields.io/github/last-commit/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square&label=updated)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/commits/main/)
 [![GitHub stars](https://img.shields.io/github/stars/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](https://github.com/BeeeFX/ComfyUI-BAT-NodePack/stargazers)
 [![MIT license](https://img.shields.io/github/license/BeeeFX/ComfyUI-BAT-NodePack?style=flat-square)](LICENSE)
@@ -44,9 +44,13 @@ For EXRs, **EXR Layer** selects passes and **Cryptomatte Matte** builds masks fr
 
 **Grade**, **Advanced Blend**, **Layered Images**, and **Rescale** cover common compositing tasks. The HDR nodes handle exposure-bracket reconstruction and tonal blending.
 
-### SeC object segmentation
+### Object segmentation
 
-**SeC Segmenter** tracks an object mask through a clip from points or a box. It needs [extra setup](#optional-features).
+**SAM 3.1 Segmenter** shows the mask live as you click the object, or finds it from a description ("person"), then tracks it through the clip in both directions. It runs on ComfyUI's built-in SAM 3.1; see [model setup](#optional-features). **SeC Segmenter** is slower but finds the object again across hard edit cuts; it needs [extra setup](#optional-features).
+
+### Keying clean-up
+
+**Despill** removes screen spill from a keyed foreground and reviews the key on the node: comp, alpha, premultiplied and spill views with zoom to real pixels. Built for CorridorKey 2, where changing the despill no longer re-keys the clip. **Matte Temporal Smooth** takes frame-to-frame flicker out of a matte without smearing moving edges.
 
 ### Profiler
 
@@ -60,7 +64,7 @@ For EXRs, **EXR Layer** selects passes and **Cryptomatte Matte** builds masks fr
 
 Names match the Add Node menu; the 🦇 prefix is omitted here.
 
-[Loading](#loading-media) · [Video](#video-and-frames) · [Animation](#crop-animation-and-masks) · [Compositing](#colour-and-compositing) · [SeC](#sec-masking) · [WAN / VACE](#wan-and-vace) · [Helpers](#workflow-helpers) · [Graph utilities](#graph-utilities)
+[Loading](#loading-media) · [Video](#video-and-frames) · [Animation](#crop-animation-and-masks) · [Compositing](#colour-and-compositing) · [Segmentation](#segmentation) · [WAN / VACE](#wan-and-vace) · [Helpers](#workflow-helpers) · [Graph utilities](#graph-utilities)
 
 ### Loading media
 
@@ -92,6 +96,8 @@ Names match the Add Node menu; the 🦇 prefix is omitted here.
 | **Roto** | Draw animated Bézier masks. |
 | **Grow Mask** | Expand mask edges. |
 | **Erode Mask** | Shrink mask edges. |
+| **Matte Temporal Smooth** | Remove frame-to-frame flicker from a matte. |
+| **Despill** | Despill a keyed foreground; review comp, alpha and spill. |
 
 ### Colour and compositing
 
@@ -107,11 +113,13 @@ Names match the Add Node menu; the 🦇 prefix is omitted here.
 
 The HDR nodes work with a separate LTX reconstruction workflow. Export their linear output in a suitable format such as EXR.
 
-### SeC masking
+### Segmentation
 
 | Node | Use it to… |
 | --- | --- |
-| **SeC Segmenter** | Track an object mask through video. |
+| **SAM 3.1 Segmenter** | Click or describe an object, see the mask live, track it. |
+| **SAM 3.1 Advanced Params** | Set model, direction, detection and tracking options. |
+| **SeC Segmenter** | Track an object mask through video, across cuts. |
 | **SeC Advanced Params** | Set model, device, and tracking options. |
 
 ### WAN and VACE
@@ -172,6 +180,8 @@ Install these with the Python environment that runs ComfyUI:
 - **EXR:** `python -m pip install OpenImageIO`. Other Loader formats work without it.
 - **SeC:** `python -m pip install -r requirements.txt`. Restart after installation. The default model is about **7.35 GB** and downloads on first use. See [model setup](bat_sec/NOTICE.md#models).
 
+- **SAM 3.1:** needs a ComfyUI with built-in SAM 3.1 (core 0.20.1 and later have it). Put `sam3.1_multiplex_fp16.safetensors` from [Comfy-Org/sam3.1](https://huggingface.co/Comfy-Org/sam3.1) in `models/checkpoints`. Nothing to pip-install. The weights are under Meta's SAM Licence (commercial use allowed; military, weapons and ITAR uses prohibited).
+
 To prevent the SeC model download, connect **SeC Advanced Params** and turn off `auto_download` before running.
 
 ## Example workflows
@@ -182,7 +192,8 @@ To prevent the SeC model download, connect **SeC Advanced Params** and turn off 
 | **Moving crop** | Animated Crop → processing → Uncrop; also connect `crop_info`. |
 | **EXR pass** | Loader → EXR Layer → processing. |
 | **Object mask** | Loader → Points Editor + Cryptomatte Matte. |
-| **Tracked mask** | Video Loader → SeC Segmenter. |
+| **Tracked mask** | Video Loader → SAM 3.1 Segmenter (or SeC Segmenter for cut-heavy clips). |
+| **Clean key** | CorridorKey 2 (despill 0) → Matte Temporal Smooth → Despill. |
 
 ## Help
 

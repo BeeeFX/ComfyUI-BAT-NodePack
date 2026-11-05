@@ -99,6 +99,14 @@ the loop pins first if any are set, and leaves fullscreen otherwise.
 |-------------------------------|----------------|---|
 | 🦇 **Grow Mask**              | `BAT/mask`     | Dilates a MASK by N pixels. |
 | 🦇 **Erode Mask**             | `BAT/mask`     | Erodes a MASK by N pixels. |
+| 🦇 **Matte Temporal Smooth**  | `BAT/mask`     | Takes the frame-to-frame flicker out of a matte from a per-frame keyer or matting model (CorridorKey 2 off a non-screen plate, MEMatte, SAM). Each pixel of the alpha — and of the optional foreground, with the same weights so colour stays in step — is averaged with its ±`radius` neighbours, weighted by `exp(-M / motion_tolerance)` where M is how much the **plate** changed near that pixel: still edges get smoothed, moving ones are left alone. M compares all three channels after a 5×5 blur (grain is not motion), then a 5×5 max-filter spreads the strongest nearby change onto each pixel — the blur alone dilutes the motion signal exactly at a moving edge and left a trail. Never luma: on the shot it was built for, skin and an orange wall have the same luminance and a luma gate dragged the moving hand's edge (0.52 vs 0.21 worst change). Measured there (83 f, 1920×1318, CorridorKey 2 output): one-frame blink pixels 326 → 37 per frame, alpha jitter 3.3 → 2.1, semi-transparent edge pixels kept. Lower `motion_tolerance` trails less and smooths less (0.02: 59 blinks, 0.14 worst edge change). `plate_colourspace = linear` encodes a scene-linear plate before comparing so the tolerance means the same thing. Rolling 2r+1-frame window on the GPU, so memory doesn't grow with clip length; nothing is clamped (HDR foreground survives). Without a foreground wired, the `foreground` output is the plate unchanged. |
+| 🦇 **Despill**                | `BAT/mask`     | Despills a keyed **straight** foreground and reviews the key, from any keyer (CorridorKey 2, MEMatte, …). Classic average despill — spill = G − (R+B)/2, clamped at 0, taken out of G and given half each to R and B; mirrored for blue — blended by `despill_strength`. Outputs the despilled straight `foreground`, `premultiplied` (foreground × alpha) and a `comp` over checker / black / grey / white, composited in linear light (IEC sRGB, sign-mirrored so scene-linear negatives survive). Built for CorridorKey 2, where despill is a widget on the key node and changing it re-keys the whole clip: set the key node's despill to 0 and put this after it, and only this node re-runs. `ComfyUI-BAT-CorridorKey2/tests/test_bat_despill_parity.py` checks the pixels are the key node's — despill bit-identical, checker comp within 6e-8 of its preview — while everything here is BAT's own MIT code. **Why the straight foreground looks soft on its own:** it is meant to be multiplied by alpha; where alpha is near zero keyers carry the subject's colour on past the edge (10–20 px of hair colour on the test shot) and nothing pins it frame to frame, so judge and render from `premultiplied` or `comp`. The on-node **viewer** is server-rendered by the same `render_view` that makes the outputs, over the visible region only, so it cannot drift and zoomed in shows real pixels: Comp / Alpha / FG / Premult / Spill (removed, ×4) / Plate, despill slider + green/blue + background written straight into the widgets, hold **B** for no despill, wheel zoom at the cursor, drag pan, Fit / 1:1, ←/→ frames, ⛶ fullscreen. A fitted 1920×1318 view is 25–45 ms (GPU while ComfyUI is idle, CPU ~100 ms while a job runs so a running key is never pushed out of VRAM), a 1:1 crop ~20 ms. Frames travel as raw RGB — PNG encoding was 84 of every ~100 ms — and are reached through **weak** references to ComfyUI's own cache of the inputs, so the viewer costs no memory and says so when ComfyUI frees them. Rendering a zoomed-out view by shrinking first and despilling after was tried and rejected: despill is non-linear, and it came out up to 88/255 wrong on the spill view. |
+
+### Segmentation
+
+| Display name                  | Category           | What it does |
+|-------------------------------|--------------------|---|
+| 🦇 **SAM 3.1 Segmenter**      | `BAT/Segmentation` | Click or describe an object, watch the mask follow your hand, track it through the clip. Runs on ComfyUI core's own SAM 3 / 3.1 (`comfy/ldm/sam3`) — nothing vendored, nothing pip-installed — with `sam3.1_multiplex_fp16.safetensors` in `models/checkpoints` ([Comfy-Org/sam3.1](https://huggingface.co/Comfy-Org/sam3.1), Meta SAM Licence: commercial use allowed, military / weapons / ITAR uses prohibited). **Click mode**: click = object, right-click = not object, drag = box; each edit re-segments the annotation frame in ~20 ms once the frame is encoded (~120–330 ms the first time), because the server keeps the frame's backbone output and only re-runs the decoder. **Text mode**: type `person` (or `person, dog`) and every match appears numbered on the frame within ~0.5 s; click one to keep or drop it. `detect_new_objects` keeps looking for the prompt while tracking, so people who walk in later join the mask — dropped matches are tracked too, invisibly, precisely so re-detection can't re-add them. One mask out per node: the clicked object, or every kept match merged. Tracks both ways from `frame_index_select` (core only goes forwards from frame 0). The viewport has a scrubber; after a run, or **▶ Track**, it shows the tracked mask on every frame. ▶ Track queues a trimmed prompt — the node, its upstream, and the internal `Bat_Sam31TrackSink` output node — as a normal job, so ComfyUI's cache hands the result to the next full queue run instead of tracking twice. The run's `ui` carries a token, never pixels: frames come from `/bat/sam31/frame` on demand, from a **weak** reference to the upstream batch, so nothing image-sized lands in ComfyUI's history. Live routes return 409 while any job executes (the executor owns the GPU). Text detections deliberately skip core's per-instance crop refine: 13× the time (2.9 s vs 0.19 s for 11 people) for IoU 0.976–0.999 against unrefined. Optional **🦇 SAM 3.1 Advanced Params** (model, direction, threshold, max objects, detect interval, frame limit, click refine passes). Measured against SeC on the same 1080p clip (A5000): identical inside a shot (IoU 0.97–0.99), 6× faster load, 2.3 GB vs 8.7 GB VRAM — but across hard edit cuts SeC re-finds the object and SAM 3.1 loses it, so 🦇 SeC Segmenter stays for cut-heavy material. Built for Nodes 1.0 and 2.0 via `addBatDOMWidget`. |
 
 ### VACE
 
@@ -461,9 +469,13 @@ back to a full queue, both risk rendering something nobody looked at.
 
 ## Shared frontend modules
 
-Four modules under `web/` are shared by the canvas editors rather than
+These modules under `web/` are shared by the canvas editors rather than
 duplicated per node:
 
+- **`bat_clip_source.js`** — where a node's IMAGE batch comes from: walks
+  upstream to a file-backed loader and maps a batch index to the file frame
+  through each loader's trim maths. Shared by the SeC and SAM 3.1 segmenters;
+  `tests/verify_sec_frame_bounds.py` checks the maths against the loaders.
 - **`bat_zoom_control.js`** — display-only zoom + pan for the on-node
   preview, so you can pull back and work on a crop or roto that extends past
   the frame edge. Purely a view transform; the backend only ever sees widget
@@ -593,6 +605,11 @@ python tests/verify_loader.py
 python tests/verify_fullscreen.py
 python tests/verify_profiler.py
 python tests/verify_utility_nodes.py
+python tests/verify_sec_frame_bounds.py
+python tests/verify_sam31_web.py
+python tests/verify_matte_temporal_smooth.py [PLATE_DIR ALPHA_NPZ]
+python tests/verify_despill.py
+python tests/verify_sam31_backend.py [FRAMES_DIR]   # GPU + the SAM 3.1 checkpoint
 ```
 
 `verify_utility_nodes.py` is the odd one out: the utility nodes have no live

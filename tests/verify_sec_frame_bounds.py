@@ -22,7 +22,8 @@ too large lets the job fail at execute time, and a wrong sourceFrameIndex
 previews the wrong plate while segmenting the right one (or vice versa).
 
 There is no node binary on this box, so the two functions are pulled out of
-`web/bat_sec_segmenter.js` and driven under quickjs (see the js-verification
+`web/bat_clip_source.js` (shared by the SeC and SAM 3.1 segmenters) and driven
+under quickjs (see the js-verification
 note). Run with the RND venv python:
 
     env/bin/python custom_nodes/ComfyUI-BAT-NodePack/tests/verify_sec_frame_bounds.py
@@ -36,7 +37,8 @@ import quickjs
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACK = os.path.dirname(HERE)
-JS = os.path.join(PACK, "web", "bat_sec_segmenter.js")
+# Moved out of bat_sec_segmenter.js into the shared module on 2026-11-04.
+JS = os.path.join(PACK, "web", "bat_clip_source.js")
 
 FAILURES = []
 
@@ -59,7 +61,8 @@ def eq(label, got, want):
 src = open(JS, encoding="utf-8").read()
 start = src.index("function widgetNum(")
 end = src.index("// ── per-node preview state")
-pure = src[start:end]
+# Strip the ES-module keyword: quickjs evaluates the slice as a plain script.
+pure = src[start:end].replace("export function", "function").replace("export async function", "async function")
 for name in ("widgetNum", "sourceFrameIndex", "sourceBatchLength"):
     if f"function {name}(" not in pure:
         sys.exit(f"could not extract {name} from {JS}")
@@ -179,6 +182,26 @@ for n, w in CASES_VOLT:
     eq(f"indices n={n} {w}", frame_indices("VoltLoader", w, n), want)
 
 
+# ── 2b. Bat_Loader ──────────────────────────────────────────────────────────
+# Checked against the loader's OWN _select, not a transcription: it is a pure
+# function, so exec it straight out of bat_loader.py.
+print("\n2b. Bat_Loader — length and index agree with bat_loader._select")
+_bl = open(os.path.join(PACK, "bat_loader.py"), encoding="utf-8").read()
+_a = _bl.index("def _select(")
+_ns = {}
+exec(_bl[_a:_bl.index("\n\n\n", _a)], _ns)
+
+
+def py_bat_loader(n, skip_first_frames=0, select_every_nth=1, frame_load_cap=0):
+    return _ns["_select"](list(range(n)), skip_first_frames, select_every_nth, frame_load_cap)
+
+
+for n, w in CASES_VOLT:
+    want = py_bat_loader(n, **w)
+    eq(f"length  n={n} {w}", batch_length("Bat_Loader", w, n), len(want))
+    eq(f"indices n={n} {w}", frame_indices("Bat_Loader", w, n), want)
+
+
 # ── 3. Bat_FramePicker ──────────────────────────────────────────────────────
 print("\n3. Bat_FramePicker — always one frame, the batch index carries nothing")
 for n, w in [(100, {"frame_index": 0}), (100, {"frame_index": 42}), (1, {"frame_index": 0})]:
@@ -206,7 +229,8 @@ print("\n5. every in-bounds batch index maps to a real file frame")
 # A violation is either a failed job or the wrong plate.
 for label, kind, cases, ref in (
         ("Bat_VideoLoader", "Bat_VideoLoader", CASES_VIDEO, py_video_loader),
-        ("VoltLoader", "VoltLoader", CASES_VOLT, py_volt_loader)):
+        ("VoltLoader", "VoltLoader", CASES_VOLT, py_volt_loader),
+        ("Bat_Loader", "Bat_Loader", CASES_VOLT, py_bat_loader)):
     bad = []
     for n, w in cases:
         length = batch_length(kind, w, n)

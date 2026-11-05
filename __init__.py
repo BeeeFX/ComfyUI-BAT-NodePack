@@ -65,6 +65,12 @@ canvas. No node and no Python at all — it lowers litegraph's
 ``canvas.ds.min_scale`` floor from 10% to 5% (adjustable, *Settings → 🦇 BAT →
 Canvas*), which is the single field every zoom gesture in the frontend clamps
 against.
+
+2026-11-04: ``Bat_Sam31Segmenter`` ("🦇 SAM 3.1 Segmenter") joins 🦇 SeC
+Segmenter rather than replacing it — same click-and-track job, built on ComfyUI
+core's native SAM 3.1 with a live mask on every click and text prompts. SeC
+stays because it still wins across hard edit cuts. ``Bat_Sam31TrackSink`` is an
+internal output node for the editor's ▶ Track button, hidden from search.
 """
 
 from .bat_video_grid_split import VideoGridSplit
@@ -92,9 +98,12 @@ from .bat_exposure_bracket import BatExposureBracket, BatExposureMerge
 from .bat_roto import BatRoto
 from .bat_filename_prefix import BatFilenamePrefix
 from .bat_mask_morph import BatGrowMask, BatErodeMask
+from .bat_matte_temporal_smooth import BatMatteTemporalSmooth
+from .bat_despill import BatDespill
 from .bat_framehold import BatFramehold
 from .bat_sec_segmenter import BatSecSegmenter
 from .bat_sec_advanced import BatSecAdvancedParams
+from .bat_sam31_segmenter import BatSam31Segmenter, BatSam31AdvancedParams, BatSam31TrackSink
 from .bat_bypass_switch import BatBypassSwitch
 from .bat_show import BatShowAny, BatShowTensorShape
 from .bat_convert import BatConvertAny, BatAnyToString, BatNumberToString
@@ -149,9 +158,14 @@ NODE_CLASS_MAPPINGS = {
     "Bat_FilenamePrefix":       BatFilenamePrefix,
     "Bat_GrowMask":             BatGrowMask,
     "Bat_ErodeMask":            BatErodeMask,
+    "Bat_MatteTemporalSmooth":  BatMatteTemporalSmooth,
+    "Bat_Despill":              BatDespill,
     "Bat_Framehold":            BatFramehold,
     "Bat_SecSegmenter":         BatSecSegmenter,
     "Bat_SecAdvancedParams":    BatSecAdvancedParams,
+    "Bat_Sam31Segmenter":       BatSam31Segmenter,
+    "Bat_Sam31AdvancedParams":  BatSam31AdvancedParams,
+    "Bat_Sam31TrackSink":       BatSam31TrackSink,
     "Bat_BypassSwitch":         BatBypassSwitch,
 
     # ─── Utility nodes (2026-09-17) ──────────────────────────────────
@@ -199,9 +213,14 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_FilenamePrefix":       "🦇 Filename Prefix",
     "Bat_GrowMask":             "🦇 Grow Mask",
     "Bat_ErodeMask":            "🦇 Erode Mask",
+    "Bat_MatteTemporalSmooth":  "🦇 Matte Temporal Smooth",
+    "Bat_Despill":              "🦇 Despill",
     "Bat_Framehold":            "🦇 Framehold",
     "Bat_SecSegmenter":         "🦇 SeC Segmenter",
     "Bat_SecAdvancedParams":    "🦇 SeC Advanced Params",
+    "Bat_Sam31Segmenter":       "🦇 SAM 3.1 Segmenter",
+    "Bat_Sam31AdvancedParams":  "🦇 SAM 3.1 Advanced Params",
+    "Bat_Sam31TrackSink":       "🦇 SAM 3.1 Track (internal)",
     "Bat_BypassSwitch":         "🦇 Bypass Switch",
 
     "Bat_ShowAny":              "🦇 Show Any",
