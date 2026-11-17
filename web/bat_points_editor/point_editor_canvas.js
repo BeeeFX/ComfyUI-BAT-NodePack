@@ -86,12 +86,12 @@ export class BatPointsEditor extends BaseEditorCanvas {
         this.bbox = JSON.parse(this.bboxStoreWidget.value);
       } catch (e) {
         console.error("Error parsing stored points:", e);
-        this.points = [{ x: this.coordWidth / 2, y: this.coordHeight / 2 }];
+        this.points = this._defaultPoints();
         this.neg_points = [];
         this.bbox = [{}];
       }
     } else {
-      this.points = [{ x: this.coordWidth / 2, y: this.coordHeight / 2 }];
+      this.points = this._defaultPoints();
       this.neg_points = [];
       this.pointsStoreWidget.value = JSON.stringify({ positive: this.points, negative: this.neg_points });
       this.bboxStoreWidget.value = JSON.stringify(this.bbox);
@@ -136,6 +136,14 @@ export class BatPointsEditor extends BaseEditorCanvas {
   // Vertical space this node's non-canvas widgets need, below the canvas.
   // Overridden by Bat_SecSegmenter, which shows far fewer widgets.
   get editorHeightOffset() { return 310; }
+
+  // Whether a fresh / reset canvas starts with one positive point in the
+  // centre (upstream behaviour). Bat_SecSegmenter turns it off — see there.
+  get seedDefaultPoint() { return true; }
+
+  _defaultPoints() {
+    return this.seedDefaultPoint ? [{ x: this.coordWidth / 2, y: this.coordHeight / 2 }] : [];
+  }
 
   onDataChanged() { this.updateData(); }
 

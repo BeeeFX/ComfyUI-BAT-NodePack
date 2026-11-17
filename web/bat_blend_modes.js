@@ -70,7 +70,9 @@ export const SEPARABLE = {
     plus: (cb, cs) => cb + cs,
     // Backdrop minus source: "take the top layer away from what is under it".
     minus: (cb, cs) => cb - cs,
-    divide: (cb, cs) => cb / (Math.abs(cs) < EPS ? EPS : cs),
+    // A black source gives white where there is backdrop and black where there
+    // is none (Photoshop's answer) — not cb / EPS, which was a ~1e5 firefly.
+    divide: (cb, cs) => (Math.abs(cs) < EPS ? (cb > 0 ? 1 : 0) : cb / cs),
 };
 
 // ── non-separable: whole-pixel colour operations ─────────────────────────

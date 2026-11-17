@@ -28,7 +28,16 @@ import { compositeStack, paintLayered } from "./bat_layered_core.js";
 let LAYERS = null, W = 0, H = 0;
 let rgbaPool = null;
 
-self.onmessage = (e) => {
+/**
+ * True only inside a dedicated worker. ComfyUI's /extensions route globs every
+ * .js under the web directory, so the page ALSO imports this file as an
+ * extension — and there `self` is `window`, so an unguarded assignment below
+ * replaced the page's own `window.onmessage`.
+ */
+const IN_WORKER = typeof WorkerGlobalScope !== "undefined"
+    && typeof self !== "undefined" && self instanceof WorkerGlobalScope;
+
+if (IN_WORKER) self.onmessage = (e) => {
     const msg = e.data;
     if (!msg) return;
 

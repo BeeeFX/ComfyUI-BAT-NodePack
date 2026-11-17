@@ -20,15 +20,40 @@ from typing import List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
+def _frame_run(pattern_path: str):
+    """``(directory, before, padding, after)`` for the frame run of a pattern.
+
+    The frame run is the LAST run of ``#`` in the file name — never one in the
+    directory, which is just part of a folder's name. None when the file name
+    has no ``#``. Both find_sequence_files() and scan_sequence_stats() split the
+    pattern here, so they can't disagree about which files belong to it.
+    """
+    directory, filename = os.path.split(pattern_path.replace('\\', '/'))
+    runs = list(re.finditer(r'#+', filename))
+    if not runs:
+        return None
+    run = runs[-1]
+    return (directory, filename[:run.start()], len(run.group(0)),
+            filename[run.end():])
+
+
 class SequenceHandler:
     """Locating and selecting the frames of a ``####`` sequence."""
     
     @staticmethod
     def detect_sequence_pattern(path: str) -> bool:
-        """Detect if the path contains a sequence pattern (#### or ###)"""
+        """Whether `path` is a ``####`` pattern rather than a literal path.
+
+        Only a run of ``#`` in the FILE NAME counts, and a path that exists as
+        typed is never a pattern: ``/proj/Take #2/edit.mov`` or a file actually
+        called ``clip#1.mp4`` is a real file, and treating its ``#`` as frame
+        padding turned it into "no files match".
+        """
         if not path:
             return False
-        return bool(re.search(r'#+', path))
+        if not _frame_run(path):
+            return False
+        return not os.path.exists(path)
     
     @staticmethod
     def get_padding_from_template(template: str) -> int:
@@ -70,32 +95,31 @@ class SequenceHandler:
         """Find all files matching the sequence pattern"""
         # Normalize slashes for consistency
         pattern_path = pattern_path.replace('\\', '/')
-        
-        # Count consecutive # to determine padding
-        match = re.search(r'#+', pattern_path)
-        if not match:
+
+        parts = _frame_run(pattern_path)
+        if parts is None:
             return []
-        
-        padding_chars = match.group(0)
-        padding_len = len(padding_chars)
-        
-        # Replace pattern with glob wildcard
-        glob_pattern = pattern_path.replace(padding_chars, '*')
+        directory, before, padding_len, after = parts
+        prefix = directory.rstrip("/") + "/" if directory else ""
+
+        # Everything but the frame run is escaped, for glob and regex alike: a
+        # folder called `shots[v2]` is a character class to an unescaped glob,
+        # which then matched nothing while the one-pass scan (a literal
+        # scandir) counted every frame.
+        glob_pattern = glob.escape(prefix + before) + '*' + glob.escape(after)
         matching_files = [f.replace('\\', '/') for f in glob.glob(glob_pattern)]
-        
+
         # Create regex for exact match
-        # Escape the pattern but then restore the digit matcher
-        escaped_pattern = re.escape(pattern_path)
-        pattern_for_regex = escaped_pattern.replace(re.escape(padding_chars), rf'\d{{{padding_len}}}')
-        
-        regex_pattern = re.compile(f"^{pattern_for_regex}$", re.IGNORECASE)
-        
+        regex_pattern = re.compile(
+            "^" + re.escape(prefix + before) + rf'\d{{{padding_len}}}'
+            + re.escape(after) + "$", re.IGNORECASE)
+
         valid_files = [f for f in matching_files if regex_pattern.match(f)]
         logger.debug("[Bat_Loader] found %d sequence files for %s",
                      len(valid_files), pattern_path)
-        
+
         return sorted(valid_files)
-    
+
     @staticmethod
     def scan_sequence_stats(pattern_path: str) -> Optional[Tuple[int, int, int]]:
         """One-pass (frame count, max mtime_ns, total size) for a #### pattern.
@@ -114,23 +138,18 @@ class SequenceHandler:
         Returns None when the fast path doesn't apply or the scan breaks, which
         means "fall back to the glob path" rather than "no files".
         """
-        pattern_path = pattern_path.replace('\\', '/')
-        match = re.search(r'#+', pattern_path)
-        if not match:
+        parts = _frame_run(pattern_path)
+        if parts is None:
+            return None
+        directory, before, padding_len, after = parts
+        if not directory:
             return None
 
-        directory, filename = os.path.split(pattern_path)
-        # A '#' in the directory part would need a walk, not a single scandir.
-        if not directory or '#' in directory or '#' not in filename:
-            return None
-
-        padding_chars = match.group(0)
         # Same construction as find_sequence_files(), so the two agree on which
         # files belong to the sequence — a fingerprint over a different set of
         # frames than the loader reads is worse than a slow one.
-        pattern_for_regex = re.escape(filename).replace(
-            re.escape(padding_chars), rf'\d{{{len(padding_chars)}}}'
-        )
+        pattern_for_regex = (re.escape(before) + rf'\d{{{padding_len}}}'
+                             + re.escape(after))
         # Case-sensitive on purpose: find_sequence_files() reaches the same set
         # through a case-sensitive glob (its IGNORECASE regex only ever narrows
         # what the glob already returned), so matching case here keeps the

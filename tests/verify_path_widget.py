@@ -257,8 +257,71 @@ def test_consumers_use_the_shared_widget():
               "makeBatPathWidget" in src and "bat_path_widget.js" in src)
 
 
+def test_unpinned_after_adoption():
+    """The frontend adopts a plain-object widget when it lands in node.widgets,
+    and its descriptor merge replaces the unpin accessor with a plain `width`
+    field. installBatPathWidget unpins the widget the list actually holds."""
+    try:
+        import quickjs           # noqa: F401
+    except ImportError:
+        return
+    ctx = _ctx()
+    ctx.eval("""
+        // Stand-in for widgetMap.ts adoptConcreteWidget's effect on `width`.
+        function adopt(w) {
+            Object.defineProperty(w, "width", { value: undefined, writable: true,
+                                               enumerable: true, configurable: true });
+            return w;
+        }
+        const target = [{ name: "path" }];
+        globalThis.node = { size: [400, 100], widgets: new Proxy(target, {
+            set(t, k, v) { t[k] = (typeof v === "object" && v) ? adopt(v) : v; return true; },
+        }) };
+        globalThis.live = installBatPathWidget(globalThis.node,  0,
+            makeBatPathWidget({ name: "path", value: "/a.mov" }));
+        globalThis.live.width = 490;
+    """)
+    check("installBatPathWidget returns the widget in the list",
+          ctx.eval("globalThis.live === globalThis.node.widgets[0]"))
+    check("width stays unset after adoption and a stamp",
+          ctx.eval("typeof globalThis.live.width === 'undefined'"),
+          str(ctx.eval("String(globalThis.live.width)")))
+
+
+def test_nodes2_drawing():
+    try:
+        import quickjs           # noqa: F401
+    except ImportError:
+        return
+    ctx = _ctx()
+    ctx.eval("""
+        globalThis.drawn = function (w, H) {
+            globalThis.__drawn = [];
+            w.draw(makeCtx(false), { size: [400, 60] }, 400, 1, H);
+            return globalThis.__drawn.map(d => d.t);
+        };
+        app.canvas.ds.scale = 0.3;
+        globalThis.plain = makeBatPathWidget({ name: "path", value: "/a.mov" });
+        globalThis.sub = makeBatPathWidget({ name: "path", value: "/a.mov",
+            subtitle: () => ["EXR sequence · 48 frames", "#8a93a0"] });
+    """)
+    check("1.0 zoomed out: no text (unchanged)",
+          ctx.eval("JSON.stringify(drawn(plain, 20))") == "[]")
+    check("1.0: no subtitle row, so the height is unchanged",
+          ctx.eval("sub.computeSize()[1]") == 20)
+    ctx.eval("LiteGraph.vueNodesMode = true;")
+    # 2.0 paints once and doesn't repaint on zoom: the text must be there.
+    check("2.0 zoomed out: the value is still drawn",
+          "/a.mov" in ctx.eval("JSON.stringify(drawn(plain, 24))"))
+    check("2.0: the subtitle adds a row", ctx.eval("sub.computeSize()[1]") > 20)
+    check("2.0: the summary line is drawn under the pill",
+          "48 frames" in ctx.eval("JSON.stringify(drawn(sub, 38))"))
+
+
 if __name__ == "__main__":
     test_width_unpinned()
+    test_unpinned_after_adoption()
+    test_nodes2_drawing()
     test_value_fitting()
     test_commit_notifies()
     test_mouse_guard()

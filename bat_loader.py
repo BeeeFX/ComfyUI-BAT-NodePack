@@ -39,6 +39,7 @@ the audio are built only when something in the prompt is actually wired to
 them — see _consumes_slots.
 """
 
+import asyncio
 import concurrent.futures
 import json
 import logging
@@ -66,6 +67,7 @@ from .bat_video_loader import (
     _strip_path,
     load_audio,
     load_batch,
+    path_allowed,
     probe_ffmpeg,
     probe_video,
 )
@@ -427,6 +429,113 @@ def _is_video(path):
     return path.rsplit(".", 1)[-1].lower() in VIDEO_EXTENSIONS if "." in path else False
 
 
+def _mask_from_alpha(alpha):
+    """ComfyUI's MASK from an EXR alpha: 1 - alpha, the convention every other
+    branch here follows, so an opaque plate — or one with no A channel, which
+    bat_exr hands over as all ones — gives an empty mask. It used to be the
+    alpha as-is, which selected the whole frame of an ordinary EXR plate.
+
+    In place: bat_exr builds the alpha as its own tensor (nothing in `layers`
+    aliases it), and a second [N, H, W] float batch would be pure overhead.
+    Clamped, because scene-referred EXR alpha can stray outside 0..1 and a
+    MASK can't.
+    """
+    if alpha is None:
+        return None
+    return alpha.neg_().add_(1.0).clamp_(0.0, 1.0)
+
+
+# PIL modes that are one channel deeper than 8 bits. A 16-bit greyscale PNG —
+# a depth pass, a matte — opens as I;16, and convert("RGBA") CLIPS it to 255
+# rather than scaling: the frame came back almost entirely white.
+_DEEP_GREY_MODES = ("I;16", "I;16L", "I;16B", "I;16N", "I", "F")
+
+
+def _is_high_depth(im):
+    """Whether a Pillow image holds more than 8 bits per channel.
+
+    16-bit RGB(A) PNG and TIFF open in an 8-bit mode (Pillow truncates them on
+    decode), so the mode alone can't say; the tile's raw mode (``RGB;16B``) or
+    the TIFF BitsPerSample tag can.
+    """
+    if im.mode in _DEEP_GREY_MODES:
+        return True
+    if im.format == "TIFF":
+        bps = im.tag_v2.get(258)                     # BitsPerSample
+        bits = bps if isinstance(bps, (tuple, list)) else (bps or 8,)
+        return any(int(b) > 8 for b in bits)
+    if im.format == "PNG":
+        try:
+            return ";16" in im.tile[0][3]            # e.g. "RGB;16B"
+        except Exception:
+            return False
+    return False
+
+
+def _read_deep_cv2(path):
+    """A 16-bit or float still via OpenCV, as ``(rgba, scale)``, or None.
+
+    imdecode over the file's bytes rather than imread(path), which can't open a
+    non-ASCII path on Windows.
+    """
+    try:
+        import cv2
+        arr = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    except Exception:
+        return None
+    if arr is None or arr.dtype == np.uint8:
+        return None
+    scale = 65535.0 if arr.dtype == np.uint16 else 1.0
+    if arr.dtype not in (np.uint16, np.float32):
+        arr = arr.astype(np.float32)
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    h, w, c = arr.shape
+    out = np.empty((h, w, 4), dtype=arr.dtype)
+    if c == 1:
+        out[:, :, :3] = arr
+    else:
+        out[:, :, :3] = arr[:, :, 2::-1]            # BGR -> RGB
+    out[:, :, 3] = arr[:, :, 3] if c >= 4 else scale
+    return out, scale
+
+
+def read_still(path):
+    """One still as ``(rgba, scale)``: an (H, W, 4) array and the value in it
+    that means 1.0 — 255 for 8-bit, 65535 for 16-bit, 1.0 for float.
+
+    8-bit files take exactly the Pillow path they always did. Deeper ones keep
+    their precision: a 16-bit TIFF plate used to arrive as 8-bit, and a 16-bit
+    greyscale PNG as white.
+    """
+    try:
+        im = Image.open(path)
+    except Exception:
+        # Pillow can't open some deep TIFFs (float RGB) at all; OpenCV can.
+        deep = _read_deep_cv2(path)
+        if deep is None:
+            raise
+        return deep
+    with im:
+        if not _is_high_depth(im):
+            return np.asarray(im.convert("RGBA"), dtype=np.uint8), 255.0
+        if im.mode in _DEEP_GREY_MODES:
+            grey = np.asarray(im)
+            scale = 1.0 if im.mode == "F" else 65535.0
+            grey = grey.astype(np.float32 if im.mode in ("F", "I") else np.uint16)
+            out = np.empty(grey.shape + (4,), dtype=grey.dtype)
+            out[:, :, :3] = grey[:, :, None]
+            out[:, :, 3] = scale
+            return out, scale
+        deep = _read_deep_cv2(path)
+        if deep is not None:
+            return deep
+        logger.warning("[Bat_Loader] %s is more than 8 bits deep but OpenCV "
+                       "couldn't read it — loading it at 8 bits",
+                       os.path.basename(path))
+        return np.asarray(im.convert("RGBA"), dtype=np.uint8), 255.0
+
+
 class BatLoader:
     """Unified media loader: stills, ``####`` sequences, movies and EXR."""
 
@@ -596,8 +705,8 @@ class BatLoader:
                 conform=(overscan == "crop"))
             if isinstance(res, dict):
                 res = res["result"]
-            return (res[0], res[1], None, res[3], _names_text(res[4]), res[2],
-                    res[6], SEQUENCE_FPS)
+            return (res[0], _mask_from_alpha(res[1]), None, res[3],
+                    _names_text(res[4]), res[2], res[6], SEQUENCE_FPS)
 
         files = SequenceHandler.find_sequence_files(path)
         if not files:
@@ -726,8 +835,9 @@ class BatLoader:
         metadata_list = [json.loads(meta_json[i]) for i in loaded]
 
         rgb, alpha, crypto, layers = batcher.finish(loaded)
-        return (rgb, alpha, None, layers, _names_text(layer_names), crypto,
-                json.dumps(metadata_list), SEQUENCE_FPS)
+        return (rgb, _mask_from_alpha(alpha), None, layers,
+                _names_text(layer_names), crypto, json.dumps(metadata_list),
+                SEQUENCE_FPS)
 
     # ── movies ──────────────────────────────────────────────────────────────
 
@@ -827,8 +937,7 @@ class BatLoader:
         final_masks = None
         for i, f in enumerate(files):
             _raise_if_interrupted()
-            with Image.open(f) as opened:
-                img_np = np.asarray(opened.convert("RGBA"), dtype=np.uint8)
+            img_np, scale = read_still(f)
             if final_images is None:
                 h, w = img_np.shape[0], img_np.shape[1]
                 final_images = torch.empty((len(files), h, w, 3), dtype=torch.float32)
@@ -850,10 +959,10 @@ class BatLoader:
             # slice is a zero-copy view, so this writes once, in place.
             img_out = final_images[i].numpy()
             mask_out = final_masks[i].numpy()
-            np.divide(img_np[:, :, :3], 255.0, out=img_out)
+            np.divide(img_np[:, :, :3], scale, out=img_out)
             # 1-alpha, to match ComfyUI's mask convention and the movie path:
             # an opaque still gives an empty mask.
-            np.divide(img_np[:, :, 3], 255.0, out=mask_out)
+            np.divide(img_np[:, :, 3], scale, out=mask_out)
             np.subtract(1.0, mask_out, out=mask_out)
             del img_np, img_out, mask_out
             if pbar is not None:
@@ -1002,17 +1111,31 @@ async def bat_loader_scan(request):
         return server.web.json_response({"ok": False, "error": "no path"})
 
     try:
-        info = _scan_path(path)
+        # A worker thread: a movie probe spawns ffmpeg and a sequence scan
+        # lists a directory, either of which would stall the event loop.
+        info = await asyncio.to_thread(_scan_path, path)
     except Exception as exc:                      # never 500 the node face
         logger.debug("[Bat_Loader] scan failed for %s: %s", path, exc)
         return server.web.json_response({"ok": False, "error": "unreadable"})
     return server.web.json_response(info)
 
 
+# What the node face may describe. Anything else is answered exactly like a
+# missing file, so the route is no oracle for what exists on disk.
+_NOT_FOUND = {"ok": False, "error": "not found"}
+_MEDIA_EXTENSIONS = set(IMAGE_EXTENSIONS) | set(VIDEO_EXTENSIONS)
+
+
 def _scan_path(path):
     is_pattern = SequenceHandler.detect_sequence_pattern(path)
     out = {"ok": True, "pattern": is_pattern, "frames": 0, "width": 0,
            "height": 0, "layers": 0, "has_audio": False, "kind": ""}
+
+    # BAT_STRICT_PATHS, and for anything but a folder an extension this node
+    # actually loads — checked on the pattern, whose frames all share it.
+    if not path_allowed(path, None if (not is_pattern and os.path.isdir(path))
+                        else _MEDIA_EXTENSIONS):
+        return dict(_NOT_FOUND)
 
     if is_pattern:
         stats = SequenceHandler.scan_sequence_stats(path)
@@ -1028,7 +1151,7 @@ def _scan_path(path):
         return out
 
     if not os.path.exists(path):
-        return {"ok": False, "error": "not found"}
+        return dict(_NOT_FOUND)
 
     if os.path.isdir(path):
         try:

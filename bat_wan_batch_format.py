@@ -14,6 +14,16 @@ def _nearest_wan_compatible_num_frames(current_frames, context_frames, context_o
     target_lvl = (current_frames - 1) // VAE_TEMPORAL_STRIDE + 1 + (1 if with_ref_or_end_frame else 0)
     base_lvl = target_lvl - (1 if with_ref_or_end_frame else 0)
 
+    # A clip that fits inside ONE window needs no window maths at all — any
+    # 4k+1 length is a clean single window (the calculator says the same).
+    # The window grid below starts at a full window, so without this a
+    # 33-frame shot was padded to 77 and generated 44 frames only to crop them.
+    up_lvl = base_lvl
+    if (up_lvl - 1) * VAE_TEMPORAL_STRIDE + 1 < current_frames:
+        up_lvl += 1
+    if up_lvl + (1 if with_ref_or_end_frame else 0) <= cf_lat:
+        return (up_lvl - 1) * VAE_TEMPORAL_STRIDE + 1
+
     candidates = []
     n_windows = 1
     while True:
@@ -31,12 +41,16 @@ def _nearest_wan_compatible_num_frames(current_frames, context_frames, context_o
     if not pixel_candidates:
         return current_frames
 
-    if round_up:
-        above_or_eq = [p for p in pixel_candidates if p >= current_frames]
-        if above_or_eq:
-            return min(above_or_eq)
+    above_or_eq = [p for p in pixel_candidates if p >= current_frames]
+    if round_up and above_or_eq:
+        return min(above_or_eq)
 
-    return min(pixel_candidates, key=lambda p: abs(p - current_frames))
+    nearest = min(pixel_candidates, key=lambda p: abs(p - current_frames))
+    # The node pads but never trims, so a nearer length BELOW the input would
+    # become a zero pad and leave the batch off the grid (100 stayed 100).
+    if nearest < current_frames and above_or_eq:
+        return min(above_or_eq)
+    return nearest
 
 
 def _normalize_mask(t):
@@ -77,6 +91,9 @@ _WINDOW_PALETTE = [
     (0.95, 0.50, 0.75),   # pink
 ]
 
+# Long edge of the debug_window_viz frames (see _build_window_viz).
+_VIZ_MAX_DIM = 128
+
 
 def _compute_static_windows(lvl, cf_lat, co_lat):
     """Mirror static_standard from WanVideoWrapper's context_windows/context.py."""
@@ -101,14 +118,20 @@ def _compute_static_windows(lvl, cf_lat, co_lat):
 
 def _build_window_viz(N, H, W, context_frames, context_overlap, use_ref_or_end_frame,
                        frames_added_start, frames_added_end):
-    """Return an [N, H, W, 3] image batch where each frame's color reflects its
+    """Return an [N, h, w, 3] image batch where each frame's color reflects its
     sliding-context window membership (split into horizontal bands when in an
-    overlap region). Padded frames are dimmed to ~40% intensity."""
+    overlap region). Padded frames are dimmed to ~40% intensity.
+
+    Rendered small (long edge <= _VIZ_MAX_DIM, plate aspect kept) rather than
+    at H x W: it is flat colour, and a full-size float batch was ~1.5 GiB and
+    ~14 s for a 145-frame 720p run — paid on every queue, wired or not."""
     cf_lat = (context_frames - 1) // VAE_TEMPORAL_STRIDE + 1
     co_lat = context_overlap // VAE_TEMPORAL_STRIDE
     lvl = (N - 1) // VAE_TEMPORAL_STRIDE + 1 + (1 if use_ref_or_end_frame else 0)
     windows = _compute_static_windows(lvl, cf_lat, co_lat)
 
+    s = min(1.0, _VIZ_MAX_DIM / max(1, H, W))
+    H, W = max(1, round(H * s)), max(1, round(W * s))
     out = torch.zeros((N, H, W, 3), dtype=torch.float32)
 
     for p in range(N):

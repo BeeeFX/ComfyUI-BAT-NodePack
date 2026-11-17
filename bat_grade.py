@@ -1,11 +1,20 @@
 """
 Bat_Grade — Nuke-style colour grading with a live canvas preview.
 
-Mirrors Nuke's Grade node math:
-    base    = (in - blackpoint) / max(whitepoint - blackpoint, 1e-6)
-    leveled = base * (gain - lift) + lift
-    out     = (leveled * multiply + offset) ** (1 / max(gamma, 1e-6))
-    out     = clamp(out, 0, 1) if both clamp toggles are on
+Mirrors Nuke's Grade node math (the formula in Foundry's Grade reference;
+Nuke's knobs are black = lift, white = gain, add = offset):
+    A   = multiply * (gain - lift) / max(whitepoint - blackpoint, 1e-6)
+    B   = offset + lift - A * blackpoint
+    out = (A * in + B) ** (1 / max(gamma, 1e-6))
+          (negative values skip the gamma and pass through linear)
+    out = clamp(out, max=1) if clamp_white; clamp(out, min=0) if clamp_black
+so blackpoint maps to lift + offset whatever `multiply` is.
+
+``lift_mode = "legacy"`` keeps this node's original formula, which scaled lift
+by multiply as well (B = offset + multiply * lift - A * blackpoint): lift 0.1
+with multiply 2 lifted black to 0.2 where Nuke gives 0.1. Workflows saved
+before the switch load as "legacy" (web/bat_grade.js infers it), so their look
+does not change; new nodes default to "nuke".
 
 An optional MASK input gates the grade: where mask == 1 the grade
 applies fully, where mask == 0 the pixels pass through unchanged
@@ -26,7 +35,12 @@ import numpy as np
 import torch
 from PIL import Image
 
+from .bat_crop import _broadcast_mask_to_n
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
+
+# `lift_mode` values. "nuke" first: it is the default for new nodes.
+LIFT_MODES = ["nuke", "legacy"]
 
 
 def _first(t: torch.Tensor) -> torch.Tensor:
@@ -69,26 +83,59 @@ def _apply_grade(
     gamma: float,
     clamp_white: bool,
     clamp_black: bool,
+    lift_mode: str = "nuke",
 ) -> torch.Tensor:
-    """Apply Nuke's Grade formula. See module docstring for the math."""
+    """Apply Nuke's Grade formula. See module docstring for the math.
+
+    `lift_mode` "legacy" is the pre-Nuke-parity formula (lift scaled by
+    multiply); anything else is Nuke's."""
     img = image.to(torch.float32)
     wp_minus_bp = max(whitepoint - blackpoint, 1e-6)
     g = max(gamma, 1e-6)
 
-    base = (img - blackpoint) / wp_minus_bp
-    leveled = base * (gain - lift) + lift
-    out = leveled * multiply + offset
-    # pow on negatives is undefined → clamp the pre-gamma minimum to 0 so
-    # the operation is well-defined. (Nuke does the same; "black_clamp"
-    # toggles whether we also clamp the FINAL output to >= 0.)
-    out = torch.clamp(out, min=0.0).pow(1.0 / g)
+    # Pass-through params (the node defaults) are an exact identity; skip the
+    # full-batch arithmetic entirely.
+    if (blackpoint == 0.0 and whitepoint == 1.0 and lift == 0.0 and gain == 1.0
+            and multiply == 1.0 and offset == 0.0 and g == 1.0
+            and not clamp_white and not clamp_black):
+        return img
+
+    # The levels stage is affine in `in`, so it is ONE multiply-add, in * A + B,
+    # and everything after it runs in place. The step-by-step version kept
+    # base / leveled / out alive together: ~6x the batch at peak versus ~2x.
+    # The two modes share A and differ only in whether multiply scales lift.
+    a = (gain - lift) / wp_minus_bp * multiply
+    if lift_mode == "legacy":
+        b = (lift - blackpoint * (gain - lift) / wp_minus_bp) * multiply + offset
+    else:
+        b = offset + lift - a * blackpoint
+    out = img * a
+    out.add_(b)
+
+    # pow on negatives is undefined. Negatives pass through LINEAR (Nuke's
+    # behaviour) rather than being zeroed, so clamp_black is a real toggle:
+    # it used to be a no-op because this step already clamped them to 0.
+    if g != 1.0:
+        if clamp_black:
+            out.clamp_(min=0.0).pow_(1.0 / g)
+        else:
+            neg = out < 0
+            neg_vals = out[neg]
+            out.clamp_(min=0.0).pow_(1.0 / g)
+            out[neg] = neg_vals
 
     if clamp_white:
-        out = torch.clamp(out, max=1.0)
+        out.clamp_(max=1.0)
     if clamp_black:
-        out = torch.clamp(out, min=0.0)
+        out.clamp_(min=0.0)
 
     if mask is not None:
+        # A mask batch that is neither 1 nor N used to crash the mix below
+        # ("size of tensor a (10) must match … (5)"); hold its last frame /
+        # truncate, the same way Bat_Crop brings a mask to the image batch.
+        n = img.shape[0]
+        if mask.shape[0] not in (1, n):
+            mask = _broadcast_mask_to_n(mask, n)
         # mask: (N, H, W) → (N, H, W, 1) for broadcasting against (N,H,W,3)
         m = mask.to(torch.float32).unsqueeze(-1).clamp(0, 1)
         # Resize mask to image spatial size if they differ (e.g. mask is
@@ -100,7 +147,8 @@ def _apply_grade(
                 m_nchw, size=img.shape[1:3], mode="bilinear", align_corners=False,
             )
             m = m_nchw.permute(0, 2, 3, 1)
-        out = out * m + img * (1.0 - m)
+        # out*m + img*(1-m), in place.
+        out.sub_(img).mul_(m).add_(img)
     return out
 
 
@@ -130,6 +178,11 @@ class BatGrade:
             },
             "optional": {
                 "mask": ("MASK",),
+                # Nuke's Grade formula ("nuke") or this node's original one
+                # ("legacy", which also scaled lift by multiply). Appended last
+                # so saved widgets_values keep their slots; web/bat_grade.js sets
+                # "legacy" on load for workflows saved before it existed.
+                "lift_mode": (LIFT_MODES, {"default": "nuke", "advanced": True}),
             },
         }
 
@@ -144,7 +197,8 @@ class BatGrade:
     )
 
     def grade(self, image, blackpoint, whitepoint, lift, gain, multiply,
-              offset, gamma, clamp_white, clamp_black, preview_frame=0, mask=None):
+              offset, gamma, clamp_white, clamp_black, preview_frame=0, mask=None,
+              lift_mode="nuke"):
         out = _apply_grade(
             image=image,
             mask=mask,
@@ -157,6 +211,7 @@ class BatGrade:
             gamma=float(gamma),
             clamp_white=bool(clamp_white),
             clamp_black=bool(clamp_black),
+            lift_mode=str(lift_mode),
         )
 
         # Push a preview thumbnail of the SELECTED frame to the JS
@@ -195,4 +250,6 @@ class BatGrade:
         # No .cpu(): forcing the result to host memory cost a full device->host
         # copy (~750MB for a 300-frame 1080p batch) that the next node has to
         # copy straight back. ComfyUI handles device placement.
-        return {"ui": ui, "result": (out,)}
+        # The preview goes to a sidecar file (bat_ui_ref.py) so the prompt
+        # history keeps a token, not the JPEG and 16-bit tile.
+        return {"ui": stash_ui(ui), "result": (out,)}

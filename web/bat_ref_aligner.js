@@ -39,7 +39,9 @@ function makeEditor(node) {
     bar.style.cssText = "position:absolute;top:6px;right:8px;display:flex;align-items:center;gap:6px;font:11px monospace;color:#cdd;background:rgba(0,0,0,0.55);padding:3px 8px;border-radius:4px;";
     const opSlider = document.createElement("input");
     opSlider.type = "range"; opSlider.min = "5"; opSlider.max = "100"; opSlider.step = "1";
-    opSlider.value = localStorage.getItem("bat-ref-opacity") || "90";
+    let opacity = null;
+    try { opacity = localStorage.getItem("bat-ref-opacity"); } catch (_) { /* storage disabled */ }
+    opSlider.value = opacity || "90";
     opSlider.style.width = "90px";
     bar.append(document.createTextNode("ref opacity"), opSlider);
 
@@ -59,7 +61,7 @@ function makeEditor(node) {
 
     opSlider.addEventListener("input", () => {
         state.refOpacity = Math.max(0.05, Math.min(1, parseInt(opSlider.value, 10) / 100));
-        localStorage.setItem("bat-ref-opacity", opSlider.value);
+        try { localStorage.setItem("bat-ref-opacity", opSlider.value); } catch (_) { /* storage disabled */ }
         render();
     });
 

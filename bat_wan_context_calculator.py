@@ -183,6 +183,17 @@ def _pick_recommendation(num_frames, context_frames, context_stride, context_ove
     return num_frames, context_frames, context_stride, context_overlap
 
 
+def _with_ui(lines, values):
+    """Node return value: the report as the STRING output AND as `ui.text`.
+
+    This is an OUTPUT_NODE, yet the report used to reach nothing unless its
+    STRING output was wired into a display node. `ui.text` puts it on the node
+    face (web/bat_show.js renders it, as for 🦇 Show Any).
+    """
+    report = "\n".join(lines)
+    return {"ui": {"text": [report]}, "result": (report, *values)}
+
+
 class VoltWanContextCalculator:
     @classmethod
     def INPUT_TYPES(cls):
@@ -245,7 +256,7 @@ class VoltWanContextCalculator:
         if delta_lat <= 0:
             lines.append("INVALID: context_overlap must be smaller than context_frames")
             lines.append("(otherwise the window can't advance and tiling is undefined).")
-            return ("\n".join(lines), num_frames, context_frames, context_stride, context_overlap, -1)
+            return _with_ui(lines, (num_frames, context_frames, context_stride, context_overlap, -1))
 
         if lvl <= cf_lat:
             implied_max_pixels = _latent_to_pixels(cf_lat, use_ref_or_end_frame)
@@ -255,7 +266,7 @@ class VoltWanContextCalculator:
             lines.append("        For longer outputs, increase num_frames past that threshold.")
             lines.append("")
             lines.append(f">>> Recommended: num_frames={num_frames}, cf={context_frames}, stride={context_stride}, overlap={context_overlap} (1 window)")
-            return ("\n".join(lines), num_frames, context_frames, context_stride, context_overlap, 1)
+            return _with_ui(lines, (num_frames, context_frames, context_stride, context_overlap, 1))
 
         clean = _is_clean(lvl, cf_lat, co_lat)
         n_win = _num_windows(lvl, cf_lat, co_lat)
@@ -323,4 +334,4 @@ class VoltWanContextCalculator:
         lines.append(f"    context_overlap= {rec_ov}     {'(unchanged)' if rec_ov == context_overlap else f'(was {context_overlap})'}")
         lines.append(f"    → {rec_n_win} windows, clean tiling")
 
-        return ("\n".join(lines), rec_n, rec_cf, rec_st, rec_ov, rec_n_win)
+        return _with_ui(lines, (rec_n, rec_cf, rec_st, rec_ov, rec_n_win))

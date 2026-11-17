@@ -13,12 +13,14 @@ Decoder selection order (lazy import, first that works wins):
   3. opencv (cv2)  — broad codec compatibility, frame-by-frame seek
 """
 
+import asyncio
 import io
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 from collections import OrderedDict
 from typing import Optional, Tuple
 
@@ -43,6 +45,14 @@ _FRAME_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 # Entry-count cap is kept as a secondary guard against pathological tiny entries.
 _FRAME_CACHE_MAX = 8
 _FRAME_CACHE_MAX_BYTES = 4 * 1024 ** 3   # 4 GiB
+# ...and never more than this share of the RAM free at the time. ComfyUI's own
+# output cache (RAM_PRESSURE by default) evicts under memory pressure, and
+# "Free node cache" / "Unload models" clear it, but none of that reaches a
+# module-level cache here: there is no free-memory callback a custom node can
+# register for (POST /free only sets prompt-queue flags that main.py's worker
+# consumes itself). So the budget follows the machine instead — 4 GiB on a
+# roomy one, a quarter of what's left on a tight one, measured at every insert.
+_FRAME_CACHE_RAM_FRACTION = 0.25
 
 
 def _tensor_nbytes(t) -> int:
@@ -65,10 +75,23 @@ def _entry_nbytes(entry) -> int:
     return total
 
 
+def frame_cache_budget() -> int:
+    """Bytes a frame cache may hold right now: the fixed cap, or a fraction of
+    the system RAM currently available, whichever is smaller. psutil ships
+    with ComfyUI; without it the fixed cap applies, as before."""
+    try:
+        import psutil
+        available = psutil.virtual_memory().available
+    except Exception:
+        return _FRAME_CACHE_MAX_BYTES
+    return min(_FRAME_CACHE_MAX_BYTES, int(available * _FRAME_CACHE_RAM_FRACTION))
+
+
 def _trim_frame_cache():
     """Evict oldest entries until both the byte budget and the entry cap hold."""
     total = sum(_entry_nbytes(v) for v in _FRAME_CACHE.values())
-    while _FRAME_CACHE and (total > _FRAME_CACHE_MAX_BYTES
+    budget = frame_cache_budget()
+    while _FRAME_CACHE and (total > budget
                             or len(_FRAME_CACHE) > _FRAME_CACHE_MAX):
         _key, victim = _FRAME_CACHE.popitem(last=False)
         total -= _entry_nbytes(victim)
@@ -158,6 +181,10 @@ def _probe_torchvision(path: str):
 # does not.
 _VIDEO_PROBE_CACHE: "OrderedDict[tuple, dict]" = OrderedDict()
 _VIDEO_PROBE_CACHE_MAX = 64
+# Guards both probe caches. The preview routes run their work on worker threads
+# (asyncio.to_thread) beside the prompt worker, and an LRU's get-then-
+# move_to_end is two steps another thread can evict between.
+_PROBE_LOCK = threading.Lock()
 
 
 def probe_video(path: str) -> Optional[dict]:
@@ -170,9 +197,11 @@ def probe_video(path: str) -> Optional[dict]:
     a path that is still being typed doesn't poison the entry for the real file.
     """
     key = (os.path.abspath(path), _fingerprint(path))
-    hit = _VIDEO_PROBE_CACHE.get(key)
+    with _PROBE_LOCK:
+        hit = _VIDEO_PROBE_CACHE.get(key)
+        if hit is not None:
+            _VIDEO_PROBE_CACHE.move_to_end(key)
     if hit is not None:
-        _VIDEO_PROBE_CACHE.move_to_end(key)
         # A copy: load() mutates nothing today, but a cached dict handed to
         # several callers is one edit away from being a bug somewhere else.
         return dict(hit)
@@ -180,9 +209,10 @@ def probe_video(path: str) -> Optional[dict]:
         info = fn(path)
         if info is not None:
             info.pop("_reader", None)
-            _VIDEO_PROBE_CACHE[key] = dict(info)
-            while len(_VIDEO_PROBE_CACHE) > _VIDEO_PROBE_CACHE_MAX:
-                _VIDEO_PROBE_CACHE.popitem(last=False)
+            with _PROBE_LOCK:
+                _VIDEO_PROBE_CACHE[key] = dict(info)
+                while len(_VIDEO_PROBE_CACHE) > _VIDEO_PROBE_CACHE_MAX:
+                    _VIDEO_PROBE_CACHE.popitem(last=False)
             return info
     return None
 
@@ -248,19 +278,33 @@ def _parse_ffmpeg_banner(info: str) -> dict:
     """
     out = {"width": 0, "height": 0, "fps": 0.0, "duration": 0.0,
            "pix_fmt": "", "has_alpha": False, "bit_depth": 8,
-           "has_audio": False, "codec": ""}
+           "has_audio": False, "codec": "", "rotation": 0}
 
     dur = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", info)
     if dur:
         out["duration"] = (int(dur.group(1)) * 3600 + int(dur.group(2)) * 60
                            + float(dur.group(3)))
 
+    # Whether we are inside the first video stream's block (its Metadata /
+    # Side data lines follow the Stream line), which is where a rotation lives.
+    in_video = False
     for line in info.split("\n"):
+        if "Stream #" in line:
+            in_video = False
+        elif in_video:
+            rot = (re.search(r"display\s*matrix:\s*rotation of\s*(-?[\d.]+)",
+                             line, re.IGNORECASE)
+                   or re.search(r"^\s*rotate\s*:\s*(-?\d+)", line))
+            if rot:
+                out["rotation"] = int(round(float(rot.group(1)))) % 360
+                in_video = False
+            continue
         if "Audio:" in line and "Stream #" in line:
             out["has_audio"] = True
             continue
         if "Video:" not in line or "Stream #" not in line or out["width"]:
             continue
+        in_video = True
         codec = re.search(r"Video:\s*([\w.-]+)", line)
         if codec:
             out["codec"] = codec.group(1)
@@ -284,6 +328,13 @@ def _parse_ffmpeg_banner(info: str) -> dict:
             except ValueError:
                 pass
 
+    # ffmpeg AUTO-ROTATES on decode, so a phone clip tagged 90/270 comes out of
+    # the pipe with its sides swapped. Reshaping those bytes at the banner's
+    # coded size produced a sheared frame, silently. Report the size ffmpeg
+    # will actually deliver.
+    if out["rotation"] in (90, 270):
+        out["width"], out["height"] = out["height"], out["width"]
+
     pf = out["pix_fmt"]
     out["has_alpha"] = any(t in pf for t in _ALPHA_TOKENS)
     out["bit_depth"] = 16 if any(t in pf for t in _HIGH_DEPTH_TOKENS) else 8
@@ -300,9 +351,11 @@ def probe_ffmpeg(path: str) -> Optional[dict]:
     if not exe:
         return None
     key = (os.path.abspath(path), _fingerprint(path))
-    hit = _PROBE_CACHE.get(key)
+    with _PROBE_LOCK:
+        hit = _PROBE_CACHE.get(key)
+        if hit is not None:
+            _PROBE_CACHE.move_to_end(key)
     if hit is not None:
-        _PROBE_CACHE.move_to_end(key)
         return hit
     try:
         res = subprocess.run([exe, "-hide_banner", "-i", path],
@@ -314,9 +367,10 @@ def probe_ffmpeg(path: str) -> Optional[dict]:
     info = _parse_ffmpeg_banner(banner)
     if not info["width"] or not info["height"]:
         return None
-    _PROBE_CACHE[key] = info
-    while len(_PROBE_CACHE) > _PROBE_CACHE_MAX:
-        _PROBE_CACHE.popitem(last=False)
+    with _PROBE_LOCK:
+        _PROBE_CACHE[key] = info
+        while len(_PROBE_CACHE) > _PROBE_CACHE_MAX:
+            _PROBE_CACHE.popitem(last=False)
     return info
 
 
@@ -788,6 +842,23 @@ def _is_safe_path(path: str) -> bool:
         return False
 
 
+def path_allowed(path: str, extensions=None) -> bool:
+    """The gate every BAT route that takes a path goes through.
+
+    `_is_safe_path` (BAT_STRICT_PATHS) plus, when `extensions` is given, an
+    allowlist on the file actually being opened — for a sequence that is the
+    resolved frame, not the pattern. Callers answer a refusal exactly like a
+    missing file, so a route can't be used to probe what exists.
+    """
+    if not path or not _is_safe_path(path):
+        return False
+    if extensions is None:
+        return True
+    name = os.path.basename(path)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return ext in extensions
+
+
 def _resolve_media(raw: str) -> Tuple[Optional[str], Optional[str]]:
     """Clean and validate a `path` query param for the preview routes.
 
@@ -1029,15 +1100,22 @@ async def bat_getpath(request):
         return server.web.Response(status=204)
 
     path = os.path.abspath(_strip_path(raw))
-    if not os.path.isdir(path) or not _is_safe_path(path):
-        return server.web.json_response([])
-
     valid_extensions = query.get("extensions")
     exts = (
         set(e.strip().lower() for e in valid_extensions.split(",") if e.strip())
         if valid_extensions
         else None
     )
+    # Off the event loop: a listing on a network mount can take seconds, and
+    # every websocket message and HTTP request waits behind a blocked loop.
+    return server.web.json_response(
+        await asyncio.to_thread(_list_dir, path, exts))
+
+
+def _list_dir(path, exts):
+    """The body of /bat/getpath — names in `path`, oldest first."""
+    if not os.path.isdir(path) or not _is_safe_path(path):
+        return []
 
     # Collect names AND mtimes in the single scandir pass — the DirEntry already
     # carries the stat, so sorting is free. This used to re-stat every entry
@@ -1064,20 +1142,27 @@ async def bat_getpath(request):
                 pass
     except Exception as e:
         logger.error(f"[Bat] getpath error: {e}")
-        return server.web.json_response([])
+        return []
 
     items.sort(key=lambda f: mtimes.get(f, 0.0))
-    return server.web.json_response(items)
+    return items
 
 
 @server.PromptServer.instance.routes.get("/bat/video-info")
 async def bat_video_info(request):
     path, err = _resolve_media(request.rel_url.query.get("path", ""))
     if err:
-        return server.web.json_response({"ok": False, "error": err})
+        # One answer for every refusal, so the reason can't reveal whether a
+        # path outside BAT_STRICT_PATHS exists.
+        return server.web.json_response({"ok": False, "error": "not a readable video"})
+    return server.web.json_response(await asyncio.to_thread(_video_info, path))
+
+
+def _video_info(path):
+    """The body of /bat/video-info. Probing can spawn ffmpeg or decode a frame."""
     info = probe_video(path)
     if info is None:
-        return server.web.json_response({"ok": False, "error": "no decoder could open file"})
+        return {"ok": False, "error": "no decoder could open file"}
     # What load() will actually do with this source, so the node face can say
     # "10-bit · alpha · audio" instead of the artist finding out on execute.
     probe = probe_ffmpeg(path)
@@ -1092,7 +1177,7 @@ async def bat_video_info(request):
                 # frame count stays with whichever backend counted it.
                 "fps": info.get("fps") or probe["fps"],
                 "duration": probe["duration"]}
-    return server.web.json_response({"ok": True, **info})
+    return {"ok": True, **info}
 
 
 @server.PromptServer.instance.routes.get("/bat/video-stream")
@@ -1126,16 +1211,32 @@ async def bat_video_frame(request):
     except ValueError:
         max_w = 320
     try:
-        arr = _single_frame(path, frame_index)
+        body = await asyncio.to_thread(_frame_jpeg, path, frame_index, max_w)
     except Exception as e:
-        return server.web.Response(status=500, text=f"decode error: {e}")
-    if arr is None:
-        return server.web.Response(status=500, text="no frame")
+        # Logged, not echoed: the exception text names paths and permissions.
+        logger.debug("[Bat_VideoLoader] thumbnail failed for %s: %s", path, e)
+        body = None
+    if body is None:
+        return server.web.Response(status=500, text="could not decode frame")
+    return server.web.Response(body=body, content_type="image/jpeg")
 
+
+# Full-resolution decodes at once from the thumbnail routes. Each one is a whole
+# frame (a 4K ProRes is ~25 MB of RGB) and the thread pool is dozens wide, so
+# a burst of requests is held to a couple at a time.
+THUMB_DECODE_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _frame_jpeg(path, frame_index, max_w):
+    """The body of /bat/video-frame: one frame as JPEG bytes, or None."""
+    with THUMB_DECODE_SLOTS:
+        arr = _single_frame(path, frame_index)
+    if arr is None:
+        return None
     img = Image.fromarray(arr)
     if img.width > max_w:
         h = int(img.height * max_w / img.width)
         img = img.resize((max_w, h), Image.BILINEAR)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=82)
-    return server.web.Response(body=buf.getvalue(), content_type="image/jpeg")
+    return buf.getvalue()

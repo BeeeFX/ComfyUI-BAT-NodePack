@@ -13,6 +13,24 @@ import json, statistics, time, urllib.request
 
 BASE, CID = "http://127.0.0.1:8791", "bench-client"
 
+
+def _server_up():
+    """Same opt-in rule as verify_profiler_e2e.py: no server means SKIP,
+    not a URLError traceback that turns the whole suite red."""
+    try:
+        urllib.request.urlopen(BASE + "/system_stats", timeout=3).read()
+        return True
+    except Exception:
+        return False
+
+
+if not _server_up():
+    print(f"SKIP  BAT Profiler benchmark — nothing answering on {BASE}.\n"
+          f"      Start one first, from the ComfyUI root:\n"
+          f"        ./env/bin/python main.py --port 8791 --listen 127.0.0.1 &")
+    raise SystemExit(0)
+
+
 def post(p, b):
     req = urllib.request.Request(BASE + p, data=json.dumps(b).encode(),
                                  headers={"Content-Type": "application/json"})

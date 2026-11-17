@@ -27,7 +27,13 @@ Shape model (matches what the JS editor serialises into the `state` widget):
 
 Between keyframes each point lerps independently (position + both
 tangent handles). Before the first keyframe / after the last we hold —
-no extrapolation.
+no extrapolation. A shape may also carry
+
+    "keyframe_ease": {"12": "ease_out", ...}    # frame → bat_easing name
+
+naming the curve on the way OUT of that key (a key's point list is a bare
+array, so the ease lives beside it rather than on it). A key with no entry is
+linear, so a state saved before easing existed renders exactly as it did.
 
 The output MASK is a (N, H, W) float tensor. For each frame we
 rasterise every shape's interpolated point list as a closed cubic
@@ -47,6 +53,9 @@ from typing import Optional
 import numpy as np
 import torch
 from PIL import Image
+
+from .bat_easing import apply_ease, ease_name
+from .bat_ui_ref import stash_ui
 
 logger = logging.getLogger("[Bat_Roto]")
 
@@ -157,6 +166,10 @@ def _resolve_shape_at_frame(shape: dict, frame: int) -> Optional[list]:
         return kfs[str(prev)]
     span = nxt - prev
     t = (frame - prev) / span if span else 0.0
+    # The segment belongs to the earlier key: its ease shapes the way out.
+    eases = shape.get("keyframe_ease")
+    if isinstance(eases, dict):
+        t = apply_ease(t, ease_name({"ease": eases.get(str(prev))}))
     return _interp_points(kfs[str(prev)], kfs[str(nxt)], t)
 
 
@@ -188,9 +201,20 @@ def _rasterise_shape(
     if polyline.shape[0] < 3:
         return
 
-    coverage = np.zeros((h, w), dtype=np.float32)
     if _HAS_CV2:
-        cv2.fillPoly(coverage, [polyline.astype(np.int32)], 1.0)
+        # Antialiased, sub-pixel fill. The old `fillPoly(float32, astype(int32))`
+        # truncated every vertex to a whole pixel — shifting the shape up-left by
+        # up to a pixel — and drew a hard, aliased edge. OpenCV only antialiases
+        # 8-bit images, hence the uint8 pass; `shift=4` keeps 1/16 px of vertex
+        # precision. fillPoly puts integer coords on pixel CENTRES, while the
+        # editor's are continuous (pixel i spans [i, i+1)) — the -0.5 lines the
+        # two up. Residual, measured: OpenCV's scanline fill is inclusive of both
+        # edges, so the soft edge sits ~0.5 px outside the true contour on every
+        # side (unbiased, but not area-exact); exact coverage needs supersampling.
+        cov8 = np.zeros((h, w), dtype=np.uint8)
+        verts = np.round((polyline - 0.5) * 16.0).astype(np.int32)
+        cv2.fillPoly(cov8, [verts], 255, lineType=cv2.LINE_AA, shift=4)
+        coverage = cov8.astype(np.float32) * (1.0 / 255.0)
         if feather > 0:
             # cv2.GaussianBlur kernel must be odd, and must be WIDE ENOUGH for
             # the sigma or the blur is a no-op. `int(round(feather))*2+1` gave
@@ -362,27 +386,39 @@ class BatRoto:
         # coordinates itself.
         frames_b64 = []
         max_preview_frames = 240
-        stride = max(1, n // max_preview_frames) if n > max_preview_frames else 1
+        # ceil, not floor: `n // 240` was 1 for anything under 480 frames, so a
+        # 479-frame clip shipped all 479 thumbnails despite the cap.
+        stride = max(1, math.ceil(n / max_preview_frames))
+        # Downscale on torch BEFORE leaving the device: the old path converted
+        # every full-res frame to uint8 on the CPU and let PIL shrink it, which
+        # was most of this node's runtime on a long 1080p clip. antialias=True
+        # matches PIL's area-aware BILINEAR resize.
+        r = 720 / max(h, w)
+        th, tw = (max(1, int(h * r)), max(1, int(w * r))) if r < 1 else (h, w)
         for i in range(0, n, stride):
-            arr = (images[i].clamp(0, 1).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
+            fr = images[i][..., :3]
+            if (th, tw) != (h, w):
+                # NCHW-contiguous first: on CPU the antialiased kernel is ~3x
+                # slower on the channels-last view the permute alone gives.
+                fr = torch.nn.functional.interpolate(
+                    fr.permute(2, 0, 1).float().contiguous().unsqueeze(0), size=(th, tw),
+                    mode="bilinear", align_corners=False, antialias=True,
+                )[0].permute(1, 2, 0)
+            arr = (fr.clamp(0, 1) * 255.0 + 0.5).to(torch.uint8).cpu().numpy()
             im = Image.fromarray(arr, "RGB")
-            if max(im.size) > 720:
-                r = 720 / max(im.size)
-                im = im.resize(
-                    (max(1, int(im.width * r)), max(1, int(im.height * r))),
-                    Image.BILINEAR,
-                )
             buf = BytesIO()
             im.save(buf, format="JPEG", quality=78)
             frames_b64.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
 
+        # The strip goes to a sidecar file, not into the prompt history (see
+        # bat_ui_ref.py); nothing here is rendered by the frontend itself.
         return {
-            "ui": {
+            "ui": stash_ui({
                 "frames": frames_b64,
                 "w": [int(w)],
                 "h": [int(h)],
                 "stride": [int(stride)],
                 "frame_count": [int(n)],
-            },
+            }),
             "result": (mask_tensor,),
         }

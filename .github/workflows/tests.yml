@@ -1,0 +1,61 @@
+# Runs every verification script against current ComfyUI master, on CPU.
+#
+# The tests evaluate the web/*.js extensions under quickjs with stubbed ComfyUI
+# globals, and import the Python nodes against the real ComfyUI modules — so
+# the pack is checked out where it lives in production, under
+# ComfyUI/custom_nodes/, which is where tests that look for ComfyUI at ../..
+# find it. Scripts that need a running server (verify_profiler_e2e,
+# bench_profiler) skip themselves.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out ComfyUI (master)
+        uses: actions/checkout@v5
+        with:
+          repository: comfyanonymous/ComfyUI
+          path: ComfyUI
+
+      - name: Check out the pack
+        uses: actions/checkout@v5
+        with:
+          path: ComfyUI/custom_nodes/ComfyUI-BAT-NodePack
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r ComfyUI/requirements.txt
+          # Test tooling, plus the pack's optional extras the tests exercise.
+          pip install quickjs opencv-python-headless imageio-ffmpeg OpenImageIO accelerate scipy
+
+      - name: Run the verification scripts
+        working-directory: ComfyUI/custom_nodes/ComfyUI-BAT-NodePack
+        env:
+          PYTHONPATH: ${{ github.workspace }}/ComfyUI
+        run: |
+          failed=0
+          for f in tests/verify_*.py tools/test_*.py; do
+            echo "::group::$f"
+            if python "$f"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error file=$f::$f failed"
+              failed=1
+            fi
+          done
+          exit $failed

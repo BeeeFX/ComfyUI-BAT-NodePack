@@ -23,8 +23,17 @@ console.log("[BAT.Migrations] module loaded");
 // auto_target_frames migrates as `false` in both directions: the predecessor
 // nodes had no such toggle, so their typed target_num_frames is the user's
 // actual intent and must keep being honoured.
+//
+// pad_frames migrates as 0 when the old mode was a nearest_* one. Both
+// predecessors ignored it there (it was an arbitrary_pad-only field, often left
+// at a stale value after a mode switch), but Bat_BatchFormat now adds it before
+// the grid snap — carried across verbatim, 24 frames with a leftover 8 would
+// come out 33 long instead of the 25 the old node produced.
 
 const DEFAULT_MODEL = "WAN (4k+1)";
+
+const padFramesFor = (oldMode, padFrames) =>
+    (typeof oldMode === "string" && oldMode.startsWith("nearest")) ? 0 : padFrames;
 
 // Old "Video Batch Format" model dropdown -> new model names.
 const VIDEO_MODEL_MAP = {
@@ -63,7 +72,7 @@ function mapFromVideoBatchFormat(old) {
     }
 
     return [newModel, mode, padMethod, padPosition, false,
-            targetNumFrames, padFrames, roundUp, greyValue];
+            targetNumFrames, padFramesFor(mode, padFrames), roundUp, greyValue];
 }
 
 /**
@@ -93,7 +102,7 @@ function mapFromWanFrameFormat(old) {
     const newPadMethod = padMethod === "wan_inpaint_grey" ? "grey_inpaint" : padMethod;
 
     return [newModel, newMode, newPadMethod, padPosition, false,
-            targetNumFrames, padFrames, roundUp, greyValue];
+            targetNumFrames, padFramesFor(mode, padFrames), roundUp, greyValue];
 }
 
 

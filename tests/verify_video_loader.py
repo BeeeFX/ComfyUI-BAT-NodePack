@@ -394,6 +394,31 @@ def test_cache(clip, tmp):
         vl._FRAME_CACHE_MAX_BYTES = saved
         vl._FRAME_CACHE.clear()
 
+    # Nothing in ComfyUI frees this cache, so its budget follows free RAM: a
+    # machine with little left keeps (here) nothing, one with plenty keeps it.
+    try:
+        import psutil
+    except ImportError:
+        print("SKIP  RAM-aware budget — no psutil")
+        return
+    real = psutil.virtual_memory
+    try:
+        entry = vl._entry_nbytes({"images": first})
+        psutil.virtual_memory = lambda: types.SimpleNamespace(available=entry)
+        check("the budget is a fraction of free RAM",
+              vl.frame_cache_budget() == int(entry * vl._FRAME_CACHE_RAM_FRACTION))
+        node.load(clip, 0, -1, 1)
+        check("low free RAM evicts the entry", len(vl._FRAME_CACHE) == 0,
+              f"{len(vl._FRAME_CACHE)} entries left")
+        psutil.virtual_memory = lambda: types.SimpleNamespace(available=64 * 1024 ** 3)
+        check("plenty of free RAM leaves the fixed cap in charge",
+              vl.frame_cache_budget() == vl._FRAME_CACHE_MAX_BYTES)
+        node.load(clip, 0, -1, 1)
+        check("...and the entry stays", len(vl._FRAME_CACHE) == 1)
+    finally:
+        psutil.virtual_memory = real
+        vl._FRAME_CACHE.clear()
+
 
 # ---------------------------------------------------------------------------
 # 6. The output signature
@@ -587,6 +612,154 @@ def test_progress_and_cancel(clip):
 # 10. The banner parser, on the shapes ffmpeg actually prints
 # ---------------------------------------------------------------------------
 
+def test_rotated_deep(tmp):
+    """A 10-bit clip with a 90-degree display matrix decodes upright.
+
+    Built with prores_ks (10-bit, so it takes the ffmpeg path) and re-wrapped
+    with -display_rotation. Before the banner parser read the rotation, the
+    pipe's 64x48 frames were reshaped as 48x64: a sheared, garbage frame.
+    """
+    ff = _ffmpeg()
+    src = os.path.join(tmp, "deep.mov")
+    rot = os.path.join(tmp, "deep_rot.mov")
+    try:
+        subprocess.run([ff, "-y", "-v", "error", "-f", "lavfi",
+                        "-i", f"testsrc2=size={H}x{W}:rate=24", "-frames:v", "2",
+                        "-c:v", "prores_ks", "-profile:v", "3",
+                        "-pix_fmt", "yuv422p10le", src], check=True, capture_output=True)
+        subprocess.run([ff, "-y", "-v", "error", "-display_rotation", "90",
+                        "-i", src, "-c", "copy", rot], check=True, capture_output=True)
+    except Exception as e:
+        print(f"SKIP  rotated clip ({e})")
+        return
+    upright, _, _ = vl.load_batch(src, 0, 0, 1, want_progress=False)
+    turned, _, meta = vl.load_batch(rot, 0, 0, 1, want_progress=False)
+    check("rotated 10-bit clip decodes at its displayed size",
+          tuple(turned.shape) == (1, upright.shape[2], upright.shape[1], 3)
+          and meta["backend"] == "ffmpeg", f"{tuple(turned.shape)} {meta}")
+    # Upright content, turned a quarter: equal to the source under rot90 in one
+    # direction or the other (the sign convention is ffmpeg's business).
+    a = turned[0]
+    matches = [bool(torch.allclose(a, torch.rot90(upright[0], k, (0, 1)), atol=0.02))
+               for k in (1, 3)]
+    check("...and the pixels are the source turned, not sheared", any(matches))
+
+
+def test_trim_hover_js():
+    """Nodes 2.0 hover on the trim widget, under quickjs with a fake <canvas>.
+
+    WidgetLegacy.vue never forwards a plain hover move to widget.mouse(), so
+    the widget listens on the <canvas> its draw() is handed. Checks: hover
+    lands on the right frame in widget-local pixels, a press is left to
+    mouse(), leaving clears it, a remount moves the listener to the new element
+    and drops the detached one, 1.0 binds nothing, node removal unbinds.
+    """
+    try:
+        import quickjs
+    except ImportError:
+        print("SKIP  trim hover JS — pip install quickjs to run it")
+        return
+    import re
+    ctx = quickjs.Context()
+    ctx.eval(r"""
+        var LiteGraph = { NODE_WIDGET_HEIGHT: 20, vueNodesMode: true };
+        var window = { addEventListener() {}, removeEventListener() {} };
+        var ext = null;
+        var app = { registerExtension(e) { ext = e; }, graph: { _nodes: [] },
+                    canvas: { ds: { scale: 1, offset: [0, 0] },
+                              canvas: { getBoundingClientRect() { return { left: 0, top: 0 }; } } } };
+        var api = { apiURL(u) { return u; } };
+        var setTimeout = function () { return 0; }, clearTimeout = function () {};
+        var batTrack = function () { return { dispose() {} }; };
+        class Image {}
+        function fakeCanvas() {
+            return { isConnected: true, on: {},
+                     addEventListener(t, f) { (this.on[t] = this.on[t] || []).push(f); },
+                     removeEventListener(t, f) { this.on[t] = (this.on[t] || []).filter(g => g !== f); },
+                     fire(t, e) { for (const f of this.on[t] || []) f(e); },
+                     count() { return Object.values(this.on).reduce((n, a) => n + a.length, 0); } };
+        }
+        function fakeCtx(el) {
+            return new Proxy({ canvas: el, measureText: (t) => ({ width: t.length * 6 }) },
+                             { get: (o, k) => (k in o ? o[k] : function () {}), set: () => true });
+        }
+    """)
+    for name in ("bat_node_layout.js", "bat_path_widget.js", "bat_video_loader.js"):
+        src = open(os.path.join(PACK, "web", name), encoding="utf-8").read()
+        src = re.sub(r"^import [\s\S]*?;\s*$", "", src, flags=re.M)
+        src = re.sub(r"^export ", "", src, flags=re.M)
+        ctx.eval(src)
+    ctx.eval("""
+        var node = { size: [420, 400], pos: [5000, 5000], widgets: [], setDirtyCanvas() {} };
+        var startInt = { value: 0 }, endInt = { value: 100 };
+        var w = bindTrimAccessors(makeTrimWidget(node, startInt, endInt), startInt, endInt);
+        node.widgets.push(w);
+        w._trim.frameCount = 101;
+        var draws = 0; w.triggerDraw = () => { draws++; };
+        var el = fakeCanvas();
+        w.draw(fakeCtx(el), node, 400, 1, 200);          // WidgetLegacy: y = 1
+        var L = w._layout(400, 1);
+        var xAt = (f) => L.left + (f / 100) * L.inner;
+        var tlY = L.timelineY + L.timelineH / 2;
+    """)
+    check("2.0: draw() binds hover on the widget's own canvas",
+          ctx.eval("el.count()") == 2, str(ctx.eval("el.count()")))
+    ctx.eval("el.fire('pointermove', { offsetX: xAt(37), offsetY: tlY, buttons: 0 })")
+    check("2.0: hovering the timeline sets the hover frame (widget-local maths)",
+          ctx.eval("w._trim.hoverFrame") == 37 and ctx.eval("draws") == 1,
+          f"{ctx.eval('w._trim.hoverFrame')} draws={ctx.eval('draws')}")
+    ctx.eval("el.fire('pointermove', { offsetX: xAt(60), offsetY: tlY, buttons: 1 })")
+    check("2.0: a move with a button down is left to mouse()",
+          ctx.eval("w._trim.hoverFrame") == 37)
+    ctx.eval("el.fire('pointermove', { offsetX: xAt(60), offsetY: L.thumbY + 5, buttons: 0 })")
+    check("2.0: off the timeline clears the hover frame",
+          ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""el.fire('pointermove', { offsetX: xAt(12), offsetY: tlY, buttons: 0 });
+                el.fire('pointerleave', {});""")
+    check("2.0: leaving the canvas clears the hover frame",
+          ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""el.isConnected = false; var el2 = fakeCanvas();
+                w.draw(fakeCtx(el2), node, 300, 1, 200);""")
+    check("2.0: a remount rebinds to the new canvas and releases the old one",
+          ctx.eval("el.count()") == 0 and ctx.eval("el2.count()") == 2)
+    ctx.eval("el2.fire('pointermove', { offsetX: w._layout(300, 1).left + w._layout(300, 1).inner / 2,"
+             " offsetY: tlY, buttons: 0 })")
+    check("2.0: ...using the new canvas's own width", ctx.eval("w._trim.hoverFrame") == 50,
+          str(ctx.eval("w._trim.hoverFrame")))
+    ctx.eval("w._unbindHover()")
+    check("node removal releases the listeners", ctx.eval("el2.count()") == 0)
+    ctx.eval("LiteGraph.vueNodesMode = false; var el3 = fakeCanvas();"
+             " w.draw(fakeCtx(el3), node, 400, 150, 200);")
+    check("1.0: draw() binds nothing (unchanged)", ctx.eval("el3.count()") == 0)
+
+    # Nodes 1.0: plain hover reaches node.onMouseMove(e, [x - pos0, y - pos1]),
+    # never widget.mouse(), so the node hook feeds the widget. Drawn above at
+    # y=150 (node-local graph units), width 400.
+    ctx.eval("""
+        var proto = {};
+        ext.beforeRegisterNodeDef({ prototype: proto }, { name: "Bat_VideoLoader" });
+        node.widgets = [w];
+        var L1 = w._layout(400, 150);
+        var tl1 = L1.timelineY + L1.timelineH / 2;
+        draws = 0;
+        proto.onMouseMove.call(node, {}, [L1.left + 0.25 * L1.inner, tl1], app.canvas);
+    """)
+    check("1.0: node hover sets the hover frame",
+          ctx.eval("w._trim.hoverFrame") == 25 and ctx.eval("draws") == 1,
+          f"{ctx.eval('w._trim.hoverFrame')} draws={ctx.eval('draws')}")
+    ctx.eval("proto.onMouseMove.call(node, {}, [L1.left + 0.25 * L1.inner + 0.1, tl1], app.canvas)")
+    check("1.0: no redraw when the frame doesn't change", ctx.eval("draws") == 1)
+    ctx.eval("proto.onMouseMove.call(node, {}, [L1.left + 10, L1.thumbY + 5], app.canvas)")
+    check("1.0: leaving the timeline rows clears it", ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""proto.onMouseMove.call(node, {}, [L1.left + 0.5 * L1.inner, tl1], app.canvas);
+                proto.onMouseLeave.call(node, {});""")
+    check("1.0: leaving the node clears it", ctx.eval("w._trim.hoverFrame") is None)
+    ctx.eval("""LiteGraph.vueNodesMode = true; draws = 0;
+                proto.onMouseMove.call(node, {}, [L1.left + 0.5 * L1.inner, tl1], app.canvas);""")
+    check("2.0: the node hook stays out (the canvas listener owns hover)",
+          ctx.eval("w._trim.hoverFrame") is None and ctx.eval("draws") == 0)
+
+
 def test_banner_parser():
     cases = [
         # (banner line, pix_fmt, alpha, depth)
@@ -637,6 +810,21 @@ def test_banner_parser():
     check("banner: no audio stream", vl._parse_ffmpeg_banner(
         "Stream #0:0: Video: h264, yuv420p, 8x8, 24 fps")["has_audio"] is False)
 
+    # ffmpeg auto-rotates on decode, so a clip tagged 90/270 arrives with its
+    # sides swapped; the reshape has to use the size ffmpeg will deliver.
+    for label, side, expect in (
+            ("-90", "        displaymatrix: rotation of -90.00 degrees", (180, 320)),
+            ("90, 7.x spelling", "        Display Matrix: rotation of 90.00 degrees", (180, 320)),
+            ("180", "        displaymatrix: rotation of -180.00 degrees", (320, 180)),
+            ("old rotate tag", "        rotate          : 270", (180, 320))):
+        got = vl._parse_ffmpeg_banner(
+            "    Stream #0:0: Video: hevc (Main 10), yuv420p10le(tv), 320x180, 24 fps\n"
+            "      Side data:\n" + side + "\n"
+            "    Stream #0:1: Audio: aac, 48000 Hz, stereo, fltp")
+        check(f"banner: rotation {label} -> {expect[0]}x{expect[1]}",
+              (got["width"], got["height"]) == expect,
+              f"got {got['width']}x{got['height']} rot {got['rotation']}")
+
     for layout, expect in (("mono", 1), ("stereo", 2), ("5.1(side)", 6),
                            ("7.1", 8), ("16 channels", 16), ("weird", 2)):
         rate, ch = vl._parse_audio_layout(
@@ -657,12 +845,14 @@ if __name__ == "__main__":
                   "(install decord, opencv-python, or torchvision)")
             sys.exit(1)
         test_banner_parser()
+        test_trim_hover_js()
         test_trim(clip)
         test_outputs(clip)
         test_scale_exact(clip)
         test_route_gating(clip, tmp)
         test_progress_and_cancel(clip)
         test_bit_depth_and_alpha(tmp)
+        test_rotated_deep(tmp)
         test_audio_gating(tmp)
         test_cache(clip, tmp)
         # Last: it mutates the clip's mtime/size.

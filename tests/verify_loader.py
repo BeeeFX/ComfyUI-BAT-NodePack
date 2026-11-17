@@ -264,6 +264,28 @@ def test_exr(root, node):
     except KeyError:
         check("unknown layer raises KeyError", True, True)
 
+    # MASK is 1 - alpha on every branch. The EXR branch used to hand the alpha
+    # over as-is (and all ones for an RGB-only file), so an opaque EXR plate
+    # masked the whole frame while the same plate as a PNG masked nothing.
+    print("\n  ...and its mask follows ComfyUI's 1-alpha convention")
+    ramp = np.linspace(0.0, 1.0, W, dtype=np.float32)[None, :].repeat(H, 0)
+    for name, chans in (("ramp", ["R", "G", "B", "A"]), ("rgb", ["R", "G", "B"])):
+        spec = oiio.ImageSpec(W, H, len(chans), "float")
+        spec.channelnames = chans
+        data = np.full((H, W, len(chans)), 0.5, dtype=np.float32)
+        if "A" in chans:
+            data[:, :, 3] = ramp
+        out = oiio.ImageOutput.create(f"{root}/exr_{name}.exr")
+        out.open(f"{root}/exr_{name}.exr", spec)
+        out.write_image(data)
+        out.close()
+    _, mask, *_ = load(node, f"{root}/exr_ramp.exr")
+    check("EXR mask is 1-alpha", bool(torch.allclose(
+        mask[0], torch.from_numpy(1.0 - ramp), atol=1e-6)), True)
+    _, mask, *_ = load(node, f"{root}/exr_rgb.exr")
+    check("an EXR without alpha gives an empty mask",
+          (tuple(mask.shape), float(mask.abs().max())), ((1, H, W), 0.0))
+
 
 def test_exr_sequence(root, node):
     print("\nan EXR sequence")
@@ -282,6 +304,8 @@ def test_exr_sequence(root, node):
           [round(float(layers["depth"][i, 0, 0])) for i in range(6)],
           [10, 11, 12, 13, 14, 15])
     check("metadata is one entry per frame", len(json.loads(meta)), 6)
+    check("the batched mask is 1-alpha too (A was 0.5)",
+          (tuple(mask.shape), round(float(mask.mean()), 4)), ((6, H, W), 0.5))
 
     print("\n  ...and the cryptomatte output aliases the layers")
     shared = sum(1 for k in layers if k in crypto and layers[k] is crypto[k])
@@ -388,6 +412,74 @@ def test_edges(root, node):
     check("an unknown overscan mode falls back to auto", tuple(images.shape)[0], 8)
 
 
+def test_deep_stills(root, node):
+    print("\nstills deeper than 8 bits")
+    ramp = np.linspace(0, 65535, W).astype(np.uint16)[None, :].repeat(H, 0)
+    Image.fromarray(ramp).save(f"{root}/grey16.png")     # mode I;16
+    images, mask, *_ = load(node, f"{root}/grey16.png")
+    # convert("RGBA") clips I;16 at 255, which came back almost all white.
+    check("a 16-bit greyscale PNG keeps its ramp",
+          bool(torch.allclose(images[0, :, :, 0],
+                              torch.from_numpy(ramp.astype(np.float32) / 65535.0))), True)
+    check("...and is opaque", float(mask.abs().max()), 0.0)
+    try:
+        import cv2
+    except ImportError:
+        print("  .... 16-bit RGB skipped (no OpenCV)")
+        return
+    rgb = np.stack([ramp, ramp // 2, ramp // 4], -1)
+    cv2.imwrite(f"{root}/rgb16.tif", rgb[:, :, ::-1])    # cv2 writes BGR
+    images, *_ = load(node, f"{root}/rgb16.tif")
+    check("a 16-bit RGB TIFF keeps 16-bit precision",
+          bool(torch.allclose(images[0], torch.from_numpy(rgb.astype(np.float32) / 65535.0))),
+          True)
+
+
+def test_hash_paths(root, node):
+    print("\n`#` and glob characters in folder names")
+    for sub in ("Take #2", "shots[v2]"):
+        os.makedirs(f"{root}/{sub}")
+        for i, f in enumerate(range(1001, 1004)):
+            make_png(f"{root}/{sub}/plate_{f}.png", i)
+    images, *_ = load(node, f"{root}/Take #2/plate_1001.png")
+    check("a `#` in a folder name is not frame padding", tuple(images.shape)[0], 1)
+    images, *_ = load(node, f"{root}/Take #2/plate_####.png")
+    check("...and a pattern inside that folder still works", tuple(images.shape)[0], 3)
+    images, *_ = load(node, f"{root}/shots[v2]/plate_####.png")
+    check("a `[v2]` folder is matched literally", tuple(images.shape)[0], 3)
+
+
+def test_frame_picker(root):
+    print("\n🦇 Frame Picker: route gate and stale-frame cache")
+    fp = sys.modules["batpack.bat_frame_picker"]
+    with open(f"{root}/secret.txt", "w") as fh:
+        fh.write("not an image")
+    check("thumbnail route refuses a non-media file",
+          fp._frame_jpeg(f"{root}/secret.txt", 0, 64), None)
+    body = fp._frame_jpeg(f"{root}/seq/plate_####.png", 2, 64)
+    check("...and serves a sequence frame", bool(body) and body[:2] == b"\xff\xd8", True)
+    check("info refuses a non-media file",
+          fp._info(f"{root}/secret.txt")["ok"], False)
+
+    picker = fp.BatFramePicker()
+    pattern = f"{root}/pick/p_####.png"
+    os.makedirs(f"{root}/pick")
+    for i, f in enumerate(range(1001, 1004)):
+        make_png(f"{root}/pick/p_{f}.png", i)
+    before_key = fp.BatFramePicker.IS_CHANGED(pattern, 1, False)
+    first = picker.load(pattern, 1)[0]
+    # Rewrite ONLY the picked frame (not the first file, which is all the old
+    # IS_CHANGED looked at), with different pixels and a new size on disk.
+    make_png(f"{root}/pick/p_1002.png", 50)
+    with open(f"{root}/pick/p_1002.png", "ab") as fh:
+        fh.write(b"\0" * 16)
+    check("IS_CHANGED sees the picked frame rewritten",
+          fp.BatFramePicker.IS_CHANGED(pattern, 1, False) != before_key, True)
+    second = picker.load(pattern, 1)[0]
+    check("...and load() returns the new pixels, not the cached ones",
+          bool(torch.equal(first, second)), False)
+
+
 def test_scan(root, node):
     print("\nthe node-face scan")
     scan = bat_loader._scan_path
@@ -400,6 +492,10 @@ def test_scan(root, node):
     check("folder", (i["kind"], i["frames"]), ("folder", 8))
     i = scan("/nope/nothing.png")
     check("missing path", i["ok"], False)
+    with open(f"{root}/notes.txt", "w") as fh:
+        fh.write("not media")
+    i = scan(f"{root}/notes.txt")
+    check("a non-media file is answered like a missing one", i, {"ok": False, "error": "not found"})
     if HAVE_OIIO:
         i = scan(f"{root}/exr/render_1001.exr")
         check("EXR layers are counted from channel prefixes",
@@ -419,6 +515,9 @@ def main():
         test_exr_sequence(root, node)
         test_overscan(root, node)
         test_edges(root, node)
+        test_deep_stills(root, node)
+        test_hash_paths(root, node)
+        test_frame_picker(root)
         test_scan(root, node)
         test_is_changed(root, node)     # last: it mutates the material
     finally:

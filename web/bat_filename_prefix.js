@@ -493,6 +493,10 @@ app.registerExtension({
             // parameters panel brands unrecognised widget types with its own
             // width via WidgetLegacy. See unpinWidgetWidth() for the full story.
             unpinWidgetWidth(dom);
+            // Out of widgets_values too, not just the API prompt — the same
+            // rule addBatDOMWidget applies (see there). The editor is the last
+            // widget, so an old save's trailing "" is simply never read.
+            dom.serialize = false;
             node._batDom = dom;
 
             // Only seed the width; the height comes from the measured editor, so

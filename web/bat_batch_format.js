@@ -18,7 +18,7 @@
  * widget in bat_animated_grade.js.
  */
 
-import { app } from "/scripts/app.js";
+import { app } from "../../scripts/app.js";
 
 const NODE_TYPE = "Bat_BatchFormat";
 

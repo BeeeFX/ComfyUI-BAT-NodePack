@@ -93,12 +93,24 @@ def js_worker_parses():
     path = os.path.join(PACK, "web", "bat_blend_worker.js")
     src = re.sub(r"^import .*?;\s*$", "", open(path, encoding="utf-8").read(), flags=re.M)
     ctx = quickjs.Context()
-    ctx.eval("var self = {postMessage: function(){}};"
+    ctx.eval("function WorkerGlobalScope() {}"
+             "var self = new WorkerGlobalScope(); self.postMessage = function(){};"
              "var performance = {now: function(){ return 0; }};")
     ctx.eval(js_prelude())
     ctx.eval(src)
     ctx.eval("if (typeof self.onmessage !== 'function') "
              "throw new Error('worker did not install onmessage');")
+
+    # And the main page, which ALSO imports this file: ComfyUI's /extensions
+    # route globs every .js under the web directory. There `self` is `window`,
+    # and an unguarded install replaced the page's own window.onmessage.
+    page = quickjs.Context()
+    page.eval("var self = {postMessage: function(){}, onmessage: 'page handler'};"
+              "var performance = {now: function(){ return 0; }};")
+    page.eval(js_prelude())
+    page.eval(src)
+    page.eval("if (self.onmessage !== 'page handler') "
+              "throw new Error('worker clobbered the page onmessage');")
 
 
 def js_parses_whole_file():
@@ -616,6 +628,12 @@ def main():
         dict(frequency_separation=True, detail_gain=2.4),
         dict(frequency_separation=True, detail_gain=0.0),
         dict(frequency_separation=True, split_radius=1.0),
+        # .5 radii: Python's round() is half-to-even, JS's half-up, so these
+        # used to get kernels of different widths — and 0.5 (the widget's
+        # minimum) got none at all in Python. See _kernel_radius().
+        dict(frequency_separation=True, split_radius=0.5),
+        dict(frequency_separation=True, split_radius=2.5),
+        dict(frequency_separation=True, soften_a=0.3, soften_b=4.5),
         dict(frequency_separation=True, split_radius=11.0),
         dict(frequency_separation=True, split_radius=60.0),   # wider than the tile
         dict(frequency_separation=True, soften_a=3.0),
@@ -718,6 +736,8 @@ def main():
         ("divide", rp(detail_mode="divide", detail_limit=3.0, split_radius=7.0)),
         ("freq off", rp(frequency_separation=False, soften_a=5.0, soften_b=2.0)),
         ("screen+mix", rp(blend_mode="screen", mix=0.6, split_radius=6.0, soften_a=4.0)),
+        # The one-tap floor has to reach the margin too, or these seam.
+        ("sub-pixel radii", rp(split_radius=0.5, soften_a=0.3, soften_b=2.5)),
     ]
     # Corners and an off-grid interior region, because the margin has to clamp
     # at the frame edge and not at an interior one.
@@ -734,6 +754,58 @@ def main():
                 roi_worst = max(roi_worst, d)
                 if d > 0:
                     roi_bad.append((name, view, (rx, ry, rw, rh), d))
+
+    # ── the compute device ───────────────────────────────────────────────
+    # Chunks go to ComfyUI's torch device and come back to the intermediate
+    # one; anything the device can't do (OOM, a missing operator) finishes on
+    # the host. No GPU here, so stand a "meta" device in for one that fails:
+    # the resampler reads a value back (`dead.any()`), which meta cannot. The
+    # result must be exactly the CPU render, preview payload included.
+    small_b = plate_b.unsqueeze(0)[:, ::2, ::2]
+    kw = dict(image_a=plate_a.unsqueeze(0).repeat(3, 1, 1, 1), image_b=small_b,
+              resize_mode="match_a", resize_filter="lanczos", blend_mode="screen",
+              mix=0.8, frequency_separation=True, split_radius=3.0,
+              detail_mode="subtract", low_mix=1.0, high_mix=0.4, detail_gain=1.0,
+              detail_limit=0.0, soften_a=1.0, soften_b=0.0, clamp_output=False,
+              preview_frame=1, mask=mask, unique_id="4:2")
+    ref = node.blend(**kw)
+    real = m._compute_devices
+    m._compute_devices = lambda fb: (torch.device("meta"), torch.device("cpu"))
+    try:
+        got = node.blend(**kw)
+    finally:
+        m._compute_devices = real
+    for k in range(3):
+        assert got["result"][k].device.type == "cpu"
+        assert torch.equal(got["result"][k], ref["result"][k]), f"output {k} differs"
+    ui_mod = sys.modules["batpack.bat_ui_ref"]
+    # The payload lives in a sidecar; resolved, it is the dict the JS reads.
+    assert set(ref["ui"]) == {"bat_ui"}, sorted(ref["ui"])
+    ui_ref, ui_got = ui_mod.load_ui(ref["ui"]), ui_mod.load_ui(got["ui"])
+    assert ui_ref["node_id"] == ["4:2"] and ui_ref["preview_frame"] == [1], ui_ref.keys()
+    assert ui_ref["tile_a"] == ui_got["tile_a"] and "mask_png" in ui_ref
+    # The full-resolution endpoint renders only for the run whose tiles the
+    # client holds: the id alone is shared by same-numbered nodes in other open
+    # workflows. Both runs above cached under "4:2", so only the latest token
+    # may render, and a restored thumbnail (no token) never does.
+    entry = m._cache_get("4:2")
+    assert m._run_matches(entry, {"node_id": "4:2", "run": ui_got["run"][0]})
+    for stale in ({"run": ui_ref["run"][0]}, {}, {"run": ""}, {"run": None}):
+        assert not m._run_matches(entry, dict(stale, node_id="4:2")), stale
+    assert not m._run_matches(None, {"run": ui_got["run"][0]})
+    print("device fallback reproduces the CPU render; payload stashed and resolves; "
+          "full layer gated on the run token: OK")
+
+    # split_radius 0.5 is the widget's minimum, and round(0.5) == 0 used to make
+    # it no blur at all: an empty high band, so high_mix 0 still returned A
+    # exactly. Pin that it now splits, and that .5 rounds up on both sides.
+    assert [m._kernel_radius(r) for r in (0.0, -1.0, 0.2, 0.5, 1.5, 2.5, 3.49)] \
+        == [0, 0, 1, 1, 2, 3, 3], "kernel radius rule changed"
+    still_a = m.BatAdvancedBlend._core(plate_a.unsqueeze(0), plate_b.unsqueeze(0),
+                                       rp(split_radius=0.5, high_mix=0.0))[0]
+    assert not torch.allclose(still_a, plate_a.unsqueeze(0)), \
+        "split_radius=0.5 is a no-op: high_mix 0 returned plate A"
+    print("split_radius 0.5 splits; .5 radii round up: OK")
 
     n_roi = len(roi_cases) * 3 * len(regions)
     print(f"{n_roi} region renders vs full-frame: worst delta = {roi_worst} code value(s)")

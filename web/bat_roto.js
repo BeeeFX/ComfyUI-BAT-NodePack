@@ -39,8 +39,9 @@
 
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
-import { addBatFullscreen } from "./bat_fullscreen.js";
-import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { addBatFullscreen, isBatFullscreen } from "./bat_fullscreen.js";
+import { easeName, applyEase, EASES, EASE_LABELS } from "./bat_easing.js";
+import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { api } from "../../scripts/api.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
 
@@ -68,7 +69,7 @@ function _previewCacheKey(node) {
     return batNodeCacheKey(app, "bat_roto_preview", node);
 }
 function _saveCachedPreview(node, data) {
-    try { localStorage.setItem(_previewCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(_previewCacheKey(node), JSON.stringify(data)); }
     catch (_) { /* quota exceeded or storage disabled — fine, just skip */ }
 }
 function _loadCachedPreview(node) {
@@ -79,6 +80,57 @@ function _loadCachedPreview(node) {
 }
 
 const lerp2 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+
+/**
+ * Interpolate two keyframes' point lists at t — a line-for-line port of
+ * `_interp_points` in bat_roto.py, because the canvas must show what the MASK
+ * renders. When the point counts differ (the pen tool appends to the current
+ * keyframe only), the shorter list is padded with its last point, so the shared
+ * prefix keeps animating. The preview used to hold keyframe A instead, while the
+ * render animated: the in-betweens on screen were not the ones in the output.
+ */
+function lerpKeyframes(a, b, t) {
+    if (!a || !a.length) return b || [];
+    if (!b || !b.length) return a;
+    let pa = a, pb = b;
+    if (pa.length !== pb.length) {
+        const pad = (l, n) => l.concat(Array(n - l.length).fill(l[l.length - 1]));
+        if (pa.length < pb.length) pa = pad(pa, pb.length);
+        else pb = pad(pb, pa.length);
+    }
+    // A malformed point (component counts differ) is the one case the backend
+    // can't lerp either — it holds A, so do we.
+    if (pa.some((p, i) => p.length !== pb[i].length)) return a;
+    return pa.map((p, i) => p.map((v, k) => v + (pb[i][k] - v) * t));
+}
+
+/**
+ * A shape's point list at `frame` — the port of `_resolve_shape_at_frame` in
+ * bat_roto.py, easing included. Holds before the first / after the last key.
+ *
+ * A key's point list is a bare array, so its ease lives beside it in
+ * `shape.keyframe_ease` ({"<frame>": name}); the segment belongs to the EARLIER
+ * key (bat_easing.js). No entry = linear, which is every pre-easing workflow.
+ */
+function resolveShapeAtFrame(sh, frame) {
+    const kfs = sh?.keyframes || {};
+    const keys = Object.keys(kfs).map(Number).sort((a, b) => a - b);
+    if (!keys.length) return null;
+    if (frame <= keys[0]) return kfs[String(keys[0])];
+    if (frame >= keys[keys.length - 1]) return kfs[String(keys[keys.length - 1])];
+    let prev = keys[0], nxt = keys[keys.length - 1];
+    for (const k of keys) {
+        if (k <= frame) prev = k;
+        if (k >= frame && k !== prev) { nxt = k; break; }
+    }
+    if (prev === nxt) return kfs[String(prev)];
+    let t = (frame - prev) / (nxt - prev);
+    const eases = sh.keyframe_ease;
+    if (eases && typeof eases === "object") {
+        t = applyEase(t, easeName({ ease: eases[String(prev)] }));
+    }
+    return lerpKeyframes(kfs[String(prev)], kfs[String(nxt)], t);
+}
 
 /**
  * De Casteljau subdivision of a cubic bezier at parameter t.
@@ -589,8 +641,21 @@ function buildEditor(node) {
     }
     try { viewSel.value = localStorage.getItem("bat_roto_view") || "image"; } catch (_) {}
 
+    // Keyframe ease — the curve on the way OUT of the selected key(s), or of the
+    // key the playhead is past when none is selected (bat_easing.js). Blank when
+    // the selected keys disagree; disabled when there is no key to set.
+    const easeSel = document.createElement("select");
+    easeSel.title = "Keyframe ease: the curve from the selected keyframe(s) — or the one "
+                  + "the playhead is past — to the next keyframe";
+    easeSel.style.cssText = viewSel.style.cssText;
+    for (const name of EASES) {
+        const o = document.createElement("option");
+        o.value = name; o.textContent = EASE_LABELS[name] || name;
+        easeSel.appendChild(o);
+    }
+
     // Timeline first (full width), then the controls beneath it.
-    controlsRow.append(prevBtn, playBtn, nextBtn, addKeyBtn, delKeyBtn,
+    controlsRow.append(prevBtn, playBtn, nextBtn, addKeyBtn, delKeyBtn, easeSel,
                        undoBtn, redoBtn, autoKeyToggle, viewSel,
                        frameLabel, helpBtn);
     transport.append(timelineStack, controlsRow);
@@ -674,8 +739,40 @@ function buildEditor(node) {
     if (!Array.isArray(state.doc.shapes)) state.doc.shapes = [];
     node._batRotoState = state;
 
+    // ── plate metadata ───────────────────────────────────────────────
+    // The plate's size and length, for drawing before a run. They live in
+    // node.properties, NOT in the `state` JSON: `state` is a prompt input, so
+    // it is part of the node's cache key, and stamping them into it after the
+    // first run (and on every clip change) re-executed Roto and everything
+    // downstream on the next Queue with nothing changed. Python never reads
+    // them. A state saved before this carries them as imgW/imgH/frameCount:
+    // still read as the fallback, never rewritten, so that state — and its
+    // cache key — stay byte-identical.
+    const PLATE_PROP = "bat_roto_plate";
+    function readPlate() {
+        const p = node.properties?.[PLATE_PROP];
+        if (p && p.w && p.h) return { w: p.w, h: p.h, frameCount: p.frameCount || 0 };
+        const d = state.doc || {};
+        return { w: d.imgW || 0, h: d.imgH || 0, frameCount: d.frameCount || 0 };
+    }
+
     // ── helpers ──────────────────────────────────────────────────────
-    const persist = () => setStateWidget(state.doc);
+    // A deleted key must not leave its ease behind — a key added later at that
+    // frame would silently inherit it. Every delete path ends in persist(), so
+    // one sweep here covers them all; a MOVE carries the ease explicitly. Linear
+    // entries are dropped too, and an emptied map with them, so a shape nobody
+    // eased serialises exactly as it did before easing existed.
+    function pruneEases(doc) {
+        for (const sh of doc?.shapes || []) {
+            const e = sh.keyframe_ease;
+            if (!e || typeof e !== "object") continue;
+            for (const k of Object.keys(e)) {
+                if (sh.keyframes?.[k] === undefined || easeName({ ease: e[k] }) === "linear") delete e[k];
+            }
+            if (!Object.keys(e).length) delete sh.keyframe_ease;
+        }
+    }
+    const persist = () => { pruneEases(state.doc); setStateWidget(state.doc); };
     const activeShape = () => state.doc.shapes.find(s => s.id === state.activeId);
     const activeShapeKey = () => String(state.currentFrame);
 
@@ -683,6 +780,21 @@ function buildEditor(node) {
     // Call recordHistory() AFTER a mutation completes so the snapshot
     // captures the post-action state. The redo branch is truncated on
     // every new mutation — standard NLE / pixel-app behaviour.
+    // Tell core's ChangeTracker a Roto edit just landed, so core's Ctrl+Z (the
+    // one that runs on the node — see the keydown handler) has it as a step.
+    // Its own triggers miss most of ours: with the editor focused, a key only
+    // arms a 'change' listener on the root (ChangeTracker.bindInput) that never
+    // fires, and a canvas pointerdown that preventDefault()s suppresses the
+    // mouseup it captures on. Not while a reload rebuilds the history
+    // (`quietHistory`): a capture then could clear core's redo queue.
+    let quietHistory = false;
+    function coreCapture() {
+        if (quietHistory) return;
+        try {
+            const t = app.extensionManager?.workflow?.activeWorkflow?.changeTracker;
+            (t?.captureCanvasState ?? t?.checkState)?.call(t);
+        } catch (_) { /* no tracker (older frontend, tests): nothing to tell */ }
+    }
     function recordHistory() {
         const snap = JSON.stringify(state.doc);
         if (history.pointer >= 0 && history.snapshots[history.pointer] === snap) {
@@ -696,6 +808,7 @@ function buildEditor(node) {
             history.pointer = history.snapshots.length - 1;
         }
         history.pointer = history.snapshots.length - 1;
+        coreCapture();
     }
     function applySnapshot(idx) {
         const snap = history.snapshots[idx];
@@ -716,6 +829,7 @@ function buildEditor(node) {
             state.activeId = null;
         }
         persist(); refreshSidebar(); render();
+        coreCapture();
     }
     function undo() {
         if (history.pointer <= 0) return;
@@ -731,26 +845,7 @@ function buildEditor(node) {
     function shapePointsAtCurrent() {
         const sh = activeShape();
         if (!sh) return null;
-        const kfs = sh.keyframes || {};
-        const keys = Object.keys(kfs).map(Number).sort((a, b) => a - b);
-        if (!keys.length) return null;
-        const f = state.currentFrame;
-        if (f <= keys[0]) return kfs[String(keys[0])];
-        if (f >= keys[keys.length - 1]) return kfs[String(keys[keys.length - 1])];
-        let prev = keys[0], nxt = keys[keys.length - 1];
-        for (const k of keys) {
-            if (k <= f) prev = k;
-            if (k >= f && k !== prev) { nxt = k; break; }
-        }
-        if (prev === nxt) return kfs[String(prev)];
-        const t = (f - prev) / (nxt - prev);
-        const a = kfs[String(prev)], b = kfs[String(nxt)];
-        if (a.length !== b.length) return a;
-        return a.map((pa, i) => {
-            const pb = b[i];
-            if (pa.length !== pb.length) return pa.slice();
-            return pa.map((v, k) => v + (pb[k] - v) * t);
-        });
+        return resolveShapeAtFrame(sh, state.currentFrame);
     }
 
     // Returns the keyframe TO MODIFY when the user drags a point. When
@@ -1200,24 +1295,7 @@ function buildEditor(node) {
     }
 
     function resolveShapeAt(sh, frame) {
-        const kfs = sh.keyframes || {};
-        const keys = Object.keys(kfs).map(Number).sort((a, b) => a - b);
-        if (!keys.length) return null;
-        if (frame <= keys[0]) return kfs[String(keys[0])];
-        if (frame >= keys[keys.length - 1]) return kfs[String(keys[keys.length - 1])];
-        let prev = keys[0], nxt = keys[keys.length - 1];
-        for (const k of keys) {
-            if (k <= frame) prev = k;
-            if (k >= frame && k !== prev) { nxt = k; break; }
-        }
-        if (prev === nxt) return kfs[String(prev)];
-        const t = (frame - prev) / (nxt - prev);
-        const a = kfs[String(prev)], b = kfs[String(nxt)];
-        if (a.length !== b.length) return a;
-        return a.map((pa, i) => {
-            const pb = b[i];
-            return pa.map((v, k) => v + (pb[k] - v) * t);
-        });
+        return resolveShapeAtFrame(sh, frame);
     }
 
     // ── handle helpers ──────────────────────────────────────────────
@@ -2029,18 +2107,34 @@ function buildEditor(node) {
     }
 
     // ── keyboard ─────────────────────────────────────────────────────
+    // Every key this editor USES stops here. The frontend's keybinding
+    // handler sits on `window`, never checks defaultPrevented, and scopes
+    // Delete / Backspace to #graph-canvas-container — which contains this
+    // editor. And focusing the editor selects the node (DomWidget.vue
+    // selectOn), so a Delete meant for an anchor also ran "Delete Selected
+    // Items" and removed the Roto node itself. Keys we leave unhandled still
+    // bubble, so a no-op Escape reaches bat_fullscreen.js and core.
+    const consume = (e) => { e.preventDefault(); e.stopPropagation(); };
     root.addEventListener("keydown", (e) => {
         if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-        // Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z (or Ctrl+Y) = redo.
-        if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+        // Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z (or Ctrl+Y) = redo — the
+        // editor's own, but ONLY while maximised. On the node, core's
+        // ChangeTracker already has the key (a window CAPTURE listener, it
+        // runs before this and cannot be stopped from here) and reloads the
+        // graph from its snapshot: handling it here as well undid twice, or
+        // undid something else entirely. The state lives in the widget, so
+        // core's undo restores it; coreCapture() gives it every edit as a
+        // step. The fullscreen overlay is aria-modal, which switches core's
+        // undo off (bat_fullscreen.js) — so there the local history is the one.
+        if ((e.ctrlKey || e.metaKey) && !e.altKey && isBatFullscreen(node)) {
             if (e.key === "z" || e.key === "Z") {
                 if (e.shiftKey) redo(); else undo();
-                e.preventDefault();
+                consume(e);
                 return;
             }
             if (e.key === "y" || e.key === "Y") {
                 redo();
-                e.preventDefault();
+                consume(e);
                 return;
             }
         }
@@ -2129,7 +2223,7 @@ function buildEditor(node) {
                 break;
             default: handled = false;
         }
-        if (handled) e.preventDefault();
+        if (handled) consume(e);
     });
 
     // ── playback ─────────────────────────────────────────────────────
@@ -2185,6 +2279,36 @@ function buildEditor(node) {
     viewSel.onchange = () => {
         try { localStorage.setItem("bat_roto_view", viewSel.value); } catch (_) {}
         render();
+    };
+
+    // The keys the ease picker acts on: the active shape's selected markers, or
+    // else its key at or before the playhead (whose segment the artist is in).
+    function easeTargets() {
+        const sh = activeShape();
+        if (!sh) return { sh: null, keys: [] };
+        const kfs = sh.keyframes || {};
+        if (state.kfSelection.size) {
+            return { sh, keys: [...state.kfSelection].map(String).filter(k => kfs[k] !== undefined) };
+        }
+        let at = null;
+        for (const k of Object.keys(kfs).map(Number)) {
+            if (k <= state.currentFrame && (at === null || k > at)) at = k;
+        }
+        return { sh, keys: at === null ? [] : [String(at)] };
+    }
+    function refreshEaseSel() {
+        const { sh, keys } = easeTargets();
+        easeSel.disabled = !keys.length;
+        const names = new Set(keys.map(k => easeName({ ease: sh.keyframe_ease?.[k] })));
+        easeSel.value = names.size === 1 ? [...names][0] : "";
+    }
+    easeSel.onchange = () => {
+        const { sh, keys } = easeTargets();
+        if (!sh || !keys.length || !EASES.includes(easeSel.value)) return;
+        const eases = (sh.keyframe_ease ||= {});
+        for (const k of keys) eases[k] = easeSel.value;
+        persist(); recordHistory(); render();
+        refreshEaseSel();
     };
 
     function addKeyframeHere() {
@@ -2263,6 +2387,7 @@ function buildEditor(node) {
     // positions abort the move (cheaper than a confirm dialog and
     // matches NLE behaviour).
     function renderTimelineKeyframes() {
+        refreshEaseSel();
         keyframeStrip.querySelectorAll(".bat-kf").forEach(el => el.remove());
         // Also wipe any minimap dots from the range strip — we rebuild
         // them in lockstep so the artist sees keyframe positions at
@@ -2443,14 +2568,22 @@ function buildEditor(node) {
                 // Apply: pull selected payloads aside, delete originals,
                 // write to new positions. Two-phase so we don't trample
                 // ourselves when keyframes shift into each other's slots.
+                // A key's ease travels with it (persist() would otherwise
+                // prune it as belonging to a frame that has no key any more).
                 const stash = new Map();
+                const easeStash = new Map();
                 for (const [sf,] of moves) {
                     stash.set(sf, sh.keyframes[String(sf)]);
                     delete sh.keyframes[String(sf)];
+                    if (sh.keyframe_ease?.[String(sf)] !== undefined) {
+                        easeStash.set(sf, sh.keyframe_ease[String(sf)]);
+                        delete sh.keyframe_ease[String(sf)];
+                    }
                 }
                 state.kfSelection = new Set();
                 for (const [sf, nf] of moves) {
                     sh.keyframes[String(nf)] = stash.get(sf);
+                    if (easeStash.has(sf)) (sh.keyframe_ease ||= {})[String(nf)] = easeStash.get(sf);
                     state.kfSelection.add(nf);
                 }
                 drag = null;
@@ -2964,13 +3097,11 @@ function buildEditor(node) {
         state.viewStart = 0;
         state.viewEnd = Math.max(0, state.frameCount - 1);
         hint.style.display = state.previewFrames.length ? "none" : "block";
-        // Persist image dimensions inside the state JSON so shape
-        // positions render at correct relative scale on workflow reload
-        // even on a different machine where the localStorage cache is
-        // absent. Cheap (two integers) and ships with the workflow.
-        state.doc.imgW = w; state.doc.imgH = h;
-        state.doc.frameCount = state.frameCount;
-        persist();
+        // Remember the plate's size and length so shape positions render at
+        // the right relative scale on a workflow reload, even on a machine
+        // with no localStorage cache. In node.properties — see readPlate().
+        try { (node.properties ||= {})[PLATE_PROP] = { w, h, frameCount: state.frameCount }; }
+        catch (_) { /* properties frozen: the next run will say it again */ }
         // Cache the first frame's thumbnail locally so the next time
         // this workflow opens on THIS machine the canvas already shows
         // something instead of black-and-waiting-for-Run.
@@ -2986,17 +3117,18 @@ function buildEditor(node) {
 
     // ── restore from cache on init ──────────────────────────────────
     // Two layers of restoration when no Run has happened yet:
-    //   1. state.doc.imgW/imgH (shipped with the workflow JSON) —
-    //      ensures shape positions are at the correct relative scale.
+    //   1. the plate size / length (shipped with the workflow JSON, see
+    //      readPlate) — ensures shape positions are at the correct scale.
     //   2. localStorage thumb (per-machine) — gives a visible bg too.
     function _restoreCachedPreview() {
-        // 1) dimensions from the workflow state.
-        if (state.doc.imgW && state.doc.imgH) {
-            state.imgW = state.doc.imgW;
-            state.imgH = state.doc.imgH;
+        // 1) dimensions from the workflow.
+        const plate = readPlate();
+        if (plate.w && plate.h) {
+            state.imgW = plate.w;
+            state.imgH = plate.h;
         }
-        if (state.doc.frameCount) {
-            state.frameCount = Math.max(1, state.doc.frameCount | 0);
+        if (plate.frameCount) {
+            state.frameCount = Math.max(1, plate.frameCount | 0);
             // Default the viewport to the full range when restoring
             // from a workflow load; we don't persist the viewport
             // because it's a UI preference, not a creative decision.
@@ -3035,7 +3167,9 @@ function buildEditor(node) {
     // below will re-paint with the cached bg + dimensions if we have
     // them; otherwise render() runs against the empty canvas.
     refreshSidebar();
+    quietHistory = true;
     recordHistory();   // seed entry so the first user action has a target to undo to.
+    quietHistory = false;
     // Tracked so the observer, the playback interval and the retained preview
     // frames are all released when the node is deleted (see bat_lifecycle).
     const track = batTrack(node);
@@ -3054,7 +3188,9 @@ function buildEditor(node) {
 
     // Display-only zoom control (bottom-left of the canvas). Lets the artist
     // pull back to see and roto shapes that extend past the frame edge.
-    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl" });
+    // `scope: root` — root is what takes focus on a canvas click, so it is what
+    // the Nodes 2.0 wheel exemption has to be declared on.
+    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl", scope: root });
 
     _restoreCachedPreview();
 
@@ -3087,16 +3223,19 @@ function buildEditor(node) {
         // back to "blank" would surprise the artist on reload.
         history.snapshots = [];
         history.pointer = -1;
+        quietHistory = true;
         recordHistory();
+        quietHistory = false;
         // If the persisted state carries image dimensions, lift them
         // over to runtime so positions render at correct scale even
         // before Run. (Cached-thumb restore is fired separately below.)
-        if (state.doc.imgW && state.doc.imgH) {
-            state.imgW = state.doc.imgW;
-            state.imgH = state.doc.imgH;
+        const plate = readPlate();
+        if (plate.w && plate.h) {
+            state.imgW = plate.w;
+            state.imgH = plate.h;
         }
-        if (state.doc.frameCount) {
-            state.frameCount = Math.max(1, state.doc.frameCount | 0);
+        if (plate.frameCount) {
+            state.frameCount = Math.max(1, plate.frameCount | 0);
         }
         // Reset the viewport on a workflow reload — viewport state
         // is a UI preference, not persisted, so we always come back

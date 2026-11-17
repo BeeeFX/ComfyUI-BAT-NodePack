@@ -119,6 +119,16 @@ def test_convert(bc):
     check("2.5 dec1 pad4 pads whole part only",
           n.to_string(2.5, 1, 4) == ("0002.5",))
     check("int stays int-shaped", n.to_string(5, -1, 0) == ("5",))
+    # Past 2**53 a float cannot hold every integer; seeds live up there.
+    check("a 64-bit seed keeps every digit",
+          n.to_string(123456789012345678, -1, 0) == ("123456789012345678",),
+          str(n.to_string(123456789012345678, -1, 0)))
+    check("2**63-1 keeps every digit",
+          n.to_string(2 ** 63 - 1, -1, 0) == (str(2 ** 63 - 1),))
+    check("an int string keeps every digit",
+          n.to_string("18446744073709551615", -1, 0) == ("18446744073709551615",))
+    check("int with decimals -> '42.00'", n.to_string(42, 2, 0) == ("42.00",))
+    check("bool still formats as 1", n.to_string(True, -1, 0) == ("1",))
 
 
 # ─── 3. logic ────────────────────────────────────────────────────────────────
@@ -137,6 +147,24 @@ def test_logic(bl):
     c = bl.BatCompare()
     check("5 > 3", c.compare(5, 3, "a > b") == (True,))
     check("a > 0 ignores b", c.compare(5, None, "a > 0") == (True,))
+    try:
+        import torch
+    except ImportError:
+        torch = None
+    if torch is not None:
+        x = torch.zeros(2, 4, 4, 3)
+        check("two equal IMAGEs compare equal",
+              c.compare(x, x.clone(), "a == b") == (True,))
+        check("different values are not equal",
+              c.compare(x, x + 1, "a == b") == (False,))
+        check("different shapes are not equal (no broadcast error)",
+              c.compare(x, x[:1], "a != b") == (True,))
+        try:
+            c.compare(x, None, "a > 0")
+            check("ordering a batch raises", False, "no error raised")
+        except TypeError as e:
+            check("ordering a batch raises a readable TypeError",
+                  "truth value" in str(e), str(e))
 
     check("Bat_IndexSwitch exposes 10 branches", bl.MAX_BRANCHES == 10,
           "easy-use's index widget allowed 0-9")
@@ -145,14 +173,26 @@ def test_logic(bl):
     check("every branch input is lazy",
           all(v[1].get("lazy") for v in opt.values()),
           "without lazy, all branches execute and all but one are discarded")
+    # A wired-but-unevaluated input arrives as None; an unwired one is absent.
     check("only the selected branch is requested",
-          s.check_lazy_status(index=3) == ["value3"])
+          s.check_lazy_status(index=3, value0=None, value3=None) == ["value3"])
+    check("an unwired selected branch is NOT requested",
+          s.check_lazy_status(index=3, value0=None) == [],
+          "the executor raises NodeInputError for an input with no link")
+    check("an evaluated branch is not requested again",
+          s.check_lazy_status(index=3, value3="x") == [])
     check("branch 9 is selectable", s.switch(index=9, value9="nine") == ("nine",))
     try:
-        s.switch(index=2, value2=None)
+        s.switch(index=2, value0="zero")
         check("unwired branch raises", False, "no error raised")
     except ValueError as e:
-        check("unwired branch names the input", "value2" in str(e))
+        check("unwired branch names the input", "value2" in str(e)
+              and "out of range" not in str(e), str(e))
+    try:
+        s.switch(index=2, value2=None)
+        check("a None branch raises", False, "no error raised")
+    except ValueError as e:
+        check("a None branch names the input", "value2" in str(e))
 
 
 def test_lists(bl):
@@ -168,6 +208,13 @@ def test_lists(bl):
         check("out-of-range index explains itself", "out of range" in str(e))
     check("join lists", B.join([1, 2], [3]) == ([1, 2, 3],))
     check("join passes through a missing side", B.join(None, [9]) == ([9],))
+
+    # The executor hands an INPUT_IS_LIST node the whole ComfyUI list at once
+    # (and a plain output as a list of one).
+    LL = bl.BatListLengthList
+    check("List Length (list) takes the whole list", LL.INPUT_IS_LIST is True)
+    check("15 tiles count as 15", LL().length(["tile"] * 15) == (15,))
+    check("a single batch counts as 1", LL().length([[1, 2, 3]]) == (1,))
 
     try:
         import torch
@@ -198,7 +245,10 @@ def test_show(bs):
               "a dead-end readout never executes otherwise")
         inst = cls()
         check(f"{name} enabled -> requests its input",
-              inst.check_lazy_status(enabled=True) == ["value"])
+              inst.check_lazy_status(enabled=True, value=None) == ["value"])
+        check(f"{name} enabled but unwired -> requests nothing",
+              inst.check_lazy_status(enabled=True) == [],
+              "requesting an unwired input fails the whole prompt")
         check(f"{name} disabled -> requests nothing",
               inst.check_lazy_status(enabled=False) == [],
               "this is the only thing that keeps a parked readout from "
@@ -310,6 +360,10 @@ def test_show_js():
     from _harness import auto_stub_js, strip_modules
 
     src = open(os.path.join(PACK, "web", "bat_show.js"), encoding="utf-8").read()
+    # The undo replay lives in bat_lifecycle.js; load the real one so the test
+    # exercises it rather than a stub.
+    lifecycle = open(os.path.join(PACK, "web", "bat_lifecycle.js"),
+                     encoding="utf-8").read()
     ctx = quickjs.Context()
     ctx.eval(auto_stub_js(src))
     ctx.eval("""
@@ -319,22 +373,35 @@ def test_show_js():
             return __el;
         }};
         var console = {log:function(){}, warn:function(){}, error:function(){}};
+        var setTimeout = function(f){ f(); };
         var __ext = null;
         var app = {registerExtension: function(o){ __ext = o; }};
         function addBatDOMWidget(node, name){ return {name: name}; }
         function refreshBatLayout(){}
     """)
+    ctx.eval(strip_modules(lifecycle))
     ctx.eval(strip_modules(src))
 
     check("extension registers", ctx.eval("__ext && __ext.name") == "BAT.ShowNodes")
 
+    # Mirrors LiteGraph: createNode() runs onNodeCreated while the id is still
+    # -1; LGraph.configure() assigns the real id afterwards, then fires
+    # onAfterGraphConfigured. The old replay looked the id up in
+    # onNodeCreated and so never hit.
     ctx.eval("""
         var proto = {};
         var nodeType = {prototype: proto};
         __ext.beforeRegisterNodeDef(nodeType, {name: "Bat_ShowAny"});
-        var node = Object.create(proto);
-        node.id = 7;
-        node.onNodeCreated();
+        var graph = {id: "g1"};
+        function make(id, g) {
+            var n = Object.create(proto);
+            n.id = -1;
+            n.onNodeCreated();
+            n.id = id; n.graph = g;
+            n.onAfterGraphConfigured && n.onAfterGraphConfigured();
+            return n;
+        }
+        var node = make(7, graph);
     """)
     check("panel starts with a placeholder",
           "not run" in ctx.eval("__el.textContent"))
@@ -343,22 +410,107 @@ def test_show_js():
     check("panel shows the payload", "1920" in ctx.eval("__el.textContent"))
 
     # Undo is a full loadGraphData: the node object is thrown away and rebuilt.
-    ctx.eval("""
-        var node2 = Object.create(proto);
-        node2.id = 7;
-        node2.onNodeCreated();
-    """)
+    ctx.eval("var node2 = make(7, graph);")
     check("payload survives an undo rebuild",
           "1920" in ctx.eval("__el.textContent"),
           "a rebuilt node with the same id must replay its last text")
 
-    ctx.eval("""
-        var other = Object.create(proto);
-        other.id = 99;
-        other.onNodeCreated();
-    """)
+    ctx.eval("var other = make(99, graph);")
     check("an unrelated node does not inherit it",
           "not run" in ctx.eval("__el.textContent"))
+
+    ctx.eval("var elsewhere = make(7, {id: 'g2'});")
+    check("the same id in another workflow does not inherit it",
+          "not run" in ctx.eval("__el.textContent"))
+
+    ctx.eval("""
+        var calcType = {prototype: {}};
+        __ext.beforeRegisterNodeDef(calcType, {name: "Bat_WanContextCalculator"});
+        var calc = Object.create(calcType.prototype);
+        calc.id = -1; calc.onNodeCreated();
+        calc.onExecuted({text: ['WAN sliding-context analysis']});
+    """)
+    check("the context calculator's report is shown too",
+          "sliding-context" in ctx.eval("__el.textContent"))
+
+
+def test_vace_js():
+    print("\nweb/bat_vace.js")
+    try:
+        import quickjs
+    except ImportError:
+        print("  skip  (pip install quickjs)")
+        return
+    sys.path.insert(0, HERE)
+    from _harness import auto_stub_js, strip_modules
+
+    src = open(os.path.join(PACK, "web", "bat_vace.js"), encoding="utf-8").read()
+    ctx = quickjs.Context()
+    ctx.eval(auto_stub_js(src))
+    # `__store` stands in for the frontend's widget value store: Nodes 2.0
+    # renders rows in ITS order (append on add, drop only via removeWidget),
+    # and a same-named re-add re-binds to a surviving entry's value.
+    ctx.eval("""
+        var console = {log:function(){}, warn:function(){}, error:function(){}};
+        var __ext = null;
+        var app = {registerExtension: function(o){ __ext = o; }};
+        var __store = [];
+        var __values = {};
+        function makeNode() {
+            var n = Object.create(__proto);
+            n.widgets = []; n.inputs = []; n.properties = {};
+            n.addWidget = function(type, name, value, cb) {
+                var w = {type: type, name: name, callback: cb};
+                w.value = (name in __values) ? __values[name] : value;
+                __values[name] = w.value;
+                this.widgets.push(w); __store.push(name); return w;
+            };
+            n.removeWidget = function(w) {
+                this.widgets.splice(this.widgets.indexOf(w), 1);
+                __store.splice(__store.indexOf(w.name), 1);
+                delete __values[w.name];
+            };
+            n.addInput = function(name){ this.inputs.push({name: name}); };
+            n.findInputSlot = function(name){
+                for (var i = 0; i < this.inputs.length; i++)
+                    if (this.inputs[i].name === name) return i;
+                return -1;
+            };
+            n.removeInput = function(i){ this.inputs.splice(i, 1); };
+            n.computeSize = function(){ return [1, 1]; };
+            n.setSize = function(){}; n.setDirtyCanvas = function(){};
+            return n;
+        }
+        function names(list) { return JSON.stringify(list); }
+    """)
+    ctx.eval(strip_modules(src))
+    ctx.eval("""
+        var __proto = {};
+        __ext.beforeRegisterNodeDef({prototype: __proto}, {name: "Bat_VaceBatchTool"});
+        var node = makeNode();
+        node.onNodeCreated();
+        function click(label) {
+            for (var i = 0; i < node.widgets.length; i++)
+                if (node.widgets[i].name === label) return node.widgets[i].callback();
+        }
+        click("+ Keyframe"); click("+ Keyframe");
+    """)
+    want = '["index_1","index_2","+ Keyframe","\u2212 Keyframe"]'
+    check("canvas order: index rows above the buttons",
+          ctx.eval("names(node.widgets.map(function(w){return w.name;}))") == want,
+          ctx.eval("names(node.widgets.map(function(w){return w.name;}))"))
+    check("store (Nodes 2.0) order: index rows above the buttons",
+          ctx.eval("names(__store)") == want, ctx.eval("names(__store)"))
+    ctx.eval("""
+        node.widgets[1].value = 40; __values["index_2"] = 40;
+        click("\u2212 Keyframe"); click("+ Keyframe");
+    """)
+    check("a removed row leaves no store entry behind, so re-adding starts at 0",
+          ctx.eval("node.widgets[1].value") == 0,
+          f"got {ctx.eval('node.widgets[1].value')}")
+    check("inputs follow the rows",
+          ctx.eval("names(node.inputs.map(function(i){return i.name;}))")
+          == '["image_1","mask_1","image_2","mask_2"]')
 
 
 def _find_qwen_config():
@@ -477,6 +629,139 @@ def test_qwen_migration():
     check("a seed socket is found by name when present", ctx.eval("__seed2") == 2)
 
 
+# ─── 3b. frame-count formatting ──────────────────────────────────────────────
+
+def test_batch_formats():
+    print("\nbatch format / WAN helpers")
+    try:
+        import torch
+    except ImportError:
+        print("  skip  (no torch)")
+        return
+    bf = importlib.import_module("batpkg.bat_batch_format")
+    wb = importlib.import_module("batpkg.bat_wan_batch_format")
+    wc = importlib.import_module("batpkg.bat_wan_context_calculator")
+
+    # These nodes pad but never trim: round_up off must not land below the input.
+    for n in (30, 83):
+        o = bf.BatBatchFormat().format("WAN (4k+1)", "nearest_compatible",
+                                       "repeat_edge", "end", 81, 0, False, 0.5,
+                                       image=torch.zeros(n, 4, 4, 3))
+        check(f"Batch Format round_up off: {n} lands on the grid",
+              o[5] >= n and (o[5] - 1) % 4 == 0, f"got {o[5]}")
+    o = bf.BatBatchFormat().format("WAN (4k+1)", "nearest_compatible",
+                                   "repeat_edge", "end", 81, 7, False, 0.5,
+                                   image=torch.zeros(24, 4, 4, 3))
+    check("round_up off still honours 'nearest' above the input (24+7 -> 29)",
+          o[5] == 29, f"got {o[5]}")
+
+    fmt = wb.VoltWanBatchFormat()
+    for n in (83, 100):
+        o = fmt.format("nearest_wan_compatible", "repeat_edge", "end", 81, 0,
+                       81, 16, True, False, 0.5, image=torch.zeros(n, 4, 4, 3))
+        check(f"WAN Batch Format round_up off: {n} lands on the grid",
+              o[6] >= n and (o[6] - 1) % 4 == 0, f"got {o[6]}")
+    for n, want in ((33, 33), (49, 49), (30, 33), (77, 77)):
+        o = fmt.format("nearest_wan_compatible", "wan_inpaint_grey", "end", 81,
+                       0, 81, 16, True, True, 0.5, image=torch.zeros(n, 4, 4, 3))
+        check(f"a {n}-frame clip inside one window -> {want}", o[6] == want,
+              f"got {o[6]}")
+    o = fmt.format("nearest_wan_compatible", "wan_inpaint_grey", "end", 81, 0,
+                   81, 16, True, True, 0.5, image=torch.zeros(81, 720, 1280, 3))
+    check("81 frames + ref still snaps to a clean 2-window length", o[6] == 145,
+          f"got {o[6]}")
+    viz = o[3]
+    check("window viz is small, not plate-sized",
+          max(viz.shape[1], viz.shape[2]) <= 128 and viz.shape[0] == 145,
+          str(tuple(viz.shape)))
+    check("window viz keeps the plate aspect",
+          abs(viz.shape[2] / viz.shape[1] - 1280 / 720) < 0.05,
+          str(tuple(viz.shape)))
+
+    out = wc.VoltWanContextCalculator().analyze(101, 81, 4, 16, True,
+                                                "balanced", True)
+    check("context calculator puts its report on the node",
+          isinstance(out, dict) and out["ui"]["text"][0] == out["result"][0]
+          and "sliding-context" in out["result"][0])
+    check("context calculator keeps its six outputs", len(out["result"]) == 6)
+
+
+def test_vace():
+    print("\nVACE batch tool")
+    try:
+        import torch
+    except ImportError:
+        print("  skip  (no torch)")
+        return
+    vb = importlib.import_module("batpkg.bat_vace_batch")
+    clip = torch.rand(5, 8, 8, 3)
+    img, msk = vb.VaceBatchTool().build(81, False, 127, image_1=clip, index_1=10)
+    check("a 5-frame keyframe clip fills frames 10..14",
+          all(torch.allclose(img[10 + i], clip[i]) for i in range(5))
+          and float(msk[10:15].max()) == 0.0)
+    check("...and nothing past it", float(msk[15].min()) == 1.0)
+    img, msk = vb.VaceBatchTool().build(12, False, 127, image_1=clip, index_1=10)
+    check("a clip running past num_frames is clipped, not an error",
+          img.shape[0] == 12 and torch.allclose(img[11], clip[1]))
+    one = torch.rand(1, 8, 8, 3)
+    img, msk = vb.VaceBatchTool().build(81, False, 127, image_1=one, index_1=40)
+    check("a single-frame keyframe still lands on its index",
+          torch.allclose(img[40], one[0]) and float(msk[40].max()) == 0.0
+          and float(msk[41].min()) == 1.0)
+
+    # A plate with no mask used to be premultiplied to flat grey — gone.
+    plate = torch.rand(81, 8, 8, 3) * 0.5 + 0.25
+    img, msk = vb.VaceBatchTool().build(81, True, 127, plate_image=plate)
+    check("a plate without a mask keeps its pixels under premultiply",
+          torch.allclose(img, plate) and float(msk.min()) == 1.0)
+    km = torch.zeros(1, 8, 8)
+    km[0, :4] = 1.0
+    img, msk = vb.VaceBatchTool().build(81, True, 127, plate_image=plate,
+                                        mask_1=km, index_1=20)
+    check("...but a keyframe mask on it is still premultiplied",
+          torch.allclose(img[20, :4], torch.full((4, 8, 3), 127 / 255))
+          and torch.allclose(img[20, 4:], plate[20, 4:])
+          and torch.allclose(img[21], plate[21]))
+    pm = torch.zeros(81, 8, 8)
+    pm[:, :, :4] = 1.0
+    img, msk = vb.VaceBatchTool().build(81, True, 127, plate_image=plate, plate_mask=pm)
+    check("a plate WITH a mask premultiplies exactly as before",
+          torch.allclose(img[..., :4, :], torch.full((81, 8, 4, 3), 127 / 255))
+          and torch.allclose(img[..., 4:, :], plate[..., 4:, :]))
+    img, _ = vb.VaceBatchTool().build(81, False, 127, plate_image=plate)
+    check("premultiply off is unchanged", torch.allclose(img, plate))
+
+
+def test_ref_aligner():
+    print("\nref aligner preview sidecar")
+    try:
+        import torch
+    except ImportError:
+        print("  skip  (no torch)")
+        return
+    import tempfile
+    ui_ref = importlib.import_module("batpkg.bat_ui_ref")
+    ra = importlib.import_module("batpkg.bat_ref_aligner")
+    tmp = tempfile.mkdtemp(prefix="bat_ui_ref_")
+    orig = ui_ref._sidecar_dir
+    ui_ref._sidecar_dir = lambda: tmp
+    try:
+        out = ra.RefAligner().align(torch.rand(1, 32, 48, 3), torch.rand(1, 20, 20, 3),
+                                    0, 0, 1.0, 0.0, "edge_pixel", "128,128,128")
+        ui = out["ui"]
+        check("the base64 previews stay out of the history",
+              set(ui) == {"bat_ui"}, str(sorted(ui)))
+        full = ui_ref.load_ui(ui)
+        check("...and resolve to the dict the editor always got",
+              full is not None and full["plate_w"] == [48] and full["ref_h"] == [20]
+              and full["plate"][0] and full["reference"][0])
+        check("outputs unchanged in shape",
+              tuple(out["result"][0].shape) == (1, 32, 48, 3)
+              and tuple(out["result"][1].shape) == (1, 32, 48))
+    finally:
+        ui_ref._sidecar_dir = orig
+
+
 def main():
     bc, bl, bs = load_pack_modules()
     test_registration()
@@ -484,8 +769,12 @@ def main():
     test_logic(bl)
     test_lists(bl)
     test_show(bs)
+    test_batch_formats()
+    test_vace()
+    test_ref_aligner()
     test_migrations()
     test_show_js()
+    test_vace_js()
     test_qwen_migration()
 
     print()

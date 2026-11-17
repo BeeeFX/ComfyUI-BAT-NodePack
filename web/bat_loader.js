@@ -21,7 +21,7 @@
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { makeBatPathWidget } from "./bat_path_widget.js";
+import { installBatPathWidget, makeBatPathWidget } from "./bat_path_widget.js";
 
 const NODE_TYPE = "Bat_Loader";
 const PATH_ROUTE = "/bat/getpath";
@@ -40,7 +40,7 @@ async function scanPath(node) {
     const pathW = node.widgets?.find((w) => w.name === "path");
     if (!pathW) return;
     const value = (pathW.value || "").trim();
-    if (!value) { node._batScan = null; node.setDirtyCanvas(true, true); return; }
+    if (!value) { node._batScan = null; redrawSummary(node, pathW); return; }
 
     // Same supersede guard the video loader uses: a slow answer for a path the
     // artist has already replaced must not overwrite the newer one's summary.
@@ -58,7 +58,7 @@ async function scanPath(node) {
         const info = await r.json();
         if (seq !== node._batScanSeq || (pathW.value || "").trim() !== pathAtRequest) return;
         node._batScan = info;
-        node.setDirtyCanvas(true, true);
+        redrawSummary(node, pathW);
     } catch (e) {
         if (e && e.name === "AbortError") return;      // expected on supersede
         console.warn("[Bat] loader-scan failed:", e);
@@ -68,6 +68,14 @@ async function scanPath(node) {
 }
 
 const scanDebounced = debounce(scanPath, 220);
+
+/** Repaint the summary in whichever renderer is drawing it. */
+function redrawSummary(node, pathW) {
+    node.setDirtyCanvas(true, true);
+    // Nodes 2.0 draws it inside the path widget's own canvas, which repaints
+    // only on triggerDraw (WidgetLegacy.vue) — setDirtyCanvas doesn't reach it.
+    pathW?.triggerDraw?.();
+}
 
 /** One line of plain English about what the path points at. */
 function summarise(info) {
@@ -99,12 +107,16 @@ app.registerExtension({
             if (pathIdx >= 0) {
                 const orig = this.widgets[pathIdx];
                 const opts = (nodeData.input?.required?.path || [])[1] || {};
+                const node = this;
                 const path = makeBatPathWidget({
                     name: "path", value: orig.value || "", options: opts,
                     route: PATH_ROUTE, title: "Media Path",
+                    // Nodes 2.0's home for the summary line; 1.0 keeps
+                    // painting it in onDrawForeground below.
+                    subtitle: () => summarise(node._batScan),
                 });
                 path.callback = () => scanPath(this);
-                this.widgets[pathIdx] = path;
+                installBatPathWidget(this, pathIdx, path);
             }
 
             return r;

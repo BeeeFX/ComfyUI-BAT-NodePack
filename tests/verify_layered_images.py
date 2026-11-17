@@ -119,6 +119,20 @@ function _composite(payload) {
     const r = compositeStack(layers, j.settings, j.w, j.h, j.clamp);
     return JSON.stringify({out: Array.from(r.out), alpha: Array.from(r.alpha)});
 }
+
+function _paint(payload) {
+    const j = JSON.parse(payload);
+    const layers = j.layers.map(l => ({
+        data: Float32Array.from(l.data),
+        mask: l.mask ? Float32Array.from(l.mask) : null,
+    }));
+    const r = compositeStack(layers, j.settings, j.w, j.h, j.clamp);
+    const px = paintLayered({view: j.view, layers, out: r.out, alpha: r.alpha,
+                             w: j.w, h: j.h});
+    const rgb = [];
+    for (let i = 0; i < px.length; i += 4) rgb.push(px[i], px[i + 1], px[i + 2]);
+    return JSON.stringify(rgb);
+}
 """
 
 
@@ -202,13 +216,25 @@ def worker_parses():
     """Parse the layered worker with its imports stubbed."""
     import quickjs
     ctx = quickjs.Context()
-    ctx.eval("var self = {postMessage: function(){}};"
+    ctx.eval("function WorkerGlobalScope() {}"
+             "var self = new WorkerGlobalScope(); self.postMessage = function(){};"
              "var performance = {now: function(){ return 0; }};")
     ctx.eval(_plain("bat_blend_modes.js"))
     ctx.eval(_plain("bat_layered_core.js"))
     ctx.eval(_plain("bat_layered_worker.js"))
     ctx.eval("if (typeof self.onmessage !== 'function') "
              "throw new Error('worker did not install onmessage');")
+
+    # The main page imports this file too (ComfyUI's /extensions route globs
+    # every .js), and there `self` is `window`: it must leave onmessage alone.
+    page = quickjs.Context()
+    page.eval("var self = {postMessage: function(){}, onmessage: 'page handler'};"
+              "var performance = {now: function(){ return 0; }};")
+    page.eval(_plain("bat_blend_modes.js"))
+    page.eval(_plain("bat_layered_core.js"))
+    page.eval(_plain("bat_layered_worker.js"))
+    page.eval("if (self.onmessage !== 'page handler') "
+              "throw new Error('worker clobbered the page onmessage');")
 
 
 def extension_parses():
@@ -264,6 +290,81 @@ def extension_parses():
         }
     })();
     """)
+    return ctx
+
+
+LAYER_STATE_DRIVER = r"""
+function _readState(text, count, slotsJson) {
+    const node = {widgets: [{name: "layers", value: text}]};
+    return JSON.stringify(readLayerState(node, count, JSON.parse(slotsJson)));
+}
+function _writeState(text, settingsJson, slotsJson) {
+    const node = {widgets: [{name: "layers", value: text}]};
+    writeLayerState(node, JSON.parse(settingsJson), JSON.parse(slotsJson));
+    return node.widgets[0].value;
+}
+"""
+
+
+def layer_state_checks(ctx, m):
+    """Slot-keyed layer settings, and the older positional format.
+
+    Settings used to be matched to layers by position among the CONNECTED ones,
+    so unwiring image_2 of three handed layer 2's mode to image_3. Entries now
+    carry their slot; one without is the old format and must load exactly as it
+    always did, which with no gap is also what the slot lookup gives.
+    """
+    ctx.eval(LAYER_STATE_DRIVER)
+    # The editor harness stubs MODES down to ["normal"]; widen it in place to
+    # the real list, or every mode below would read back as the default.
+    ctx.eval(f"MODES.splice(0, MODES.length, ...{json.dumps(list(m.MODES))});")
+    _r, _w = ctx.get("_readState"), ctx.get("_writeState")
+    # quickjs takes scalars only, so the lists cross as JSON.
+    def js_read(text, count, slots):
+        return _r(text, count, json.dumps(slots))
+
+    def js_write(text, settings, slots):
+        return _w(text, json.dumps(settings), json.dumps(slots))
+
+    def both(text, count, slots):
+        py = m.parse_layers(text, count, slots)
+        js = json.loads(js_read(text, count, slots))
+        assert py == js, (text, slots, py, js)
+        return py
+
+    legacy = json.dumps({"layers": [{"mode": "normal"}, {"mode": "multiply"},
+                                    {"mode": "screen", "opacity": 0.5}]})
+    # Old format, no gap: unchanged, whatever the slots.
+    got = both(legacy, 3, [1, 2, 3])
+    assert [g["mode"] for g in got] == ["normal", "multiply", "screen"], got
+    # Old format with a gap still reads by position — that is what it meant.
+    got = both(legacy, 2, [1, 3])
+    assert [g["mode"] for g in got] == ["normal", "multiply"], got
+
+    keyed = json.dumps({"layers": [{"slot": 1, "mode": "normal"},
+                                   {"slot": 2, "mode": "multiply"},
+                                   {"slot": 3, "mode": "screen", "opacity": 0.5}]})
+    # The bug: image_2 unwired. image_3 must keep screen, not inherit multiply.
+    got = both(keyed, 2, [1, 3])
+    assert [g["mode"] for g in got] == ["normal", "screen"], got
+    assert got[1]["opacity"] == 0.5, got
+    # A slot with no entry gets the default; slots omitted -> 1..n.
+    got = both(keyed, 2, [1, 5])
+    assert got[1] == dict(m.DEFAULT_LAYER), got
+    both(keyed, 3, None)
+
+    # Writing: slots recorded, entries for unwired slots kept, legacy dropped.
+    text = js_write(legacy, [{"mode": "normal", "opacity": 1, "enabled": True},
+                             {"mode": "screen", "opacity": 0.5, "enabled": True}],
+                    [1, 3])
+    doc = json.loads(text)["layers"]
+    assert [e["slot"] for e in doc] == [1, 3], doc
+    text = js_write(text, [{"mode": "darken", "opacity": 1, "enabled": False}], [1])
+    doc = json.loads(text)["layers"]
+    assert [(e["slot"], e["mode"]) for e in doc] == [(1, "darken"), (3, "screen")], doc
+    got = both(text, 2, [1, 3])
+    assert [g["mode"] for g in got] == ["darken", "screen"], got
+    assert got[0]["enabled"] is False, got
 
 
 def main():
@@ -276,8 +377,10 @@ def main():
     _load("bat_advanced_blend")
     m = _load("bat_layered_images")
 
-    extension_parses()
+    ext_ctx = extension_parses()
     print("whole-file JS parse + registration: OK")
+    layer_state_checks(ext_ctx, m)
+    print("layer settings: slot-keyed, old positional format loads unchanged: OK")
     worker_parses()
     print("bat_layered_worker.js parses and installs its handler: OK")
     scrub_smoke()
@@ -336,6 +439,16 @@ def main():
             py = modes_py.blend(t_cb_rgb, t_cs_rgb, mode).reshape(-1).numpy()
             js = json.loads(js_modes(json.dumps({"mode": mode, "cb": cb, "cs": cs})))
         check(f"mode[{mode}]", py, js)
+
+    # Divide by a black source: Photoshop's answer (white where there is a
+    # backdrop, black where there is none), not cb / EPS — a 5e5 firefly.
+    t = lambda v: torch.tensor(v, dtype=torch.float32)
+    got = modes_py.blend(t([0.5, 0.0, -0.2, 3.0, 0.5]), t([0.0, 0.0, 0.0, 1e-7, 0.25]),
+                         "divide").tolist()
+    assert got == [1.0, 0.0, 0.0, 1.0, 2.0], got
+    js = json.loads(js_modes(json.dumps({"mode": "divide", "cb": [0.5, 0.0, -0.2, 3.0, 0.5],
+                                         "cs": [0.0, 0.0, 0.0, 1e-7, 0.25]})))
+    assert js == got, js
 
     # ── 2. the composite ─────────────────────────────────────────────────
     torch.manual_seed(19)
@@ -406,6 +519,33 @@ def main():
     if roi_worst:
         failures.append(("render_region", f"delta {roi_worst}"))
 
+    # ── 3b. the full layer must show the view the draft shows ────────────
+    # It is drawn OVER the draft once it lands. Alpha had no server branch and
+    # came back as the RGB result; Solo came back un-premultiplied, so a soft
+    # matte showed full colour wherever it was above zero.
+    js_paint = ctx.get("_paint")
+    use = [all_layers[0], (all_layers[1][0], None), all_layers[2]]
+    payload = {
+        "layers": [{"data": im[0].numpy().reshape(-1).tolist(),
+                    "mask": (None if mk is None
+                             else mk[0, ..., 0].numpy().reshape(-1).tolist())}
+                   for (im, mk) in use],
+        "settings": cfg, "w": W, "h": H, "clamp": False,
+    }
+    view_entry = {"layers": use, "settings": None, "meta": {}}
+    view_worst = 0
+    for view in ("result", "alpha", "layer:0", "layer:1", "layer:2"):
+        py = m.render_region(view_entry, cfg, (0, 0, W, H), W, H, view).astype(np.int32)
+        js = np.asarray(json.loads(js_paint(json.dumps(dict(payload, view=view)))),
+                        dtype=np.int32).reshape(H, W, 3)
+        d = int(np.abs(py - js).max())
+        view_worst = max(view_worst, d)
+        # One code value: float32 against float64 at a rounding boundary.
+        if d > 1:
+            failures.append((f"view[{view}]", f"server vs draft delta {d}"))
+    print(f"server views vs draft (result/alpha/solo): worst delta = {view_worst} "
+          "code value(s)")
+
     # ── 4. layer-state parsing must never throw ──────────────────────────
     for bad in ["", "{", "null", "[]", '{"layers":"nope"}',
                 '{"layers":[{"mode":"nonsense","opacity":"x"}]}',
@@ -421,6 +561,71 @@ def main():
     ok = m.parse_layers('{"layers":[{"mode":"screen","opacity":0.25,"enabled":false}]}', 1)
     assert ok[0] == {"mode": "screen", "opacity": 0.25, "enabled": False}, ok
     print("layer-state parsing survives malformed input and preserves good input: OK")
+
+    # ── 5. the node end to end: a gap, a short mask, several chunks ───────
+    # image_2 unwired, so slot 3 must get ITS settings (screen), not slot 2's.
+    # Six frames crosses a CHUNK_FRAMES boundary, and a two-frame mask has to
+    # hold its last frame for frames 2..5 — the per-chunk mask path must give
+    # exactly what the old whole-batch alignment did.
+    n_fr = m.CHUNK_FRAMES + 2
+    base = torch.rand(n_fr, H, W, 3, generator=torch.Generator().manual_seed(5))
+    top = torch.rand(1, H, W, 3, generator=torch.Generator().manual_seed(6))
+    mk = torch.rand(2, H, W, generator=torch.Generator().manual_seed(7))
+    state = json.dumps({"layers": [{"slot": 1, "mode": "normal"},
+                                   {"slot": 2, "mode": "multiply"},
+                                   {"slot": 3, "mode": "screen", "opacity": 0.7}]})
+    res = m.BatLayeredImages().run(layers=state, image_1=base, image_3=top,
+                                   mask_3=mk, resize_filter="area",
+                                   unique_id="12:5")
+    cfg = [{"mode": "normal", "opacity": 1.0, "enabled": True},
+           {"mode": "screen", "opacity": 0.7, "enabled": True}]
+    for f in range(n_fr):
+        a = mk[min(f, 1)][None, ..., None]
+        want_rgb, want_a = m.composite([(base[f:f + 1], None), (top, a)], cfg)
+        assert torch.allclose(res["result"][0][f:f + 1], want_rgb, atol=1e-6), f
+        assert torch.allclose(res["result"][1][f:f + 1], want_a[..., 0], atol=1e-6), f
+    # The payload now lives in a sidecar (bat_ui_ref.py): the history keeps only
+    # the token, and the JS resolves it back to exactly this dict.
+    assert set(res["ui"]) == {"bat_ui"}, sorted(res["ui"])
+    ui = sys.modules["batpack.bat_ui_ref"].load_ui(res["ui"])
+    assert ui["settings"][0][1]["mode"] == "screen", ui["settings"]
+    assert ui["slots"] == [[1, 3]] and len(ui["tiles"][0]) == 2, sorted(ui)
+    # The subgraph execution id rides along for the full-resolution request,
+    # and the thumbnail a reopened workflow shows is the COMPOSITE.
+    assert ui["node_id"] == ["12:5"], ui.get("node_id")
+    # The full layer renders only for the run whose tiles the client holds; the
+    # id alone is shared by same-numbered nodes in other open workflows, and a
+    # restored thumbnail has no token at all.
+    entry = m._cache_get("12:5")
+    assert m._run_matches(entry, {"node_id": "12:5", "run": ui["run"][0]})
+    for stale in ({"run": "0" * 32}, {}, {"run": ""}):
+        assert not m._run_matches(entry, dict(stale, node_id="12:5")), stale
+    import base64, io
+    from PIL import Image
+    thumb = np.asarray(Image.open(io.BytesIO(base64.b64decode(ui["jpeg_result"][0]))),
+                       dtype=np.float32) / 255.0
+    want = res["result"][0][0].clamp(0, 1).numpy()
+    # The plates are noise, which JPEG cannot hold per pixel — so compare the
+    # means: the composite's, not the bottom layer's (what it used to ship).
+    d_comp = abs(float(thumb.mean()) - float(want.mean()))
+    d_base = abs(float(thumb.mean()) - float(base[0].numpy().mean()))
+    assert thumb.shape == want.shape and d_comp < 0.02 and d_comp < d_base, (d_comp, d_base)
+    print("node run: slot-keyed settings across a gap, short mask held, chunked: OK")
+
+    # Chunks run on ComfyUI's device and fall back to the host for anything it
+    # can't do. "meta" stands in for a failing GPU (the resampler reads a value
+    # back, which meta cannot); the result must be exactly the CPU one.
+    kw = dict(layers=state, image_1=base, image_3=top[:, ::2, ::2], mask_3=mk,
+              resize_filter="bilinear")
+    ref = m.BatLayeredImages().run(**kw)
+    real = m._compute_devices
+    m._compute_devices = lambda fb: (torch.device("meta"), torch.device("cpu"))
+    try:
+        got = m.BatLayeredImages().run(**kw)
+    finally:
+        m._compute_devices = real
+    assert all(torch.equal(g, r) for g, r in zip(got["result"], ref["result"]))
+    print("device fallback reproduces the CPU composite: OK")
 
     for label in sorted(worst):
         if worst[label] > 0.05:

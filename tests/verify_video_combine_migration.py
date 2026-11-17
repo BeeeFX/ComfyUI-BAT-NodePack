@@ -87,8 +87,11 @@ var api = {
 };
 var batTrack = function () {};
 var batNodeCacheKey = function () { return "test-key"; };
+// As the real helper: out of the API prompt (options) AND out of
+// widgets_values (widget.serialize). Saves made before the latter still carry
+// the player's "" — PLAYER below.
 var addBatDOMWidget = function (node, name, type, el, opts) {
-    var w = { name: name, type: type, element: el, options: { serialize: false } };
+    var w = { name: name, type: type, element: el, options: { serialize: false }, serialize: false };
     node.widgets.push(w);
     return w;
 };
@@ -142,10 +145,14 @@ function loadWorkflowNode(savedVals) {
     // serialisable widgets, then fire onConfigure with the same info object.
     // The extension patches configure() ahead of this, which is the whole
     // point of the test — the migration has to land before the deal.
+    //
+    // "Serialisable" the way the frontend means it: LGraphNode skips only
+    // `widget.serialize === false` (options.serialize is the API prompt's
+    // flag), so the DOM player takes a slot here just as it does for real.
     node.__baseConfigure = function (info) {
         var vals = info.widgets_values || [];
         var serialisable = this.widgets.filter(function (w) {
-            return w.name && (!w.options || w.options.serialize !== false);
+            return w.name && w.serialize !== false;
         });
         for (var i = 0; i < serialisable.length && i < vals.length; i++) {
             serialisable[i].value = vals[i];
@@ -254,6 +261,14 @@ def check(label, got, want):
         FAILURES.append(label)
 
 
+# The DOM player's value. Until addBatDOMWidget set `widget.serialize = false`
+# the frontend wrote it into widgets_values after the codec entries (it only
+# skips `widget.serialize === false`), so every save from before then ends with
+# it. Leaving it out of these fixtures is what let the "" -> codec-slot bug
+# through; the "new save" case below has none.
+PLAYER = ""
+
+
 def load(ctx, key, saved):
     ctx.eval(f"run({json.dumps(key)}, {json.dumps(saved)})")
     pump(ctx)
@@ -278,7 +293,7 @@ def main():
     #    then the codec tail in prores-mov.json order: profile, pix_fmt.
     print("Stable-era workflow (loop_count + pingpong present), ProRes:")
     v = load(ctx, "prores", [25.0, 0, "SHOT_010_comp", "video/prores-mov",
-                             False, False, "4444", "yuva444p10le"])
+                             False, False, "4444", "yuva444p10le", PLAYER])
     check("frame_rate", v.get("frame_rate"), 25.0)
     check("filename_prefix", v.get("filename_prefix"), "SHOT_010_comp")
     check("format", v.get("format"), "video/prores-mov")
@@ -294,7 +309,7 @@ def main():
     # ── Same vintage, h264, non-default loop_count/pingpong and save_output on.
     print("\nStable-era workflow, h264, pingpong on:")
     v = load(ctx, "h264", [24.0, 3, "BatVideo", "video/h264-mp4",
-                           True, True, 12, "yuv420p", "slow"])
+                           True, True, 12, "yuv420p", "slow", PLAYER])
     check("frame_rate", v.get("frame_rate"), 24.0)
     check("filename_prefix", v.get("filename_prefix"), "BatVideo")
     check("format", v.get("format"), "video/h264-mp4")
@@ -305,7 +320,8 @@ def main():
     # ── A workflow saved by the CURRENT layout must be untouched.
     print("\nCurrent-layout workflow, EXR sequence:")
     v = load(ctx, "exr", [48.0, "SHOT_020_lin", "image/exr-sequence", True,
-                          "gbrapf32le", "dwaa", "true", "32f", "FLOAT", 45, "dwaa"])
+                          "gbrapf32le", "dwaa", "true", "32f", "FLOAT", 45, "dwaa",
+                          PLAYER])
     check("frame_rate", v.get("frame_rate"), 48.0)
     check("filename_prefix", v.get("filename_prefix"), "SHOT_020_lin")
     check("format", v.get("format"), "image/exr-sequence")
@@ -315,9 +331,39 @@ def main():
     # ── A format that no longer exists must not stick on the combo, but the
     #    widgets around it must still land on the right names.
     print("\nStable-era workflow naming a dropped format (av1-webm):")
-    v = load(ctx, "gone", [24.0, 0, "OLD_SHOT", "video/av1-webm", False, True, 30])
+    v = load(ctx, "gone", [24.0, 0, "OLD_SHOT", "video/av1-webm", False, True, 30,
+                           PLAYER])
     check("filename_prefix still migrated", v.get("filename_prefix"), "OLD_SHOT")
     check("format falls back to the declared default", v.get("format"), "video/h264-mp4")
+
+    # ── Stable-era arrays whose format has had knobs appended since. The
+    #    player's "" lands in the first appended knob's slot; it must read as
+    #    "not saved" so the knob is recovered from the saved pix_fmt instead of
+    #    defaulting and re-deriving the pixel format underneath the artist.
+    print("\nStable-era codec tails followed by the player's value:")
+    for key, fmt, tail, want in [
+        ("h264-10", "video/h264-mp4", [16, "yuv420p10le", "fast"],
+         {"bit_depth": "10", "pix_fmt": "yuv420p10le"}),
+        ("h265-8", "video/h265-mp4", [22, "yuv420p", "medium"],
+         {"bit_depth": "8", "pix_fmt": "yuv420p"}),
+        ("vp9-alpha", "video/vp9-webm", [30, "yuva420p"],
+         {"alpha": True, "pix_fmt": "yuva420p"}),
+        ("ffv1-422", "video/ffv1-mkv", ["16", "yuv422p10le"],
+         {"layout": "yuv422", "bit_depth": "10", "pix_fmt": "yuv422p10le"}),
+        ("png-rgba", "image/png-sequence", ["rgba"],
+         {"alpha": True, "bit_depth": "8", "pix_fmt": "rgba"}),
+    ]:
+        v = load(ctx, key, [24.0, 0, "B", fmt, False, True] + tail + [PLAYER])
+        for name, value in want.items():
+            check(f"{key}: {name}", v.get(name), value)
+
+    # ── A save made now: no player slot at all.
+    print("\nCurrent save without the player's value:")
+    v = load(ctx, "new-h265", [24.0, "B", "video/h265-mp4", True, 20, "yuv420p", "slow", "8"])
+    check("crf", v.get("crf"), 20)
+    check("preset", v.get("preset"), "slow")
+    check("bit_depth", v.get("bit_depth"), "8")
+    check("pix_fmt", v.get("pix_fmt"), "yuv420p")
 
     # ── An array from no known layout must be left alone, not scrambled.
     print("\nUnrecognisable widgets_values:")

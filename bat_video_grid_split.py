@@ -1,6 +1,64 @@
 import math
 import torch
 
+
+def grid_tile_rects(h, w, rows, columns, overlap):
+    """(y1, y2, x1, x2) of every tile of the grid, row-major.
+
+    The one place the tile geometry lives: 🦇 Video Grid Split cuts with it and
+    🦇 Grid Merge (bat_grid_merge.py) reassembles with it, so the two can never
+    disagree about where a tile came from.
+    """
+    # 1. Calculate the Base Tile Size
+    base_tile_h = h / rows
+    base_tile_w = w / columns
+
+    # 2. Calculate the Actual Tile Size (Base + Overlap)
+    #    ceil, not int(): truncating dropped the last pixel row/column on
+    #    any size that doesn't divide evenly (e.g. h=1081, rows=3 lost a
+    #    row), leaving a seam when the tiles were recombined.
+    tile_h = min(h, math.ceil(base_tile_h * (1 + overlap)))
+    tile_w = min(w, math.ceil(base_tile_w * (1 + overlap)))
+
+    rects = []
+    for r in range(rows):
+        for col in range(columns):
+            # --- Coordinate Logic ---
+            center_y = (r + 0.5) * base_tile_h
+            center_x = (col + 0.5) * base_tile_w
+
+            y1 = int(center_y - (tile_h / 2))
+            x1 = int(center_x - (tile_w / 2))
+
+            if y1 < 0: y1 = 0
+            if x1 < 0: x1 = 0
+
+            y2 = y1 + tile_h
+            x2 = x1 + tile_w
+
+            if y2 > h:
+                y2 = h
+                y1 = max(0, h - tile_h)
+
+            if x2 > w:
+                x2 = w
+                x1 = max(0, w - tile_w)
+
+            rects.append((y1, y2, x1, x2))
+    return rects
+
+
+def grid_tile_indices(rows, columns, start_index, end_index):
+    """Tile indices a start/end pair selects: [start_index, end), where an
+    end of -1 (or past the grid) means "to the last tile"."""
+    total_tiles = rows * columns
+    if end_index == -1 or end_index > total_tiles:
+        limit_index = total_tiles
+    else:
+        limit_index = end_index
+    return range(start_index, limit_index)
+
+
 class VideoGridSplit:
     @classmethod
     def INPUT_TYPES(s):
@@ -37,71 +95,11 @@ class VideoGridSplit:
                 f"rows/columns."
             )
 
-        # 1. Calculate the Base Tile Size
-        base_tile_h = h / rows
-        base_tile_w = w / columns
-
-        # 2. Calculate the Actual Tile Size (Base + Overlap)
-        #    ceil, not int(): truncating dropped the last pixel row/column on
-        #    any size that doesn't divide evenly (e.g. h=1081, rows=3 lost a
-        #    row), leaving a seam when the tiles were recombined.
-        tile_h = min(h, math.ceil(base_tile_h * (1 + overlap)))
-        tile_w = min(w, math.ceil(base_tile_w * (1 + overlap)))
-        
+        # Tiles are views into the batch — slicing, no copy.
+        rects = grid_tile_rects(h, w, rows, columns, overlap)
         output_list = []
-        
-        # Calculate total theoretical tiles
-        total_tiles = rows * columns
-        
-        # Determine the effective end index
-        # If -1, it means "process until the very last tile"
-        if end_index == -1 or end_index > total_tiles:
-            limit_index = total_tiles
-        else:
-            limit_index = end_index
+        for i in grid_tile_indices(rows, columns, start_index, end_index):
+            y1, y2, x1, x2 = rects[i]
+            output_list.append(images[:, y1:y2, x1:x2, :])
 
-        current_tile_index = 0
-
-        for r in range(rows):
-            for col in range(columns):
-                
-                # LOGIC: Only process if we are within the requested range
-                # range is [start_index, limit_index) -> Inclusive start, Exclusive end
-                if start_index <= current_tile_index < limit_index:
-
-                    # --- Coordinate Logic ---
-                    center_y = (r + 0.5) * base_tile_h
-                    center_x = (col + 0.5) * base_tile_w
-                    
-                    y1 = int(center_y - (tile_h / 2))
-                    x1 = int(center_x - (tile_w / 2))
-                    
-                    if y1 < 0: y1 = 0
-                    if x1 < 0: x1 = 0
-                    
-                    y2 = y1 + tile_h
-                    x2 = x1 + tile_w
-                    
-                    if y2 > h: 
-                        y2 = h
-                        y1 = max(0, h - tile_h)
-                    
-                    if x2 > w: 
-                        x2 = w
-                        x1 = max(0, w - tile_w)
-                    
-                    # Slice and append
-                    tile_batch = images[:, y1:y2, x1:x2, :]
-                    output_list.append(tile_batch)
-                
-                # Increment the counter
-                current_tile_index += 1
-                
-                # Optimization: If we have passed the end index, we can stop the loops entirely
-                if current_tile_index >= limit_index:
-                    break
-            
-            if current_tile_index >= limit_index:
-                break
-                
         return (output_list,)

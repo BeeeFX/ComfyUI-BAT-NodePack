@@ -346,6 +346,102 @@ def main():
                         })))["out"]
                         check("mergeTiles", py_out, js_out)
 
+    # ── 4. the merge lands at the PLATE's exposure ───────────────────────
+    # Regression: the reference pass used to keep k = 1, so a bracket with no
+    # stop on 0 EV (symmetric with an even count, or custom stops) merged at
+    # the reference's exposure — 0.75 stops dark at the default spacing. Every
+    # ALL_EVS prefix above starts at 0, which is why the parity loop could not
+    # see it. The passes here follow `nominal`'s own assumption — LTX kept the
+    # exposure it was shown, so a pass is the plate at 2^ev — plus a little
+    # hallucination, and the merge has to undo exactly that.
+    def exposed_pass(ev, seed):
+        g = torch.Generator().manual_seed(seed)
+        return ((plate_lin + torch.rand(H, W, 3, generator=g) * 0.04)
+                * 2.0 ** ev).unsqueeze(0)
+
+    for evs in ([-0.75, 0.75], [-2.25, -0.75, 0.75, 2.25], [-3.0, -1.5]):
+        got = [(ev, exposed_pass(ev, 200 + i)) for i, ev in enumerate(evs)]
+        js_passes = [{"ev": ev, "lin": img[0].numpy().reshape(-1).tolist()}
+                     for ev, img in got]
+        for align in ("nominal", "auto"):
+            for reference in ("auto", "first"):
+                py_scales = node._alignment(got, plate4, "srgb", align, reference, 0.2)
+                js_scales = json.loads(js_align(json.dumps({
+                    "plate": plate_lin.numpy().reshape(-1).tolist(),
+                    "passes": js_passes, "w": W, "h": H, "mode": "srgb",
+                    "align": align, "reference": reference, "sigma": 0.2,
+                })))
+                check(f"computeAlignment[{align}/{reference}]", py_scales, js_scales)
+                out = node._weighted_merge(got, plate4, "srgb", py_scales, 0.2)
+                ratio = float(out.mean() / plate4.mean())
+                if not 0.98 < ratio < 1.03:
+                    failures.append((f"merge level {evs} {align}/{reference}",
+                                     f"merged/plate = {ratio:.4f}, want ~1.0"))
+
+    # ── 5. chunked alignment == whole-batch alignment ────────────────────
+    # _alignment accumulates its sums per chunk now; the chunk size must not
+    # move the answer beyond float noise.
+    got3 = [(ev, torch.cat([make_pass(ev, 300 + i + 10 * f) for f in range(3)]))
+            for i, ev in enumerate([0.0, -1.5, -3.0])]
+    plate3 = plate4.expand(3, -1, -1, -1)
+    saved = m._CHUNK_BYTES
+    try:
+        whole = node._alignment(got3, plate3, "srgb", "auto", "auto", 0.2)
+        m._CHUNK_BYTES = 1                      # one frame per chunk
+        chunked = node._alignment(got3, plate3, "srgb", "auto", "auto", 0.2)
+    finally:
+        m._CHUNK_BYTES = saved
+    check("alignment chunk-invariant", whole, chunked)
+
+    # ── 6. custom_stops parses identically on both sides ─────────────────
+    # The JS labels the slots from ITS parse, so a string the two disagree on
+    # labels one set of EVs and renders another.
+    for text in ("0, -1.5, -3", "0 -1.5 -3,", "+1 .5 -2.", "1e0 -2E-1",
+                 "0 -1 -2ev", "0 nan -2", "0 inf", "0x10", "1_000", "", "  "):
+        py = m.parse_stops(text)
+        js = json.loads(ctx.eval(f"JSON.stringify(parseStops({json.dumps(text)}))"))
+        if py != js:
+            failures.append((f"parseStops({text!r})", f"py {py} != js {js}"))
+    if m.parse_stops("0 nan -2") is not None:
+        failures.append(("parse_stops rejects nan", str(m.parse_stops("0 nan -2"))))
+
+    # ── 7. HDR Tonal Composite: shared plate work changes nothing ────────
+    # Several hdr_ai versions now share one `_plate_terms` per chunk instead
+    # of recomputing it per version. Each version's outputs must be
+    # bit-identical to compositing it on its own — a version writing into the
+    # shared terms would show up here as the NEXT version changing.
+    torch.manual_seed(5)
+    cplate = torch.rand(3, 40, 56, 3)
+    chdrs = [torch.rand(3, 40, 56, 3) * s for s in (3.0, 6.0, 11.0)]
+    cnode = comp.BatHDRTonalComposite()
+    for cfg in ({}, {"match_scope": "per_frame"},
+                {"detail_transfer": 0.7, "detail_radius": 5, "blur_radius": 2},
+                {"auto_match_mids": False, "linear_out_primaries": "acescg"}):
+        multi = cnode.composite(cplate, chdrs[0], hdr_ai_2=chdrs[1], hdr_ai_3=chdrs[2],
+                                preview_resolution="256", **cfg)["result"]
+        for v, h in enumerate(chdrs):
+            alone = cnode.composite(cplate, h, preview_resolution="256", **cfg)["result"]
+            if not (torch.equal(multi[2 * v], alone[0])
+                    and torch.equal(multi[2 * v + 1], alone[1])):
+                failures.append((f"composite version {v + 1} shared == alone {cfg}",
+                                 "outputs differ"))
+
+    # ── 8. the previews ride the sidecar ─────────────────────────────────
+    # Bracket and merge stash their tiles out of the prompt history; the JS
+    # gets the same dict back through bat_ui_ref, and so does load_ui here.
+    load_ui = sys.modules["batpack.bat_ui_ref"].load_ui
+    bres = m.BatExposureBracket().split(plate4.clamp(0, 1), "srgb", 3, 1.5, "down", "", 0)
+    bui = load_ui(bres["ui"])
+    if "bat_ui" not in bres["ui"] or not bui or "plate_tile" not in bui:
+        failures.append(("bracket ui stashed and resolvable", str(list(bres["ui"]))))
+    pipe = bres["result"][0]
+    mres = m.BatExposureMerge().merge(
+        pipe, "auto", 0.2, "auto",
+        **{f"hdr_{i + 1}": pipe["plate_lin"] * 2.0 ** ev for i, ev in enumerate(pipe["stops"])})
+    mui = load_ui(mres["ui"])
+    if "bat_ui" not in mres["ui"] or not mui or "pass_tiles" not in mui:
+        failures.append(("merge ui stashed and resolvable", str(list(mres["ui"]))))
+
     print(f"{n_align} merge configurations x {len(MODES)} transfer modes")
     print("  (residual = worst error as a fraction of its allowance; "
           "1.00 would be exactly at tolerance)")

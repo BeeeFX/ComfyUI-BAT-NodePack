@@ -102,6 +102,43 @@ def _area_sample(arr: np.ndarray, max_dim: int) -> np.ndarray:
     return np.ascontiguousarray(out, dtype=np.float32)
 
 
+def _decimate_on_device(t, max_dim: int, sample: str):
+    """Shrink an (H, W, 3) torch tensor to fit `max_dim` BEFORE it leaves its
+    device, with the same boxes / sample positions as the numpy samplers above.
+
+    The tile is 256px, but `.cpu()` on the full frame first shipped ~100 MB of
+    float32 per 4K execution across the bus just to throw almost all of it
+    away. The numpy samplers still run afterwards; on an already-small array
+    they are no-ops."""
+    import torch  # noqa: PLC0415 - only reached with a torch tensor in hand
+
+    h, w = t.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return t
+    nh = max(1, int(round(h * max_dim / longest)))
+    nw = max(1, int(round(w * max_dim / longest)))
+    ys = (np.arange(nh) * (h / nh)).astype(np.int64)
+    xs = (np.arange(nw) * (w / nw)).astype(np.int64)
+    if sample != "area" or np.any(np.diff(ys) < 1) or np.any(np.diff(xs) < 1):
+        ys_t = torch.from_numpy(np.minimum(ys, h - 1)).to(t.device)
+        xs_t = torch.from_numpy(np.minimum(xs, w - 1)).to(t.device)
+        return t.index_select(0, ys_t).index_select(1, xs_t)
+    # Exact non-overlapping box average, as _area_sample's reduceat: sum each
+    # row band into its output row, divide by the band height, then columns.
+    t = t.to(torch.float32)
+    row_of = torch.from_numpy(np.repeat(np.arange(nh), np.diff(np.append(ys, h)))).to(t.device)
+    col_of = torch.from_numpy(np.repeat(np.arange(nw), np.diff(np.append(xs, w)))).to(t.device)
+    cy = torch.bincount(row_of, minlength=nh).to(torch.float32)
+    cx = torch.bincount(col_of, minlength=nw).to(torch.float32)
+    rows = torch.zeros((nh, w, t.shape[2]), dtype=torch.float32, device=t.device)
+    rows.index_add_(0, row_of, t)
+    rows /= cy[:, None, None]
+    out = torch.zeros((nh, nw, t.shape[2]), dtype=torch.float32, device=t.device)
+    out.index_add_(1, col_of, rows)
+    return out / cx[None, :, None]
+
+
 def hdr_tile(frame, max_dim: int = HDR_MAX_DIM, sample: str = "point"):
     """Pack one (H, W, C>=3) float frame into the JS-side preview payload.
 
@@ -118,9 +155,10 @@ def hdr_tile(frame, max_dim: int = HDR_MAX_DIM, sample: str = "point"):
     a nearest-neighbour tile just looks aliased.
     """
     try:
-        arr = frame.detach().cpu().numpy()
-        if arr.ndim != 3 or arr.shape[2] < 3:
+        t = frame.detach()
+        if t.ndim != 3 or t.shape[2] < 3:
             return None
+        arr = _decimate_on_device(t[:, :, :3], max_dim, sample).cpu().numpy()
         arr = np.ascontiguousarray(arr[:, :, :3], dtype=np.float32)
         arr = (_area_sample(arr, max_dim) if sample == "area"
                else _point_sample(arr, max_dim))

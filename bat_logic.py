@@ -66,6 +66,30 @@ def _is_tensor(value) -> bool:
         return False
 
 
+def _is_array(value) -> bool:
+    if _is_tensor(value):
+        return True
+    try:
+        import numpy as np
+        return isinstance(value, np.ndarray)
+    except Exception:
+        return False
+
+
+def _arrays_equal(a, b) -> bool:
+    """Same shape and same values, for any mix of torch tensors / ndarrays."""
+    if _is_tensor(a) and _is_tensor(b):
+        if tuple(a.shape) != tuple(b.shape):
+            return False
+        return bool((a == b.to(a.device)).all())
+    import numpy as np
+
+    def _np(v):
+        return v.detach().cpu().numpy() if _is_tensor(v) else np.asarray(v)
+
+    return bool(np.array_equal(_np(a), _np(b)))
+
+
 class BatCompare:
     """Compare two values → BOOLEAN."""
 
@@ -92,8 +116,24 @@ class BatCompare:
         fn = COMPARE_OPS.get(operation)
         if fn is None:
             raise ValueError(f"Unknown operation {operation!r}")
+        # Two tensors/arrays: `a == b` is element-wise, and bool() of a
+        # many-element result raises "ambiguous". What a graph means by
+        # "are these the same image" is same shape and same values.
+        if operation in ("a == b", "a != b") and _is_array(a) and _is_array(b):
+            same = _arrays_equal(a, b)
+            return (same if operation == "a == b" else not same,)
         try:
             return (bool(fn(a, b)),)
+        except (RuntimeError, ValueError) as e:
+            # The same "ambiguous truth value" from an ordering op on a
+            # tensor/array, or from a list that contains them.
+            raise TypeError(
+                f"Cannot apply '{operation}' to {type(a).__name__} and "
+                f"{type(b).__name__}: a multi-element tensor or array has no "
+                f"single truth value. Reduce it to a number first (🦇 List "
+                f"Length, a statistic, …) or use '==' / '!=' on two of them. "
+                f"({e})"
+            ) from None
         except TypeError as e:
             # Ordering two values of different types raises in Python 3. Say
             # which types, because "'<' not supported" alone is unhelpful when
@@ -137,21 +177,33 @@ class BatIndexSwitch:
     def check_lazy_status(self, index=0, **kwargs):
         """Ask the executor only for the branch we are about to return."""
         name = f"value{int(index)}"
-        if kwargs.get(name) is None:
+        # Only a WIRED-but-unevaluated input arrives as None. An unwired one is
+        # absent from kwargs altogether, and requesting it makes the executor
+        # raise NodeInputError ("…but there is no input to that node at all"),
+        # failing the whole prompt before switch() can name the real problem.
+        # Same distinction core's ComfySwitchNode draws with its MISSING default.
+        if name in kwargs and kwargs[name] is None:
             return [name]
         return []
 
     def switch(self, index=0, **kwargs):
         name = f"value{int(index)}"
-        if name not in kwargs:
+        # Range is checked on the index itself: an unwired input is also
+        # absent from kwargs, and must not be reported as "out of range".
+        if not 0 <= int(index) < MAX_BRANCHES:
             raise ValueError(
                 f"index {index} is out of range (0–{MAX_BRANCHES - 1})."
+            )
+        if name not in kwargs:
+            raise ValueError(
+                f"🦇 Index Switch: index is {index} but nothing is connected to "
+                f"'{name}'. Wire that input, or change the index."
             )
         value = kwargs[name]
         if value is None:
             raise ValueError(
-                f"🦇 Index Switch: index is {index} but nothing is connected to "
-                f"'{name}'. Wire that input, or change the index."
+                f"🦇 Index Switch: '{name}' is connected but its upstream node "
+                f"produced None (a disabled 🦇 Show Any, for instance)."
             )
         return (value,)
 
@@ -180,6 +232,37 @@ class BatListLength:
         if isinstance(value, (list, tuple, dict, str)):
             return (len(value),)
         return (1,)
+
+
+class BatListLengthList:
+    """How many items a ComfyUI LIST carries (not the frames of one batch)."""
+
+    # 🦇 List Length runs once PER ITEM when handed a ComfyUI list (an output
+    # marked OUTPUT_IS_LIST, e.g. 🦇 Video Grid Split's tiles), so fifteen
+    # tiles gave fifteen frame counts instead of 15. INPUT_IS_LIST makes the
+    # executor pass the whole list in one call. Picking an item and joining
+    # lists are already core: "Get Item From List" and "Create List"
+    # (comfy_extras/nodes_toolkit.py) — length is the one core lacks.
+    INPUT_IS_LIST = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"value": (ANY, {
+            "tooltip": "A ComfyUI list. A plain (non-list) input counts as 1 — "
+                       "for frames in a batch use 🦇 List Length.",
+        })}}
+
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("length",)
+    FUNCTION = "length"
+    CATEGORY = "BAT/Logic"
+    DESCRIPTION = (
+        "Number of items in a ComfyUI list (e.g. the tiles from 🦇 Video Grid "
+        "Split). 🦇 List Length counts the frames of a batch instead."
+    )
+
+    def length(self, value=None):
+        return (len(value) if value is not None else 0,)
 
 
 class BatListIndex:

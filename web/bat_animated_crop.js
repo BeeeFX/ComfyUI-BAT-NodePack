@@ -6,10 +6,19 @@
  * Persistent state (hidden STRING widget `state`):
  *   {
  *     "keyframes": {
- *       "<frame>": { x, y, w, h, angle },
+ *       "<frame>": { x, y, w, h, angle, ease? },
  *       ...
- *     }
+ *     },
+ *     "seed": "centre"
  *   }
+ *
+ * `ease` (bat_easing.js) is the curve on the way OUT of a key; absent =
+ * linear. `seed: "centre"` (new nodes) makes an empty map render the centred
+ * half-size rect, here and in Python; a state saved without it keeps the old
+ * 512×512 at the origin. The clip's size and frame count live in
+ * node.properties, not in the state: `state` is a prompt input, so anything
+ * written there after a run changed the cache key and re-ran the node and
+ * everything downstream.
  *
  * Auto-key ON  → every rect edit creates / replaces the keyframe at the
  *                current frame.
@@ -30,8 +39,9 @@
 import { app } from "../../scripts/app.js";
 import { addBatDOMWidget, clampNodeSize } from "./bat_node_layout.js";
 import { addBatFullscreen } from "./bat_fullscreen.js";
-import { batTrack, batNodeCacheKey, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
+import { batTrack, batNodeCacheKey, batCacheSet, batReplayLastExecution, batPreviewWillReplay } from "./bat_lifecycle.js";
 import { attachZoomControl } from "./bat_zoom_control.js";
+import { easeName, applyEase, EASES, EASE_LABELS } from "./bat_easing.js";
 
 const NODE_TYPE = "Bat_AnimatedCrop";
 
@@ -48,7 +58,7 @@ function _previewCacheKey(node) {
     return batNodeCacheKey(app, "bat_animcrop_preview", node);
 }
 function _saveCachedPreview(node, data) {
-    try { localStorage.setItem(_previewCacheKey(node), JSON.stringify(data)); }
+    try { batCacheSet(_previewCacheKey(node), JSON.stringify(data)); }
     catch (_) {}
 }
 function _loadCachedPreview(node) {
@@ -69,6 +79,54 @@ function parseRatio(s) {
     }
     const n = Number(s);
     return n > 0 ? n : null;
+}
+
+// The rect an empty keyframe map renders — bat_animated_crop.py's _seed_rect.
+// `clip` is { imgW, imgH, seed }. The centred half-size rect is the one the
+// editor has always offered first; before, only the editor used it and the
+// backend rendered 512×512 at the origin, so the first run never matched.
+function seedRect(clip) {
+    if (clip && clip.seed === "centre" && clip.imgW && clip.imgH) {
+        return {
+            x: Math.round(clip.imgW * 0.25),
+            y: Math.round(clip.imgH * 0.25),
+            w: Math.max(1, Math.round(clip.imgW * 0.5)),
+            h: Math.max(1, Math.round(clip.imgH * 0.5)),
+            angle: 0,
+        };
+    }
+    return { x: 0, y: 0, w: 512, h: 512, angle: 0 };
+}
+
+// Rect at frame `f` — the preview twin of _resolve_rect_at_frame in
+// bat_animated_crop.py (tests/verify_animated_crop.py holds them together).
+// Holds at the ends; between keys every field follows the EARLIER key's ease.
+// Always a fresh { x, y, w, h, angle }: a key auto-created from it past the
+// last key must not inherit that key's ease.
+function interpolateRect(kfs, f, clip) {
+    const keys = Object.keys(kfs).map(Number).sort((a, b) => a - b);
+    if (!keys.length) return seedRect(clip);
+    const at = (k) => {
+        const r = kfs[String(k)];
+        return { x: r.x, y: r.y, w: r.w, h: r.h, angle: r.angle };
+    };
+    if (f <= keys[0]) return at(keys[0]);
+    if (f >= keys[keys.length - 1]) return at(keys[keys.length - 1]);
+    let prev = keys[0], nxt = keys[keys.length - 1];
+    for (const k of keys) {
+        if (k <= f) prev = k;
+        if (k >= f && k !== prev) { nxt = k; break; }
+    }
+    if (prev === nxt) return at(prev);
+    const a = kfs[String(prev)], b = kfs[String(nxt)];
+    const t = applyEase((f - prev) / (nxt - prev), easeName(a));
+    return {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        w: a.w + (b.w - a.w) * t,
+        h: a.h + (b.h - a.h) * t,
+        angle: a.angle + (b.angle - a.angle) * t,
+    };
 }
 
 function buildEditor(node) {
@@ -236,9 +294,21 @@ function buildEditor(node) {
     frameLabel.style.cssText = "font-family:monospace; min-width:80px; text-align:right; color:#9ab; margin-left:auto;";
     frameLabel.textContent = "1 / 1";
 
+    // Ease of the selected keyframe(s) — or of the key under the playhead when
+    // nothing is selected. Disabled when neither exists. See syncEasePicker.
+    const easeSelect = document.createElement("select");
+    easeSelect.title = "Ease out of the selected keyframe, towards the next one";
+    easeSelect.style.cssText = "background:#0e1116; border:1px solid #2a2f37; color:#cdd; font-size:11px; border-radius:3px; padding:1px 2px;";
+    for (const name of EASES) {
+        const o = document.createElement("option");
+        o.value = name; o.textContent = EASE_LABELS[name] || name;
+        easeSelect.appendChild(o);
+    }
+    easeSelect.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+
     // Timeline first (full width), then the controls beneath it.
     controlsRow.append(prevBtn, playBtn, nextBtn, addKeyBtn, delKeyBtn,
-                       clearKeysBtn, autoKeyToggle, frameLabel);
+                       clearKeysBtn, easeSelect, autoKeyToggle, frameLabel);
 
     // Any click that isn't the clear button itself cancels a pending confirm.
     root.addEventListener("pointerdown", (ev) => {
@@ -302,37 +372,71 @@ function buildEditor(node) {
     node._batAnimCropState = state;
 
     // ── helpers ──────────────────────────────────────────────────────
-    const persist = () => setStateWidget(state.doc);
+    // A state saved before the clip size moved to node.properties still
+    // carries imgW / imgH / frameCount. They go on the next real edit — which
+    // changes the state (and re-runs the node) anyway — never on their own.
+    const persist = () => {
+        if ("imgW" in state.doc || "imgH" in state.doc || "frameCount" in state.doc) {
+            if (!node.properties?.bat_clip && state.doc.imgW && state.doc.imgH) {
+                saveClipMeta(state.doc.imgW, state.doc.imgH,
+                             state.doc.frameCount || state.frameCount);
+            }
+            delete state.doc.imgW; delete state.doc.imgH; delete state.doc.frameCount;
+        }
+        setStateWidget(state.doc);
+    };
+    // Clip size / frame count for the reopen-before-run view. node.properties
+    // first; a workflow saved before they moved there still has them in the
+    // state JSON, and that stays readable.
+    function saveClipMeta(w, h, frameCount) {
+        try {
+            node.properties = node.properties || {};
+            node.properties.bat_clip = { imgW: w, imgH: h, frameCount };
+        } catch (_) {}
+    }
+    function applyClipMeta() {
+        const m = node.properties?.bat_clip || state.doc;
+        if (m.imgW && m.imgH) {
+            state.imgW = m.imgW;
+            state.imgH = m.imgH;
+        }
+        if (m.frameCount) {
+            state.frameCount = Math.max(1, m.frameCount | 0);
+        }
+    }
 
-    // Rect at current frame (interpolated). Returns the default rect when
-    // no keyframes exist — same defaults the backend falls back to.
+    // Rect at current frame (interpolated). With no keyframes it is the
+    // seed rect — the same one the backend falls back to.
     function rectAtCurrent() {
         return rectAtFrame(state.currentFrame);
     }
     function rectAtFrame(f) {
-        const kfs = state.doc.keyframes;
-        const keys = Object.keys(kfs).map(Number).sort((a, b) => a - b);
-        if (!keys.length) {
-            return { x: 0, y: 0, w: 512, h: 512, angle: 0 };
-        }
-        if (f <= keys[0]) return { ...kfs[String(keys[0])] };
-        if (f >= keys[keys.length - 1]) return { ...kfs[String(keys[keys.length - 1])] };
-        let prev = keys[0], nxt = keys[keys.length - 1];
-        for (const k of keys) {
-            if (k <= f) prev = k;
-            if (k >= f && k !== prev) { nxt = k; break; }
-        }
-        if (prev === nxt) return { ...kfs[String(prev)] };
-        const t = (f - prev) / (nxt - prev);
-        const a = kfs[String(prev)], b = kfs[String(nxt)];
-        return {
-            x: a.x + (b.x - a.x) * t,
-            y: a.y + (b.y - a.y) * t,
-            w: a.w + (b.w - a.w) * t,
-            h: a.h + (b.h - a.h) * t,
-            angle: a.angle + (b.angle - a.angle) * t,
-        };
+        return interpolateRect(state.doc.keyframes, f,
+            { imgW: state.imgW, imgH: state.imgH, seed: state.doc.seed });
     }
+
+    function easeTargets() {
+        const kfs = state.doc.keyframes || {};
+        const sel = [...state.kfSelection].filter((f) => kfs[String(f)] !== undefined);
+        if (sel.length) return sel;
+        return kfs[String(state.currentFrame)] !== undefined ? [state.currentFrame] : [];
+    }
+    function syncEasePicker() {
+        const targets = easeTargets();
+        easeSelect.disabled = targets.length === 0;
+        easeSelect.value = targets.length
+            ? easeName(state.doc.keyframes[String(targets[0])]) : "linear";
+    }
+    easeSelect.addEventListener("change", () => {
+        const name = easeSelect.value;
+        for (const f of easeTargets()) {
+            const k = state.doc.keyframes[String(f)];
+            // Linear is the absent value, so a linear key serialises exactly
+            // as it did before easing existed.
+            if (name === "linear") delete k.ease; else k.ease = name;
+        }
+        persist(); renderTimelineKeyframes(); render();
+    });
 
     // Get the keyframe object to WRITE rect edits into. With auto-key,
     // we snapshot the interpolated rect into a new keyframe at the
@@ -397,6 +501,7 @@ function buildEditor(node) {
         }
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         recomputeDisplay();
+        syncEasePicker();
 
         ctx.fillStyle = "#000";
         ctx.fillRect(0, 0, cssW, cssH);
@@ -507,8 +612,11 @@ function buildEditor(node) {
         if (!state.imgW) { info.textContent = ""; return; }
         const r = rectAtCurrent();
         const snap = Math.max(1, (get("snap_to") | 0) || 8);
-        const outW = Math.max(snap, Math.round(r.w / snap) * snap);
-        const outH = Math.max(snap, Math.round(r.h / snap) * snap);
+        // The output size is uniform across the clip: the FIRST frame's rect,
+        // floored to snap_to exactly as bat_animated_crop.py's _snap does.
+        const r0 = rectAtFrame(0);
+        const outW = Math.max(snap, Math.floor(Math.round(r0.w) / snap) * snap);
+        const outH = Math.max(snap, Math.floor(Math.round(r0.h) / snap) * snap);
         const angTxt = Math.abs(r.angle) >= 0.05 ? `  · ${r.angle.toFixed(1)}°` : "";
         const onKey = !!state.doc.keyframes[String(state.currentFrame)];
         const freeTxt = constrained() ? "" : " · ⛶ free";
@@ -643,9 +751,19 @@ function buildEditor(node) {
                 x = Math.round(dirX > 0 ? anchX : anchX - nw);
                 y = Math.round(dirY > 0 ? anchY : anchY - nh);
             } else if (con) {
-                const nx = Math.min(anchX, cP.x), ny = Math.min(anchY, cP.y);
-                x = cl(Math.round(nx), 0, Math.max(0, Wimg - 1));
-                y = cl(Math.round(ny), 0, Math.max(0, Himg - 1));
+                // Clamp both EDGES to the canvas, not just the origin. w/h used
+                // to be left unclamped here, so a drag past the right edge
+                // stored an overhanging key (which the backend then slid, off
+                // from what was drawn) and one past the left edge moved the
+                // anchor.
+                const x0 = cl(Math.min(anchX, cP.x), 0, Wimg);
+                const y0 = cl(Math.min(anchY, cP.y), 0, Himg);
+                nw = cl(Math.max(anchX, cP.x), 0, Wimg) - x0;
+                nh = cl(Math.max(anchY, cP.y), 0, Himg) - y0;
+                x = cl(Math.round(x0), 0, Math.max(0, Wimg - 1));
+                y = cl(Math.round(y0), 0, Math.max(0, Himg - 1));
+                nw = Math.min(nw, Wimg - x);
+                nh = Math.min(nh, Himg - y);
             } else {
                 x = Math.round(dirX > 0 ? anchX : anchX - nw);
                 y = Math.round(dirY > 0 ? anchY : anchY - nh);
@@ -829,6 +947,9 @@ function buildEditor(node) {
     nextBtn.onclick = () => setFrame(state.currentFrame + 1);
     addKeyBtn.onclick = () => {
         const cur = rectAtCurrent();
+        // Re-keying an existing key keeps its ease.
+        const had = state.doc.keyframes[String(state.currentFrame)];
+        if (had && had.ease) cur.ease = had.ease;
         state.doc.keyframes[String(state.currentFrame)] = cur;
         persist(); renderTimelineKeyframes(); render();
     };
@@ -981,6 +1102,7 @@ function buildEditor(node) {
         keyframeStrip.querySelectorAll(".bat-kf").forEach(el => el.remove());
         rangeStrip.querySelectorAll(".bat-kf-mini").forEach(el => el.remove());
         syncRangeWindow();
+        syncEasePicker();
         if (state.frameCount <= 1) return;
         const fullDenom = Math.max(1, state.frameCount - 1);
 
@@ -1009,7 +1131,8 @@ function buildEditor(node) {
             const dot = document.createElement("div");
             dot.className = "bat-kf";
             dot.dataset.frame = String(f);
-            dot.title = `Keyframe @ frame ${f + 1} — drag to move, Shift+click to add to selection, right-click to delete`;
+            const kEase = easeName(state.doc.keyframes[k]);
+            dot.title = `Keyframe @ frame ${f + 1}${kEase !== "linear" ? ` · ${EASE_LABELS[kEase]} out` : ""} — drag to move, Shift+click to add to selection, right-click to delete`;
             dot.style.cssText = `
                 position:absolute; top:0; bottom:0; width:8px;
                 background:${inSel ? "#7ab8ff" : "#f4b860"};
@@ -1112,7 +1235,9 @@ function buildEditor(node) {
 
     // ── keyboard ─────────────────────────────────────────────────────
     root.addEventListener("keydown", (e) => {
-        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+        // SELECT: the arrow keys belong to the ease picker while it has focus.
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA"
+                || e.target.tagName === "SELECT") return;
         let handled = true;
         switch (e.key) {
             case " ": togglePlay(); break;
@@ -1137,7 +1262,13 @@ function buildEditor(node) {
                 break;
             default: handled = false;
         }
-        if (handled) e.preventDefault();
+        if (handled) {
+            // stopPropagation too: ComfyUI's window-level keybinding handler
+            // ignores defaultPrevented, so Delete/Backspace here ALSO ran
+            // "Delete Selected Items" and removed the (focus-selected) node.
+            e.preventDefault();
+            e.stopPropagation();
+        }
     });
 
     // ── ingest from backend (input image batch) ──────────────────────
@@ -1158,11 +1289,12 @@ function buildEditor(node) {
             state.viewEnd = Math.max(0, state.frameCount - 1);
         }
         hint.style.display = state.previewFrames.length ? "none" : "block";
-        // Persist image dimensions + frame count in state.doc so the
-        // rect renders at the correct scale on reopen even before Run.
-        state.doc.imgW = w; state.doc.imgH = h;
-        state.doc.frameCount = state.frameCount;
-        persist();
+        // Kept so the rect renders at the correct scale on reopen even before
+        // Run — in node.properties: written into `state` (a prompt input) it
+        // changed the cache key after every first run / clip change, so the
+        // next queue re-ran this node and everything downstream with nothing
+        // edited. Python never read it.
+        saveClipMeta(w, h, state.frameCount);
         // Cache the first frame as a bg preview for next reopen.
         if (frames.length > 0) {
             _saveCachedPreview(node, {
@@ -1170,10 +1302,11 @@ function buildEditor(node) {
                 imgW: w, imgH: h, frameCount: state.frameCount,
             });
         }
-        // If we have no keyframes yet AND no existing rect, seed with a
-        // sensible default — centred half-size rect at frame 0 — so the
-        // artist sees something to manipulate immediately.
-        if (!Object.keys(state.doc.keyframes).length) {
+        // A new node's empty map already shows (and renders) the centred
+        // seed — see seedRect — so nothing is written. A state saved without
+        // the seed marker rendered 512×512 at the origin on its first run and
+        // was then seeded here; it still is, so it renders as it always did.
+        if (state.doc.seed !== "centre" && !Object.keys(state.doc.keyframes).length) {
             state.doc.keyframes["0"] = {
                 x: Math.round(w * 0.25),
                 y: Math.round(h * 0.25),
@@ -1187,16 +1320,11 @@ function buildEditor(node) {
     };
 
     // ── restore from cache on init ──────────────────────────────────
-    // Two layers: dimensions from state.doc (ships with the workflow),
-    // bg thumbnail from localStorage (per-machine).
+    // Two layers: dimensions from node.properties (ships with the workflow;
+    // older workflows have them in state.doc), bg thumbnail from localStorage
+    // (per-machine).
     function _restoreCachedPreview() {
-        if (state.doc.imgW && state.doc.imgH) {
-            state.imgW = state.doc.imgW;
-            state.imgH = state.doc.imgH;
-        }
-        if (state.doc.frameCount) {
-            state.frameCount = Math.max(1, state.doc.frameCount | 0);
-        }
+        applyClipMeta();
         if (state.viewEnd <= state.viewStart) {
             state.viewStart = 0;
             state.viewEnd = Math.max(0, state.frameCount - 1);
@@ -1228,7 +1356,7 @@ function buildEditor(node) {
 
     // ── State JSON inspector ─────────────────────────────────────────
     // Collapsible panel under the canvas that exposes the entire node
-    // state (keyframes, dimensions, frame count) as JSON. Useful for
+    // state (keyframes and their eases) as JSON. Useful for
     // confirming persistence and for copy/pasting a rect animation to
     // another Animated Crop node.
     const inspector = document.createElement("div");
@@ -1239,7 +1367,7 @@ function buildEditor(node) {
     inspectorChevron.textContent = "▸";
     inspectorChevron.style.cssText = "font-size:9px; width:10px; display:inline-block;";
     const inspectorLabel = document.createElement("span");
-    inspectorLabel.textContent = "State JSON (keyframes · dimensions)";
+    inspectorLabel.textContent = "State JSON (keyframes)";
     inspectorLabel.style.flex = "1";
     const copyBtn = document.createElement("button");
     copyBtn.textContent = "Copy"; copyBtn.title = "Copy state JSON to the clipboard";
@@ -1336,7 +1464,9 @@ function buildEditor(node) {
 
     // Display-only zoom control (bottom-left of the canvas). Lets the artist
     // pull back to see the out-of-frame area for an off-canvas crop.
-    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl" });
+    // scope: root — the element this editor focuses, which is what makes the
+    // Nodes 2.0 wheel exemption apply (see bat_zoom_control.js).
+    attachZoomControl({ wrap: canvasWrap, canvas, state, onChange: render, corner: "bl", scope: root });
 
     // Re-clamp every axis-aligned keyframe rect back inside the canvas when
     // the artist turns "constrain to canvas" on. Called from the widget's
@@ -1376,13 +1506,7 @@ function buildEditor(node) {
         } catch (_) { return; }
         state.kfSelection = new Set();
         state.drag = null;
-        if (state.doc.imgW && state.doc.imgH) {
-            state.imgW = state.doc.imgW;
-            state.imgH = state.doc.imgH;
-        }
-        if (state.doc.frameCount) {
-            state.frameCount = Math.max(1, state.doc.frameCount | 0);
-        }
+        applyClipMeta();
         setFrame(0);
         render();
         renderTimelineKeyframes();

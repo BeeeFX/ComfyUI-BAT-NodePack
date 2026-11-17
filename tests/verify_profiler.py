@@ -38,6 +38,28 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
+def prefer_cpu_without_gpu():
+    """Let `import execution` succeed on a machine with no GPU (CI, a laptop).
+
+    ComfyUI's model_management initialises a CUDA device at import unless the
+    CLI asked for the CPU, and it only reads the CLI once args parsing is
+    enabled — so do both, before anything imports comfy. Leaves a GPU box alone.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return
+        sys.path.insert(0, COMFY)
+        import comfy.options
+        sys.argv = [sys.argv[0], "--cpu"]
+        comfy.options.enable_args_parsing()
+    except Exception:
+        pass    # no ComfyUI importable: [4] reports it
+
+
+prefer_cpu_without_gpu()
+
+
 def load_profiler():
     """Load bat_profiler.py standalone.
 
@@ -131,16 +153,14 @@ def t_cuda():
     check("peak reset works", prof.cuda_peak() <= freed["alloc"] + 2**20,
           f"peak {prof.cuda_peak()} alloc {freed['alloc']}")
 
-    # And it must honour the config switch.
-    prof.CONFIG.reset_peak = False
+    # And it must honour the run's own setting (per client since 2026-09).
     spike = torch.zeros((128, 1024, 1024), dtype=torch.float16, device="cuda")
     hi = prof.cuda_peak()
     del spike
     torch.cuda.empty_cache()
-    prof.cuda_reset_peak()
+    prof.cuda_reset_peak(False)
     check("reset_peak=False leaves the counter alone", prof.cuda_peak() == hi,
           f"{prof.cuda_peak()} vs {hi}")
-    prof.CONFIG.reset_peak = True
 
 
 def t_arming():
@@ -166,6 +186,62 @@ def t_arming():
 
 
 t_arming()
+
+
+def t_client_config():
+    """Measurement settings used to be process-global: one artist turning
+    GPU sync off changed how everybody else's runs were measured, and
+    /state listed every user's runs with their workflow paths."""
+    prof.arm("A", True, {"sync_cuda": False, "sample_hz": 50})
+    prof.arm("B", True)
+    a, b = prof.client_config("A"), prof.client_config("B")
+    check("arming carries this client's settings",
+          a["sync_cuda"] is False and a["sample_hz"] == 20.0, str(a))
+    check("another client keeps the defaults",
+          b["sync_cuda"] is True and b["sample_hz"] == prof.CONFIG.sample_hz_active, str(b))
+    check("/config applies to the caller only",
+          prof.configure("B", {"reset_peak": False}) is True
+          and prof.client_config("B")["reset_peak"] is False
+          and prof.client_config("A")["reset_peak"] is True)
+    check("an unarmed client has nothing server-side to configure",
+          prof.configure("C", {"sync_cuda": False}) is False
+          and prof.client_config("C")["sync_cuda"] is True)
+    prof.arm("A", True)
+    check("re-arming keeps the client's settings", prof.client_config("A")["sync_cuda"] is False)
+
+    # A run freezes its submitter's settings.
+    run_a = prof.RunRecord("pa", "A")
+    prof.configure("A", {"sync_cuda": True})
+    check("a run keeps the settings it started with", run_a.config["sync_cuda"] is False)
+    check("the run summary says how it was measured",
+          run_a.summary()["config"]["sync_cuda"] is False)
+
+    # /state: the caller's config and the caller's runs, nobody else's.
+    run_a.workflow = "wf/a-secret.json"
+    run_b = prof.RunRecord("pb", "B")
+    run_b.workflow = "wf/b-secret.json"
+    prof._history.extend([run_a, run_b])
+    try:
+        sa = prof.state_payload(None, "A")
+        sn = prof.state_payload(None, None)
+        check("/state lists only the caller's runs",
+              [r["prompt_id"] for r in sa["runs"]] == ["pa"], str(sa["runs"]))
+        check("/state leaks no workflow path to an anonymous caller",
+              sn["runs"] == [] and "b-secret" not in json.dumps(sn), str(sn["runs"]))
+        check("/state reports the caller's own config",
+              sa["config"]["sync_cuda"] is True and sa["config"]["enabled"] is True
+              and prof.state_payload(None, "B")["config"]["reset_peak"] is False)
+        prof._current = run_b
+        check("someone else's live run is not reported as current",
+              prof.state_payload(None, "A")["current"] is None
+              and prof.state_payload(None, "B")["current"] == "pb")
+    finally:
+        prof._current = None
+        prof._history.clear()
+        prof._armed.clear()
+
+
+t_client_config()
 
 # ─────────────────────────────────────────────────────────────────────
 print("\n[2b] CUDA probes")
@@ -270,6 +346,125 @@ def t_install():
 
 
 t_install()
+
+# ─────────────────────────────────────────────────────────────────────
+print("\n[4b] failed nodes, async nodes, and who hears about them")
+
+
+def t_failures():
+    """execute() never raises for a failing node — it catches the exception
+    (a CUDA OOM included) and returns FAILURE. The profiler used to read
+    only exceptions, so the node that OOMed was filed as a cache hit and
+    hidden by the panel's default filter. Also covers the per-client
+    addressing of events and the fail-safe execute_async signature."""
+    import asyncio
+    import enum
+
+    class ExecutionResult(enum.Enum):
+        SUCCESS = 0
+        FAILURE = 1
+        PENDING = 2
+
+    class InterruptProcessingException(Exception):
+        pass
+
+    class DP:
+        def get_node(self, uid):
+            return {"class_type": "KSampler", "inputs": {}}
+
+        def get_display_node_id(self, uid):
+            return uid
+
+    sent = []
+    real_send = prof._send
+    prof._send = lambda ev, d, sid=None: sent.append((ev, d, sid))
+    saved = (prof._orig_execute, prof._orig_get_output_data)
+
+    def fake_execute(exc):
+        async def _execute(server, dynprompt, caches, current_item, extra_data,
+                           executed, prompt_id, *rest):
+            try:
+                await prof._wrapped_get_output_data(prompt_id, current_item, None, {"x": [1]})
+            except Exception as ex:
+                return (ExecutionResult.FAILURE,
+                        {"node_id": current_item, "exception_message": str(ex),
+                         "exception_type": type(ex).__name__}, ex)
+            return (ExecutionResult.SUCCESS, None, None)
+        return _execute
+
+    def raiser(exc):
+        async def _god(*a, **k):
+            raise exc
+        return _god
+
+    try:
+        for exc, want_status in ((RuntimeError("CUDA out of memory"), "error"),
+                                 (InterruptProcessingException(), "interrupted")):
+            sent.clear()
+            prof._orig_execute = fake_execute(exc)
+            prof._orig_get_output_data = raiser(exc)
+            prof.arm("fail-client", True)
+
+            async def orig_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+                await prof._wrapped_execute(None, DP(), None, "7", extra_data, set(),
+                                            prompt_id, None, {}, {}, {}, None)
+
+            gate = prof._wrap_execute_async(orig_async)
+            asyncio.run(gate(types.SimpleNamespace(success=False), None, "pf",
+                             {"client_id": "fail-client"}, []))
+            node = [d for e, d, _ in sent if e == "bat.profiler.node"][-1]["node"]
+            end = [d for e, d, _ in sent if e == "bat.profiler.run" and d["phase"] == "end"][-1]
+            check(f"{want_status}: the failing node is an error row, not a cache hit",
+                  node["error"] is True and node["cached"] is False, f"got {node}")
+            check(f"{want_status}: run status and run.error name the node",
+                  end["run"]["status"] == want_status
+                  and (end["run"]["error"] or {}).get("node_id") == "7",
+                  f"got {end['run']['status']} {end['run']['error']}")
+            check(f"{want_status}: every event goes to the submitting client only",
+                  sent and all(sid == "fail-client" for _, _, sid in sent),
+                  f"sids={[sid for _, _, sid in sent]}")
+            prof.arm("fail-client", False)
+
+        # The GPU sync follows the submitting client's own setting.
+        seen_sync = []
+        real_sync = prof.cuda_sync
+        prof.cuda_sync = lambda enabled=None: seen_sync.append(enabled)
+        try:
+            async def ok_god(*a, **k):
+                return ([], {}, False, False)
+            prof._orig_get_output_data = ok_god
+            for cid, cfg in (("nosync", {"sync_cuda": False}), ("sync", {})):
+                prof.arm(cid, True, cfg)
+
+                async def orig_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+                    await prof._wrapped_execute(None, DP(), None, "7", extra_data, set(),
+                                                prompt_id, None, {}, {}, {}, None)
+                asyncio.run(prof._wrap_execute_async(orig_async)(
+                    types.SimpleNamespace(success=True), None, "ps-" + cid,
+                    {"client_id": cid}, []))
+                prof.arm(cid, False)
+        finally:
+            prof.cuda_sync = real_sync
+        check("each run syncs the GPU per its own client's setting",
+              seen_sync == [False, False, True, True], f"got {seen_sync}")
+
+        # An upstream signature change must not become a TypeError for
+        # every prompt on the box.
+        async def orig_new_sig(self, prompt, prompt_id, extra_data={}, execute_outputs=[],
+                               extra=None, *, flag=False):
+            return ("through", extra, flag)
+
+        res = asyncio.run(prof._wrap_execute_async(orig_new_sig)(
+            types.SimpleNamespace(success=True), {}, "pz", {"client_id": "nobody"}, [],
+            "x", flag=True))
+        check("execute_async wrapper forwards arguments it does not know",
+              res == ("through", "x", True), f"got {res}")
+    finally:
+        prof._send = real_send
+        prof._orig_execute, prof._orig_get_output_data = saved
+
+
+t_failures()
 
 # ─────────────────────────────────────────────────────────────────────
 print("\n[5] frontend")
@@ -410,14 +605,21 @@ def t_queue_passthrough():
     ctx = quickjs.Context()
     ctx.eval("""
       var seen = null;
+      var claims = 0;
+      var nextId = 0;
       var api = {
         queuePrompt: function () {
           seen = Array.prototype.slice.call(arguments);
-          return Promise.resolve({prompt_id: "p1"});
+          nextId++;
+          return Promise.resolve({prompt_id: "p" + nextId});
         },
-        fetchApi: function () { return Promise.resolve({}); }
+        fetchApi: function (url) {
+          if (url === "/bat/profiler/claim") claims++;
+          return Promise.resolve({});
+        }
       };
       var pendingClaims = new Map();
+      var state = {config: {enabled: true}};
       function currentKey() { return "wf/x.json"; }
     """)
     ctx.eval(iife)
@@ -436,6 +638,29 @@ def t_queue_passthrough():
           f"got {targets}")
     check("wrapper marks itself, so it installs once",
           ctx.eval("api.queuePrompt.__batProfiler === true"))
+
+    def drain():
+        while ctx.execute_pending_job():
+            pass
+
+    drain()
+    check("an armed browser claims its prompt",
+          ctx.eval("claims") == 1 and ctx.eval("pendingClaims.size") == 1,
+          f"claims={ctx.eval('claims')} map={ctx.eval('pendingClaims.size')}")
+
+    # Disarmed, nothing is ever profiled, so nothing may be claimed: no
+    # run-end would ever arrive to clear the entry again.
+    ctx.eval("state.config.enabled = false; api.queuePrompt(0, {});")
+    drain()
+    check("a disarmed browser claims nothing",
+          ctx.eval("claims") == 1 and ctx.eval("pendingClaims.size") == 1,
+          f"claims={ctx.eval('claims')} map={ctx.eval('pendingClaims.size')}")
+
+    ctx.eval("state.config.enabled = true; for (var i = 0; i < 200; i++) api.queuePrompt(0, {});")
+    drain()
+    check("pending claims stay bounded",
+          ctx.eval("pendingClaims.size") <= 64 and ctx.eval(f"pendingClaims.has('p{202}')"),
+          f"size={ctx.eval('pendingClaims.size')}")
 
 
 t_queue_passthrough()
@@ -565,6 +790,31 @@ def t_report():
     r3 = ctx.eval('buildReport({run: EMPTY, runCount: 1, workflowName: "y",'
                   ' system: null, config: {}})')
     check("survives an empty run", isinstance(r3, str) and len(r3) > 0)
+
+    # DynamicVRAM keeps weights outside the torch allocator: torch says 4 GB,
+    # the card says 23 GB of 24. The headroom check must believe the card.
+    dyn = dict(clean)
+    dyn["samples"] = [dict(s, vram=4 * GB, res=5 * GB, dev=23 * GB, dev_total=24 * GB)
+                      for s in samples]
+    ctx.eval("var DYN = " + json.dumps(dyn) + ";")
+    r4 = ctx.eval('buildReport({run: DYN, runCount: 1, workflowName: "d",'
+                  ' system: SYS, config: {}})')
+    check("headroom judged on the whole device, not torch's share",
+          "HEADROOM" in r4 and "VRAM reached 95.8%" in r4 and "whole device peaked" in r4,
+          r4[:400])
+
+    # A failed run names the node and the exception.
+    err = dict(clean)
+    err["status"] = "error"
+    err["error"] = {"node_id": "42", "class_type": "WanVideoSampler",
+                    "exception_type": "torch.OutOfMemoryError",
+                    "message": "CUDA out of memory. Tried to allocate 2.00 GiB\nmore"}
+    ctx.eval("var ERR = " + json.dumps(err) + ";")
+    r5 = ctx.eval('buildReport({run: ERR, runCount: 1, workflowName: "e",'
+                  ' system: SYS, config: {}})')
+    check("an errored run names the failing node and the exception",
+          "ENDED IN ERROR" in r5 and "WanVideo Sampler (WanVideoSampler)" in r5
+          and "torch.OutOfMemoryError: CUDA out of memory" in r5, r5[:500])
 
 
 t_report()

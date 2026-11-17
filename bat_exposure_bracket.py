@@ -65,6 +65,7 @@ supposed to correspond to.
 import base64
 import logging
 import math
+import re
 from io import BytesIO
 
 import numpy as np
@@ -72,6 +73,7 @@ import torch
 from PIL import Image
 
 from .bat_hdr_preview import hdr_tile
+from .bat_ui_ref import stash_ui
 from . import bat_interrupt as _interrupt
 from .bat_hdr_tonal_composite import (
     _EPS, _K_MIN, _K_MAX, _encode_from_linear, _luminance, _to_linear,
@@ -121,6 +123,14 @@ _CHUNK_BYTES = 128 << 20
 # Stop layout
 # ---------------------------------------------------------------------------
 
+# One plain decimal number. Spelled out rather than left to float(), which
+# also takes "nan", "inf" and "1_0" — a NaN stop exposes every pixel to NaN —
+# and matched by the same pattern in web/bat_exposure_bracket.js, because the
+# JS labels the slots from ITS parse: two parsers that disagree on "-2ev" put
+# one set of EVs on the node and render another.
+_STOP_RE = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?")
+
+
 def parse_stops(text: str):
     """Parse a comma/space separated EV list. Returns None if unusable.
 
@@ -133,12 +143,12 @@ def parse_stops(text: str):
         return None
     out = []
     for tok in text.replace(",", " ").split():
-        try:
-            out.append(float(tok))
-        except ValueError:
+        v = float(tok) if _STOP_RE.fullmatch(tok) else float("nan")
+        if not math.isfinite(v):
             logger.warning("could not parse %r in custom_stops; falling back "
                            "to the generated layout", tok)
             return None
+        out.append(v)
     if not out:
         return None
     return out[:MAX_STOPS]
@@ -311,7 +321,9 @@ class BatExposureBracket:
               "count": [len(stops)]}
         ui.update(self._preview_payload(plate, str(plate_gamma_mode),
                                         preview_frame))
-        return {"ui": ui, "result": (pipe, *padded)}
+        # The plate tile + JPEG are stashed to a sidecar so they stay out of
+        # the prompt history — see bat_ui_ref.py. The JS sees the same dict.
+        return {"ui": stash_ui(ui), "result": (pipe, *padded)}
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -388,7 +400,9 @@ class BatExposureMerge:
             "reference": (["auto", "first"], {
                 "default": "auto",
                 "tooltip": "Which pass the others are aligned to. auto picks the stop "
-                           "closest to 0 EV, which is the one whose exposure you trust."}),
+                           "closest to 0 EV, which is the one whose exposure you trust. "
+                           "The merge is then brought back to the plate's exposure by "
+                           "that pass's own 2^-ev."}),
         }
         for i in range(MAX_STOPS):
             opt[f"hdr_{i + 1}"] = ("IMAGE", {
@@ -466,7 +480,8 @@ class BatExposureMerge:
                                    float(well_exposed_sigma))
         ui = self._preview_payload(got, plate_lin, gamma_mode, scales, stops,
                                    align, reference, float(well_exposed_sigma))
-        return {"ui": ui, "result": (out,)}
+        # Up to nine 16-bit tiles: stashed, as the bracket's are.
+        return {"ui": stash_ui(ui), "result": (out,)}
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -544,47 +559,68 @@ class BatExposureMerge:
         return min(range(len(got)), key=lambda i: abs(got[i][0]))
 
     def _alignment(self, got, plate_lin, gamma_mode, mode, reference, sigma):
-        """One scalar per pass, bringing them all onto the reference's scale."""
+        """One scalar per pass, bringing them all onto the PLATE's scale.
+
+        The passes are measured against the reference pass, and the reference
+        is then taken back to 0 EV by its own nominal 2^-ev. Leaving the
+        reference at k = 1 put the whole merge at the reference's exposure,
+        which is only the plate's when a stop sits on exactly 0 EV — a
+        symmetric bracket with an even count came out 0.75 stops dark.
+        """
         n = len(got)
         if mode == "off":
             return [1.0] * n
         nominal = [2.0 ** (-ev) for ev, _ in got]
         if mode == "nominal":
-            r = self._ref_index(got, reference)
-            return [k / nominal[r] for k in nominal]
-        if n == 1:
-            return [1.0]
-
+            return list(nominal)
         r = self._ref_index(got, reference)
-        w_ref = _well_exposed(_luminance(_expose_to_sdr(
-            plate_lin, got[r][0], gamma_mode)), sigma)
-        y_ref = _luminance(got[r][1])
-        total = float(w_ref.numel())
+        if n == 1:
+            return [nominal[r]]
+
+        # Accumulated per chunk, like the merge itself: whole-batch weight maps
+        # for every pass peaked at ~7x a full clip, on the one step that exists
+        # to produce four scalars.
+        b, h, w, _ = got[0][1].shape
+        per_chunk = max(1, int(_CHUNK_BYTES //
+                               max(h * w * 3 * 4 * max(n, 1), 1)))
+        ov = [0.0] * n
+        num = [0.0] * n
+        den = [0.0] * n
+        for s in range(0, b, per_chunk):
+            _interrupt.check()
+            e = min(s + per_chunk, b)
+            pl = plate_lin[s:e]
+            w_ref = _well_exposed(_luminance(_expose_to_sdr(
+                pl, got[r][0], gamma_mode)), sigma)
+            y_ref = _luminance(got[r][1][s:e])
+            for i, (ev, img) in enumerate(got):
+                if i == r:
+                    continue
+                overlap = w_ref * _well_exposed(_luminance(_expose_to_sdr(
+                    pl, ev, gamma_mode)), sigma)
+                ov[i] += float(overlap.sum())
+                den[i] += float((overlap * _luminance(img[s:e])).sum())
+                num[i] += float((overlap * y_ref).sum())
+        total = float(b * h * w)
 
         scales = []
         for i, (ev, img) in enumerate(got):
             if i == r:
-                scales.append(1.0)
+                scales.append(nominal[r])
                 continue
-            w_i = _well_exposed(_luminance(_expose_to_sdr(
-                plate_lin, ev, gamma_mode)), sigma)
-            overlap = w_ref * w_i
-            frac = float(overlap.sum()) / max(total, 1.0)
-            y_i = _luminance(img)
-            den = float((overlap * y_i).sum())
-            num = float((overlap * y_ref).sum())
-            if frac < _MIN_OVERLAP or den <= _EPS or num <= 0.0:
+            frac = ov[i] / max(total, 1.0)
+            if frac < _MIN_OVERLAP or den[i] <= _EPS or num[i] <= 0.0:
                 k = nominal[i] / nominal[r]
                 logger.info("stop %+.2f EV: overlap with the reference is %.3f%% — "
                             "too little to measure, using the nominal ratio %.4f",
                             ev, frac * 100.0, k)
             else:
-                k = num / den
+                k = num[i] / den[i]
                 if not math.isfinite(k) or not (_K_MIN <= k <= _K_MAX):
                     k = nominal[i] / nominal[r]
                     logger.warning("stop %+.2f EV: measured ratio was out of range; "
                                    "using the nominal %.4f", ev, k)
-            scales.append(float(k))
+            scales.append(float(k) * nominal[r])
         return scales
 
     @staticmethod
@@ -609,4 +645,5 @@ class BatExposureMerge:
                 acc += img[s:e] * k * wt
                 wsum += wt
             out[s:e] = acc / wsum.clamp(min=_W_FLOOR)
-        return out.clamp(min=0.0)
+        # In place: `out` is ours, and a clamp() copy briefly doubled the clip.
+        return out.clamp_(min=0.0)

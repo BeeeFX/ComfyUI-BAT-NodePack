@@ -41,8 +41,9 @@ iopath
 # falls back to a plain load_state_dict without it, ~30s slower per load.
 accelerate>=0.26.0
 
-# Model auto-download into models/sams
-huggingface_hub>=0.20.0
+# Model auto-download into models/sams. 0.23+ writes real files into
+# local_dir; older versions symlinked the 7GB blob out of ~/.cache instead.
+huggingface_hub>=0.23.0
 
 # Used by the SAM2 utils
 scipy>=1.7.0

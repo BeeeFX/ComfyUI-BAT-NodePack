@@ -1,5 +1,21 @@
+import logging
+
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger("[Bat_VaceBatchTool]")
+_warned_plate_no_mask = False
+
+
+def _note_plate_without_mask():
+    """Say once per session why a mask-less plate is no longer greyed out."""
+    global _warned_plate_no_mask
+    if _warned_plate_no_mask:
+        return
+    _warned_plate_no_mask = True
+    logger.info("plate_image has no plate_mask: the plate is kept as-is "
+                "(mask 1, not premultiplied). Wire a plate_mask to choose "
+                "what is regenerated.")
 
 
 class _AnyType(str):
@@ -102,16 +118,18 @@ class VaceBatchTool:
                     kf_idx = int(kf_idx_raw)
                 except (TypeError, ValueError):
                     kf_idx = 0
-                keyframes.append((kf_idx, kf_img, kf_mask))
+                keyframes.append((kf_idx, kf_img, kf_mask, True))
             i += 1
             if i > 4096:
                 break
 
         # Start/end frames as keyframes (applied last so they win on collision)
+        # (start/end stay single frames — their first frame — as they always
+        # were; only the image_N keyframes place a whole clip.)
         if start_image is not None or start_mask is not None:
-            keyframes.append((0, start_image, start_mask))
+            keyframes.append((0, start_image, start_mask, False))
         if end_image is not None or end_mask is not None:
-            keyframes.append((max(0, num_frames - 1), end_image, end_mask))
+            keyframes.append((max(0, num_frames - 1), end_image, end_mask, False))
 
         # Determine target H, W from the first available image/mask
         H = W = None
@@ -134,6 +152,11 @@ class VaceBatchTool:
 
         images = torch.full((num_frames, H, W, 3), fc, dtype=torch.float32)
         masks = torch.ones((num_frames, H, W), dtype=torch.float32)
+        # Frames whose mask is only the all-ones default under a plate that
+        # came without a mask. premultiply skips them: it used to grey the
+        # whole plate out, so wiring a plate alone produced a batch with none
+        # of it left. The mask stays 1 (generate), the pixels stay the plate.
+        keep_plate = torch.zeros((num_frames,), dtype=torch.bool)
 
         # Plate: fill base sequence; hold last frame if plate is shorter
         if plate_image is not None:
@@ -142,6 +165,9 @@ class VaceBatchTool:
             images[:n] = p[:n]
             if p.shape[0] < num_frames:
                 images[p.shape[0]:] = p[-1:]
+            if plate_mask is None:
+                keep_plate[:] = True
+                _note_plate_without_mask()
         if plate_mask is not None:
             pm = _resize_mask(plate_mask, H, W).to(masks.dtype).cpu()
             n = min(pm.shape[0], num_frames)
@@ -149,16 +175,22 @@ class VaceBatchTool:
             if pm.shape[0] < num_frames:
                 masks[pm.shape[0]:] = pm[-1:]
 
-        # Apply keyframes (index out of range is silently skipped)
-        for (idx, kf_img, kf_mask) in keyframes:
+        # Apply keyframes (index out of range is silently skipped). A
+        # multi-frame image_N input is a clip: it fills idx, idx+1, … (clipped
+        # at num_frames) — it used to land only its first frame on idx and
+        # drop the rest. Only the frames that land are resized.
+        for (idx, kf_img, kf_mask, as_clip) in keyframes:
             if idx < 0 or idx >= num_frames:
                 continue
+            take = (num_frames - idx) if as_clip else 1
             if kf_img is not None:
-                k = _resize_image(kf_img, H, W)[..., :3].to(images.dtype).cpu()
-                images[idx] = k[0]
+                k = _resize_image(kf_img[:take], H, W)[..., :3].to(images.dtype).cpu()
+                images[idx:idx + k.shape[0]] = k
             if kf_mask is not None:
-                km = _resize_mask(kf_mask, H, W).to(masks.dtype).cpu()
-                masks[idx] = km[0]
+                km = kf_mask.unsqueeze(0) if kf_mask.ndim == 2 else kf_mask
+                km = _resize_mask(km[:take], H, W).to(masks.dtype).cpu()
+                masks[idx:idx + km.shape[0]] = km
+                keep_plate[idx:idx + km.shape[0]] = False
             elif kf_img is not None:
                 # Image given without a mask → preserve frame (black mask).
                 #
@@ -167,10 +199,11 @@ class VaceBatchTool:
                 # here and had the mask it just set overwritten with zeros.
                 # Now it only fires for the image-without-mask case the comment
                 # describes.
-                masks[idx] = 0.0
+                masks[idx:idx + k.shape[0]] = 0.0
 
         if premultiply:
             m = masks.unsqueeze(-1).clamp(0.0, 1.0)
+            m[keep_plate] = 0.0
             images = images * (1.0 - m) + fc * m
 
         return (images, masks)

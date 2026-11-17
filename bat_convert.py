@@ -66,6 +66,21 @@ def _to_int(value) -> int:
     raise TypeError(f"Cannot convert {type(value).__name__} to a number.")
 
 
+def _exact_int(value):
+    """The value as an exact Python int when it is one (an int, or a string
+    holding an integer), else None. Bools are left to the float path."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _to_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -199,7 +214,14 @@ class BatNumberToString:
     def to_string(self, value, decimals=-1, pad_to=0, prefix="", suffix=""):
         number = _to_float(value)
 
-        if decimals < 0:
+        # An integer must not pass through float: past 2**53 a float cannot
+        # hold every integer, and seeds (up to 2**64) routinely live there —
+        # 123456789012345678 used to come out as ...680.
+        exact = _exact_int(value)
+
+        if exact is not None:
+            body = str(exact) if decimals <= 0 else f"{exact}.{'0' * decimals}"
+        elif decimals < 0:
             # Preserve intent: an integer-valued input should not sprout a
             # decimal point just by passing through this node.
             if isinstance(value, bool) or float(number).is_integer():

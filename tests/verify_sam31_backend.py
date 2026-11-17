@@ -44,6 +44,12 @@ def iou(a, b):
     return (a & b).sum().item() / u if u else 1.0
 
 
+# GPU-only test. Check before importing the pack: comfy.model_management picks
+# a device at import time and raises on a machine without CUDA (e.g. CI).
+if not torch.cuda.is_available():
+    print("SKIP  no CUDA device")
+    sys.exit(0)
+
 # Load the pack's modules without its __init__ (which needs a running server).
 pkg = types.ModuleType("batpack")
 pkg.__path__ = [PACK]
@@ -51,11 +57,14 @@ sys.modules["batpack"] = pkg
 from batpack import bat_sam31_runtime as rt          # noqa: E402
 from batpack import bat_sam31_segmenter as seg       # noqa: E402
 
+# A skip must exit 0: sys.exit("message") exits 1, which CI counts as a failure.
 if not rt.list_models():
-    sys.exit("SKIP: no SAM 3 checkpoint in models/checkpoints")
+    print("SKIP  no SAM 3 checkpoint in models/checkpoints")
+    sys.exit(0)
 free = torch.cuda.mem_get_info()[0] / 1e9 if torch.cuda.is_available() else 0
 if free < 4:
-    sys.exit(f"SKIP: only {free:.1f} GB VRAM free")
+    print(f"SKIP  only {free:.1f} GB VRAM free")
+    sys.exit(0)
 
 print("parse_state")
 st = seg.parse_state("not json")

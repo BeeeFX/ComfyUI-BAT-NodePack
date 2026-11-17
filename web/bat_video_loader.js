@@ -16,7 +16,8 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { addBatDOMWidget, clampNodeSize, vueNodesEnabled, unpinWidgetWidth } from "./bat_node_layout.js";
-import { makeBatPathWidget } from "./bat_path_widget.js";
+import { installBatPathWidget, makeBatPathWidget } from "./bat_path_widget.js";
+import { batTrack } from "./bat_lifecycle.js";
 
 const NODE_TYPE = "Bat_VideoLoader";
 const PATH_ROUTE   = "/bat/getpath";
@@ -123,9 +124,16 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
         type: "BAT.TRIM",
         value: null,
 
+        // The node this widget belongs to. Looked up by walking app.graph
+        // before, which is the ROOT graph — so inside a subgraph the lookup
+        // failed and nudges/keys never refreshed anything.
+        _batOwner: node,
+
         // Volatile state. start/end live on the INT widgets — single
-        // source of truth that ComfyUI serialises.
-        _state: {
+        // source of truth that ComfyUI serialises. Not `_state`: that is
+        // BaseWidget's own (store-backed) field, and the frontend's adoption
+        // of this object replaced ours with it.
+        _trim: {
             frameCount: 0,
             fps: 0,
             width: 0,
@@ -143,10 +151,8 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             hoverFrame: null,        // for hairline + tooltip
             hoverInTimeline: false,
         },
-        get _start() { return startIntWidget.value | 0; },
-        set _start(v) { startIntWidget.value = v | 0; },
-        get _end()   { return endIntWidget.value | 0; },
-        set _end(v)  { endIntWidget.value = v | 0; },
+        // _start / _end are accessors onto the INT widgets, installed by
+        // bindTrimAccessors() once this object is in node.widgets — see there.
 
         computeSize() { return [360, TRIM_TOTAL_H]; },
 
@@ -199,12 +205,12 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
         },
 
         _frameToX(frame, L) {
-            const st = this._state;
+            const st = this._trim;
             if (st.frameCount < 2) return L.left;
             return L.left + (frame / (st.frameCount - 1)) * L.inner;
         },
         _xToFrame(x, L) {
-            const st = this._state;
+            const st = this._trim;
             if (st.frameCount < 2) return 0;
             const t = clamp((x - L.left) / L.inner, 0, 1);
             return Math.round(t * (st.frameCount - 1));
@@ -214,8 +220,9 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
         draw(ctx, n, width, y, H) {
             this._last_w = width;
             this._last_y = y;
-            const st = this._state;
+            const st = this._trim;
             const L = this._layout(width, y);
+            if (globalThis.LiteGraph?.vueNodesMode) this._bindHoverCanvas(ctx.canvas, width, y);
 
             // ── Thumbnails ────────────────────────────────────────────────
             this._drawThumb(ctx, L, "start", L.left,                                st.startImg, this._start);
@@ -347,13 +354,12 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
         // Resolve the select_every_nth widget's current value (if the node
         // declares one). Falls back to 1 so existing workflows still work.
         _strideValue() {
-            const n = findNodeForWidget(this);
-            const w = n?.widgets?.find(w => w.name === "select_every_nth");
+            const w = node?.widgets?.find(w => w.name === "select_every_nth");
             return (w?.value | 0) || 1;
         },
 
         _drawThumb(ctx, L, label, x, img, frameIdx) {
-            const st = this._state;
+            const st = this._trim;
             const y = L.thumbY, tw = L.thumbW, th = L.thumbH;
             ctx.fillStyle = "#0e0e0e";
             ctx.fillRect(x, y, tw, th);
@@ -395,7 +401,7 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
         },
 
         _drawHandle(ctx, x, y, which, accent) {
-            const st = this._state;
+            const st = this._trim;
             const active = st.dragMode === which;
             const focused = st.lastTouched === which;
             // Focus ring (last-touched handle)
@@ -419,12 +425,79 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             ctx.fill();
         },
 
+        // ── Hover ──────────────────────────────────────────────────────────
+        // Point the hover state (hairline, tooltip, and the frame the I / O
+        // keys set) at widget-local (lx, ly) on layout L. True when it moved.
+        _hoverAt(lx, ly, L) {
+            const st = this._trim;
+            const inTL = ly >= L.timelineY - 4 && ly <= L.timelineY + L.timelineH + 4;
+            const newHover = (inTL && st.frameCount > 1) ? this._xToFrame(lx, L) : null;
+            if (newHover === st.hoverFrame && inTL === st.hoverInTimeline) return false;
+            st.hoverFrame = newHover;
+            st.hoverInTimeline = inTL;
+            return true;
+        },
+
+        // Nodes 2.0 only. WidgetLegacy.vue forwards a press and its drag to
+        // mouse(), but never a plain hover move, so the hairline and the I / O
+        // keys were dead there. The ctx.canvas handed to draw() IS that
+        // component's own <canvas>, so listen on it directly — in the same
+        // widget-local pixels draw() used (it paints at the CSS size; offsetX
+        // is in the element's own, untransformed, box).
+        //
+        // One entry per element: the widget can be drawn by two components at
+        // once (the node and the parameters panel), each with its own width,
+        // and a remount hands over a fresh <canvas>. Detached ones are
+        // released here; the rest on node removal (_unbindHover).
+        _bindHoverCanvas(el, width, y) {
+            if (!el || typeof el.addEventListener !== "function") return;
+            const bound = (this._hoverEls ||= new Map());
+            for (const [old, entry] of bound) {
+                if (old !== el && old.isConnected === false) {
+                    entry.off();
+                    bound.delete(old);
+                }
+            }
+            const known = bound.get(el);
+            if (known) { known.width = width; known.y = y; return; }
+            const entry = { width, y };
+            const self = this;
+            const move = (e) => {
+                // A press is a drag, and mouse() owns those.
+                if (e.buttons || self._trim.dragMode != null) return;
+                const L = self._layout(entry.width, entry.y);
+                if (self._hoverAt(e.offsetX, e.offsetY, L)) redrawTrim(self._batOwner, self);
+            };
+            const leave = () => {
+                const L = self._layout(entry.width, entry.y);
+                if (self._hoverAt(-1, -1e9, L)) redrawTrim(self._batOwner, self);
+            };
+            el.addEventListener("pointermove", move);
+            el.addEventListener("pointerleave", leave);
+            entry.off = () => {
+                el.removeEventListener("pointermove", move);
+                el.removeEventListener("pointerleave", leave);
+            };
+            bound.set(el, entry);
+        },
+
+        _unbindHover() {
+            for (const entry of this._hoverEls?.values() || []) entry.off();
+            this._hoverEls?.clear();
+        },
+
         // ── Mouse / wheel ──────────────────────────────────────────────────
         mouse(event, pos, n) {
-            const st = this._state;
+            const st = this._trim;
             const width = this._last_w || n.size[0];
             const y0 = this._last_y || 0;
             const L = this._layout(width, y0);
+            // Nodes 2.0 paints this widget into its own canvas at y=1 and hands
+            // `pos` in THAT canvas's coordinates (WidgetLegacy.vue: processWidgetClick
+            // on down, pointer.onDrag on move). The clientX -> graph arithmetic
+            // below is relative to node.pos, i.e. off by wherever the widget sits
+            // inside the node, so under 2.0 `pos` is the truth.
+            const vue = !!globalThis.LiteGraph?.vueNodesMode;
 
             // Translate clientX → widget-local-X (consistent across versions).
             const canvasEl = app.canvas.canvas;
@@ -435,28 +508,34 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             const widgetOriginGraphY = n.pos[1];
             const clientToWidgetX = (cx) => (cx - rect.left) / scale - off[0] - widgetOriginGraphX;
             const clientToGraphY  = (cy) => (cy - rect.top)  / scale - off[1] - widgetOriginGraphY;
+            const localX = (e) => (vue || e.clientX == null) ? pos[0] : clientToWidgetX(e.clientX);
+            const localY = (e) => (vue || e.clientY == null) ? pos[1] : clientToGraphY(e.clientY);
 
             // Hover (pointermove with no drag) — only updates hover state.
             const isMove = event.type === "pointermove" || event.type === "mousemove";
             const isDown = event.type === "pointerdown" || event.type === "mousedown" || event.type === "down";
             const isWheel = event.type === "wheel";
 
-            if (isMove && st.dragMode == null) {
-                const lx = event.clientX != null ? clientToWidgetX(event.clientX) : pos[0];
-                const ly = event.clientY != null ? clientToGraphY(event.clientY) : pos[1];
-                const inTL = ly >= L.timelineY - 4 && ly <= L.timelineY + L.timelineH + 4;
-                const newHover = (inTL && st.frameCount > 1) ? this._xToFrame(lx, L) : null;
-                if (newHover !== st.hoverFrame || inTL !== st.hoverInTimeline) {
-                    st.hoverFrame = newHover;
-                    st.hoverInTimeline = inTL;
-                    n.setDirtyCanvas(true, true);
+            // Nodes 2.0: the drag's moves and its release come back through
+            // here — listeners on app.canvas.canvas never see them, because
+            // the node is DOM on top of that canvas and WidgetLegacy captures
+            // the pointer.
+            if (vue && st.dragMode != null) {
+                if (isMove) { st.dragApply?.(pos[0]); return true; }
+                if (event.type === "pointerup" || event.type === "pointercancel") {
+                    st.dragEnd?.();
+                    return true;
                 }
+            }
+
+            if (isMove && st.dragMode == null) {
+                if (this._hoverAt(localX(event), localY(event), L)) redrawTrim(n, this);
                 return false;
             }
 
             // Mouse wheel — nudge nearest handle if pointer is over the timeline.
             if (isWheel && st.frameCount > 1) {
-                const lx = event.clientX != null ? clientToWidgetX(event.clientX) : pos[0];
+                const lx = localX(event);
                 const sx = this._frameToX(this._start, L);
                 const ex = this._frameToX(this._end, L);
                 const nearStart = Math.abs(lx - sx) <= HANDLE_HIT_R;
@@ -475,8 +554,8 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             if (!isDown) return false;
             if (st.frameCount < 2) return false;
 
-            const lx = event.clientX != null ? clientToWidgetX(event.clientX) : pos[0];
-            const ly = event.clientY != null ? clientToGraphY(event.clientY) : pos[1];
+            const lx = localX(event);
+            const ly = localY(event);
 
             // 1. Step buttons
             for (const b of this._stepButtonRects(L)) {
@@ -516,7 +595,7 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             }
             st.dragMode = mode;
             st.lastTouched = mode === "range" ? st.lastTouched : mode;
-            n.setDirtyCanvas(true, true);
+            redrawTrim(n, this);
 
             const self = this;
             const applyAt = (xLocal) => {
@@ -533,7 +612,7 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
                     self._start = ns;
                     self._end = ns + dur;
                 }
-                n.setDirtyCanvas(true, true);
+                redrawTrim(n, self);
                 syncPreviewRange(n);
                 // Live thumbnail refresh while dragging (debounced).
                 if (st.dragMode === "start" || st.dragMode === "range") debouncedFetchStart(n);
@@ -541,7 +620,13 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
             };
 
             const onMove = (e) => applyAt(clientToWidgetX(e.clientX));
+            let ended = false;
             const cleanup = () => {
+                // Twice under 2.0 (WidgetLegacy's release, then the window
+                // backstop); the second is a no-op.
+                if (ended) return;
+                ended = true;
+                st.dragApply = st.dragEnd = null;
                 canvasEl.removeEventListener("pointermove", onMove, true);
                 canvasEl.removeEventListener("pointerup",   onUp,   true);
                 canvasEl.removeEventListener("pointercancel", onUp, true);
@@ -553,12 +638,17 @@ function makeTrimWidget(node, startIntWidget, endIntWidget) {
                 fetchFrame(n, "start");
                 fetchFrame(n, "end");
                 syncPreviewRange(n);
-                n.setDirtyCanvas(true, true);
+                redrawTrim(n, self);
             };
             const onUp = () => cleanup();
-            canvasEl.addEventListener("pointermove",   onMove, true);
-            canvasEl.addEventListener("pointerup",     onUp,   true);
-            canvasEl.addEventListener("pointercancel", onUp,   true);
+            if (vue) {
+                st.dragApply = applyAt;
+                st.dragEnd = cleanup;
+            } else {
+                canvasEl.addEventListener("pointermove",   onMove, true);
+                canvasEl.addEventListener("pointerup",     onUp,   true);
+                canvasEl.addEventListener("pointercancel", onUp,   true);
+            }
             window.addEventListener("pointerup", onUp, true);
             window.addEventListener("mouseup",   onUp, true);
             window.addEventListener("blur",      onUp);
@@ -580,7 +670,7 @@ const debouncedFetchEnd   = debounce((n) => fetchFrame(n, "end"),   180);
 // buttons, wheel, keyboard). Clamps, writes through, focuses the handle,
 // refreshes the canvas, and triggers a debounced thumb refresh.
 function commitFrame(widget, which, newFrame) {
-    const st = widget._state;
+    const st = widget._trim;
     const f = clamp(newFrame | 0, 0, Math.max(0, st.frameCount - 1));
     if (which === "start") widget._start = Math.min(f, widget._end);
     else                   widget._end   = Math.max(f, widget._start);
@@ -594,7 +684,7 @@ function nudgeHandle(widget, which, delta) {
     // again on next dirty — find the node by walking app.graph._nodes.
     const node = findNodeForWidget(widget);
     if (node) {
-        node.setDirtyCanvas(true, true);
+        redrawTrim(node, widget);
         syncPreviewRange(node);
         if (which === "start") debouncedFetchStart(node);
         else                   debouncedFetchEnd(node);
@@ -602,11 +692,40 @@ function nudgeHandle(widget, which, delta) {
 }
 
 function findNodeForWidget(widget) {
-    const nodes = app.graph?._nodes || [];
+    if (widget?._batOwner) return widget._batOwner;
+    const nodes = app.canvas?.graph?._nodes || app.graph?._nodes || [];
     for (const n of nodes) {
         if (n.widgets && n.widgets.includes(widget)) return n;
     }
     return null;
+}
+
+// Repaint the trim widget in whichever renderer draws it. Nodes 2.0 paints it
+// into its own small canvas and repaints only on triggerDraw (WidgetLegacy.vue);
+// setDirtyCanvas redraws the graph canvas, which no longer draws it — so an
+// async thumbnail, the info lookup or a drag left the widget frozen.
+function redrawTrim(node, trimW) {
+    node?.setDirtyCanvas?.(true, true);
+    trimW?.triggerDraw?.();
+}
+
+// Install `_start` / `_end` — accessors onto the INT widgets — on the trim
+// widget that is actually IN node.widgets. The frontend adopts a plain-object
+// widget on insertion (widgetMap.ts adoptConcreteWidget), and its descriptor
+// merge keeps BaseWidget's copy of each field, which for a getter is the value
+// it returned at that moment. Written into the object literal, _start/_end
+// froze at insertion: the slider moved a private number and start_frame /
+// end_frame — what actually loads — never changed.
+function bindTrimAccessors(w, startIntWidget, endIntWidget) {
+    Object.defineProperties(w, {
+        _start: { configurable: true,
+                  get() { return startIntWidget.value | 0; },
+                  set(v) { startIntWidget.value = v | 0; } },
+        _end:   { configurable: true,
+                  get() { return endIntWidget.value | 0; },
+                  set(v) { endIntWidget.value = v | 0; } },
+    });
+    return w;
 }
 
 // Push the trim widget's current state into the preview's playback range.
@@ -616,7 +735,7 @@ function syncPreviewRange(node) {
     if (!preview) return;
     const trim = node.widgets.find(w => w.type === "BAT.TRIM");
     if (!trim) return;
-    preview.setRange(trim._start, trim._end, trim._state.fps);
+    preview.setRange(trim._start, trim._end, trim._trim.fps);
 }
 
 // ─── Loading / preview fetching ─────────────────────────────────────────────
@@ -647,7 +766,7 @@ async function fetchVideoInfo(node) {
         // Superseded by a newer lookup, or the artist changed the path — drop it.
         if (seq !== node._batInfoSeq || pathW.value !== pathAtRequest) return;
         if (!info.ok) { console.warn("[Bat] video-info:", info.error); return; }
-        const st = trimW._state;
+        const st = trimW._trim;
         st.frameCount = info.frame_count | 0;
         st.fps = info.fps || 0;
         st.width = info.width | 0;
@@ -670,7 +789,7 @@ async function fetchVideoInfo(node) {
             node._batPreview.setSource(api.apiURL(`${STREAM_ROUTE}?path=${encodeURIComponent(pathW.value)}`));
             node._batPreview.setRange(trimW._start, trimW._end, st.fps);
         }
-        node.setDirtyCanvas(true, true);
+        redrawTrim(node, trimW);
         fetchFrame(node, "start");
         fetchFrame(node, "end");
     } catch (e) {
@@ -685,7 +804,7 @@ function fetchFrame(node, which) {
     const pathW = node.widgets.find(w => w.name === "path");
     const trimW = node.widgets.find(w => w.name === "trim");
     if (!pathW?.value || !trimW) return;
-    const st = trimW._state;
+    const st = trimW._trim;
     const frame = which === "start" ? trimW._start : trimW._end;
     if (frame < 0) return;
     if (which === "start" && st.startImgFrame === frame) return;
@@ -712,7 +831,7 @@ function fetchFrame(node, which) {
         if (seq !== seqs[which] || pathW.value !== pathAtRequest) return;
         if (which === "start") { st.startImg = img; st.startImgFrame = frame; }
         else                   { st.endImg = img;   st.endImgFrame = frame; }
-        node.setDirtyCanvas(true, true);
+        redrawTrim(node, trimW);
     };
     img.onerror = () => {};
     img.src = url;
@@ -982,6 +1101,11 @@ function makePreviewWidget() {
 // When a Bat_VideoLoader node is the (only) selected node, arrow keys and
 // a few NLE-style bindings nudge / snap the trim handles. Skipped when the
 // active focus target is an input/textarea so the path popup keeps working.
+//
+// Capture phase, so a handled key goes no further. ComfyUI's own keybinding
+// handler is a bubble-phase listener on this same window, which a bubble-phase
+// stopPropagation here cannot reach — and it binds a bare "." to Fit View, so
+// nudging the handle by one frame also re-framed the whole canvas.
 
 function selectedTrimWidget() {
     const sel = app.canvas?.selected_nodes;
@@ -998,7 +1122,7 @@ window.addEventListener("keydown", (e) => {
     if (tag === "INPUT" || tag === "TEXTAREA" || e.target?.isContentEditable) return;
     const tw = selectedTrimWidget();
     if (!tw) return;
-    const st = tw._state;
+    const st = tw._trim;
     if (st.frameCount < 2) return;
 
     const mag = e.shiftKey ? 10 : 1;
@@ -1023,11 +1147,11 @@ window.addEventListener("keydown", (e) => {
     function finalize(only) {
         const node = findNodeForWidget(tw);
         if (!node) return;
-        node.setDirtyCanvas(true, true);
+        redrawTrim(node, tw);
         if (!only || only === "start") debouncedFetchStart(node);
         if (!only || only === "end")   debouncedFetchEnd(node);
     }
-});
+}, true);
 
 // ─── Extension hook ─────────────────────────────────────────────────────────
 
@@ -1056,7 +1180,7 @@ app.registerExtension({
                     route: PATH_ROUTE, title: "Video Path",
                 });
                 path.callback = () => fetchVideoInfo(this);
-                this.widgets[pathIdx] = path;
+                installBatPathWidget(this, pathIdx, path);
             }
 
             // Keep the INT widgets visible so the user can type exact
@@ -1075,7 +1199,7 @@ app.registerExtension({
                 }
                 if (startInt && startInt.value < 0) startInt.value = 0;
                 if (endInt   && endInt.value   < 0) endInt.value   = 0;
-                self.setDirtyCanvas(true, true);
+                redrawTrim(self, self.widgets?.find(w => w.name === "trim"));
                 syncPreviewRange(self);
                 debouncedFetchStart(self);
                 debouncedFetchEnd(self);
@@ -1098,11 +1222,14 @@ app.registerExtension({
             // Append the trim widget after the INT widgets so the
             // text inputs appear above the scrubber.
             if (startInt && endInt) {
-                // unpin: the trim widget hit-tests against the width it
-                // was last drawn at, so a stamped widget.width puts every
-                // handle and step button beside where it appears.
-                const trim = unpinWidgetWidth(makeTrimWidget(this, startInt, endInt));
-                this.widgets.push(trim);
+                this.widgets.push(makeTrimWidget(this, startInt, endInt));
+                // Both AFTER insertion, on the widget the list actually holds:
+                // adoption on insertion would undo either done beforehand (see
+                // bindTrimAccessors). unpin: the trim widget hit-tests against
+                // the width it was last drawn at, so a stamped widget.width
+                // puts every handle and step button beside where it appears.
+                const trim = this.widgets.find(w => w.name === "trim");
+                if (trim) unpinWidgetWidth(bindTrimAccessors(trim, startInt, endInt));
             }
 
             // Attach the HTML5 video preview underneath. addDOMWidget
@@ -1111,6 +1238,15 @@ app.registerExtension({
             // it isn't persisted in the workflow JSON.
             const preview = makePreviewWidget();
             this._batPreview = preview;
+            // Release the <video> (preload="auto" keeps buffering the file),
+            // any info lookup still in flight, and the trim widget's Nodes 2.0
+            // hover listeners when the node is deleted.
+            const node = this;
+            batTrack(this).dispose(() => {
+                preview.dispose();
+                if (node._batInfoAbort) { try { node._batInfoAbort.abort(); } catch (_) {} }
+                node.widgets?.find(w => w.name === "trim")?._unbindHover?.();
+            });
             // Dual-mode sizing. The preview pane's own height is declared here
             // (PREVIEW_H) so Nodes 2.0 can size the node from the widget rather
             // than from the `computeSize() + previewH` arithmetic below, which
@@ -1124,11 +1260,12 @@ app.registerExtension({
             // so the info-fetch there gets the right start/end.
             queueMicrotask(() => fetchVideoInfo(this));
 
-            // Resize node to fit (Nodes 1.0 only — clampNodeSize no-ops under
-            // 2.0, where the height comes from each widget's computeLayoutSize).
-            // Bump min width so the IN/OUT step button clusters + status line
-            // don't crowd each other, and add room for the preview pane below
-            // the trim widget.
+            // Resize node to fit. Bump min width so the IN/OUT step button
+            // clusters + status line don't crowd each other, and add room for
+            // the preview pane below the trim widget. Under 2.0 the height
+            // comes from each widget's computeLayoutSize, so only the width
+            // floor applies — without it a fresh node opened at the default
+            // ~250px, too narrow for the trim controls.
             if (!vueNodesEnabled()) {
                 const computed = this.computeSize();
                 this.size = [
@@ -1136,6 +1273,8 @@ app.registerExtension({
                     computed[1] + VIDEO_PANE_H,
                 ];
                 this.setDirtyCanvas?.(true, true);
+            } else {
+                clampNodeSize(this, 420, 0);
             }
             return r;
         };
@@ -1147,6 +1286,34 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function (info) {
             const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
             queueMicrotask(() => fetchVideoInfo(this));
+            return r;
+        };
+
+        // Hover under Nodes 1.0. LGraphCanvas forwards pointermove to
+        // widget.mouse() only while a press is in progress (node_widget is set
+        // by processWidgetClick), so a plain hover never reached the trim
+        // widget and the hairline and I / O keys were dead here too. The node
+        // does get every hover move, in node-local graph units — the space the
+        // widget was drawn in at (_last_w, _last_y). Under 2.0 the widget's own
+        // canvas listener covers it (_bindHoverCanvas), so this stays out.
+        const trimHover = (node, lx, ly) => {
+            if (globalThis.LiteGraph?.vueNodesMode) return;
+            const trim = node.widgets?.find(w => w.type === "BAT.TRIM");
+            if (!trim || trim._last_y == null || trim._trim.dragMode != null) return;
+            const L = trim._layout(trim._last_w || node.size[0], trim._last_y);
+            // Off the timeline rows _hoverAt clears it; redraw only on a change.
+            if (trim._hoverAt(lx, ly, L)) redrawTrim(node, trim);
+        };
+        const onMouseMove = nodeType.prototype.onMouseMove;
+        nodeType.prototype.onMouseMove = function (e, pos) {
+            const r = onMouseMove ? onMouseMove.apply(this, arguments) : undefined;
+            if (pos) trimHover(this, pos[0], pos[1]);
+            return r;
+        };
+        const onMouseLeave = nodeType.prototype.onMouseLeave;
+        nodeType.prototype.onMouseLeave = function () {
+            const r = onMouseLeave ? onMouseLeave.apply(this, arguments) : undefined;
+            trimHover(this, -1, -1e9);
             return r;
         };
     },

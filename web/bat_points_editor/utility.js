@@ -4,6 +4,12 @@
 // without KJNodes installed.
 
 const { app } = window.comfyAPI.app;
+const { api } = window.comfyAPI.api;
+
+/** True while the Vue (Nodes 2.0) renderer is drawing the graph. */
+export function isVueNodesMode() {
+  return !!window.LiteGraph?.vueNodesMode;
+}
 
 export function makeUUID() {
   let dt = new Date().getTime()
@@ -35,14 +41,20 @@ export function chainCallback(object, property, callback) {
 export function addMiddleClickPan(element) {
   const onMouseDown = (e) => {
     if (e.button !== 1) return;
+    // Nodes 2.0's TransformPane already forwards middle-button drags over a
+    // node to LiteGraph's own pan; a second pan here would fight it.
+    if (isVueNodesMode()) return;
     e.preventDefault();
     const ds = app.canvas?.ds;
     if (!ds) return;
     const startX = e.clientX, startY = e.clientY;
     const startOffsetX = ds.offset[0], startOffsetY = ds.offset[1];
     const onMove = (me) => {
-      ds.offset[0] = startOffsetX + (me.clientX - startX);
-      ds.offset[1] = startOffsetY + (me.clientY - startY);
+      // ds.offset is in graph units; divide by scale (as LiteGraph's own pan
+      // does) so the graph tracks the cursor at any zoom.
+      const scale = ds.scale || 1;
+      ds.offset[0] = startOffsetX + (me.clientX - startX) / scale;
+      ds.offset[1] = startOffsetY + (me.clientY - startY) / scale;
       app.canvas.setDirty(true, true);
     };
     const onUp = () => {
@@ -76,14 +88,37 @@ export function resolveSourcePreview(node, inputSlot) {
     const lastSlash = fname.lastIndexOf("/");
     if (lastSlash >= 0) { subfolder = fname.substring(0, lastSlash); fname = fname.substring(lastSlash + 1); }
     const isVideo = w.name === "video";
-    const url = `/view?filename=${encodeURIComponent(fname)}&type=input&subfolder=${encodeURIComponent(subfolder)}`;
+    const url = api.apiURL(`/view?filename=${encodeURIComponent(fname)}&type=input&subfolder=${encodeURIComponent(subfolder)}`);
     return { url, isVideo };
+  }
+
+  // The source's last execution output. Preferred over srcNode.imgs, which is
+  // only filled once that node's preview has actually been drawn — from
+  // onDrawBackground in Nodes 1.0, from the Vue ImagePreview's <img> load in
+  // Nodes 2.0 — so it's empty for an off-screen or not-yet-rendered node.
+  const image = nodeOutputImages(srcNode)?.[0];
+  if (image?.filename) {
+    const params = new URLSearchParams({
+      filename: image.filename, type: image.type || "output", subfolder: image.subfolder || "",
+    });
+    return { url: api.apiURL(`/view?${params}`), isVideo: false };
   }
 
   if (srcNode.imgs?.length > 0 && srcNode.imgs[0].src) {
     return { url: srcNode.imgs[0].src, isVideo: false };
   }
   return null;
+}
+
+// app.nodeOutputs is keyed by node locator: the bare id at the root, and
+// "<subgraph uuid>:<id>" inside a subgraph.
+function nodeOutputImages(node) {
+  const outputs = app.nodeOutputs;
+  if (!outputs) return null;
+  const graph = node.graph;
+  const inSubgraph = graph && graph.rootGraph && graph !== graph.rootGraph;
+  const key = inSubgraph ? `${graph.id}:${node.id}` : String(node.id);
+  return outputs[key]?.images ?? null;
 }
 
 export function watchImageInputs(node, inputName, onChange) {

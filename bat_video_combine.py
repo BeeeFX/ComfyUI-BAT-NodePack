@@ -385,6 +385,54 @@ def _safe_name(s: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in s)
 
 
+# NTSC rates, keyed by the integer rate they sit just under. The frame_rate
+# widget steps (and the frontend rounds) to 0.01, so an artist asking for
+# 23.976 actually sends 23.98 — which ffmpeg would take literally as 1199/50,
+# a rate no NLE or broadcast spec uses, drifting ~0.1s per 10 minutes against
+# 23.976 audio.
+_NTSC_RATES = {24: "24000/1001", 30: "30000/1001", 48: "48000/1001",
+               60: "60000/1001", 120: "120000/1001"}
+
+
+def _snap_frame_rate(frame_rate: float):
+    """(ffmpeg rate string, float value) for `frame_rate`, snapping anything
+    within 0.01 of an NTSC rate (23.976 / 23.98, 29.97, 47.95, 59.94, 119.88)
+    to its exact x000/1001 rational. Every other rate passes through as-is."""
+    fps = float(frame_rate)
+    for base, rational in _NTSC_RATES.items():
+        exact = base * 1000.0 / 1001.0
+        if abs(fps - exact) < 0.01:
+            return rational, exact
+    return f"{fps}", fps
+
+
+def _remove_partial_output(output_path: str) -> None:
+    """Delete whatever an aborted encode left at `output_path`.
+
+    A single file is removed outright. A printf pattern (image sequence)
+    removes the frames written so far, then the sequence directory if that
+    leaves it empty. The directory half of a pattern arrives with any literal
+    `%` doubled (see combine()), so it is un-escaped before touching disk."""
+    head, tail = os.path.split(output_path)
+    if not _SEQ_TOKEN_RE.search(tail):
+        if os.path.isfile(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        return
+    seq_dir = head.replace("%%", "%")
+    for _, frame_path in _scan_sequence(seq_dir, tail):
+        try:
+            os.remove(frame_path)
+        except OSError:
+            pass
+    try:
+        os.rmdir(seq_dir)
+    except OSError:
+        pass
+
+
 # Cleared the first time torch's uint16 bridge to numpy turns out to be
 # missing (it landed in torch 2.3, and this pack ships into checkouts on
 # older builds). Once cleared we stay on the numpy path for the process —
@@ -921,7 +969,13 @@ def _encode(
     # ffmpeg does support, which the hidden `ffmpeg_compression` derives.
     if fmt.get("writer") == "oiio":
         if _oiio() is not None:
-            _write_sequence_oiio(images, fmt, widget_values, output_path, metadata)
+            try:
+                _write_sequence_oiio(images, fmt, widget_values, output_path, metadata)
+            except BaseException:
+                # Interrupted or failed part-way: don't leave a short sequence
+                # sitting in output/ looking like a finished render.
+                _remove_partial_output(output_path)
+                raise
             return
         logger.warning(
             "Bat_VideoCombine: OpenImageIO not available — falling back to "
@@ -932,10 +986,11 @@ def _encode(
         )
 
     # Even-dimensions guard: codecs paired with YUV 4:2:0/4:2:2 chroma
-    # subsampling (h264, h265, vp9, av1, prores, animated webp) refuse
-    # odd width/height — ffmpeg errors out with "width not divisible by
-    # 2". Pad up by a single black row/column on the right/bottom when
-    # the format JSON declares `requires_even_dims: true`. Single-pixel
+    # subsampling (h264, h265, vp9, av1, prores) refuse odd width/height
+    # — ffmpeg errors out with "width not divisible by 2". (libwebp takes
+    # odd sizes, so webp keeps its own dimensions.) Pad up by a single
+    # black row/column on the right/bottom when the format JSON declares
+    # `requires_even_dims: true`. Single-pixel
     # padding is imperceptible and preserves the original pixel data
     # bit-for-bit, vs. a scale filter which would resample everything.
     # The pad is applied per-frame in the streaming loop below (pad_h/pad_w)
@@ -1030,7 +1085,7 @@ def _encode(
             "-f", "rawvideo",
             "-pix_fmt", input_pix,
             "-s", f"{w}x{h}",
-            "-r", f"{frame_rate}",
+            "-r", _snap_frame_rate(frame_rate)[0],
             "-i", "-",                                # raw frames on stdin (input 0)
         ]
         if audio_path:
@@ -1039,10 +1094,24 @@ def _encode(
             args += ["-f", "ffmetadata", "-i", meta_file]  # metadata (next input)
 
         args += _expand_widget_args(fmt.get("video_args", []), widget_values)
+        # Extra args for YUV output only (FFV1 offers RGB and YUV layouts from
+        # one arg list, and only the YUV ones want a matrix + colour tags).
+        if str(widget_values.get("pix_fmt") or "").startswith("yuv"):
+            args += _expand_widget_args(fmt.get("yuv_video_args", []), widget_values)
         audio_args = fmt.get("audio_args")
         if audio_path and audio_args:
             args += _expand_widget_args(audio_args, widget_values)
-            args += ["-shortest"]
+            # The frames set the length, never the audio. `-shortest` on its
+            # own cut the video at the end of a shorter clip — 48 frames with
+            # 1s of audio came out 24 frames long, or, once ffmpeg had quit and
+            # closed stdin under larger frames, failed as a broken pipe. apad
+            # pads a short clip with silence up to the video's duration, so the
+            # video is never the stream that gets cut; `-shortest` still trims
+            # a longer clip. The pad is bounded (whole_dur) on purpose: an
+            # open-ended apad defeats -shortest's trim, and a 2s ProRes came
+            # out with a minute of trailing silence.
+            video_secs = n / _snap_frame_rate(frame_rate)[1]
+            args += ["-af", f"apad=whole_dur={video_secs:.6f}", "-shortest"]
         elif not audio_path:
             args += ["-an"]
 
@@ -1087,6 +1156,8 @@ def _encode(
             stderr_thread.join(timeout=5)
             return b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
+        # Cleared only once ffmpeg has exited cleanly; see the `finally`.
+        finished = False
         try:
             # Convert-and-pipe one frame at a time. The even-dims pad is
             # applied here, per frame, so peak memory stays
@@ -1137,11 +1208,36 @@ def _encode(
                 raise RuntimeError(f"ffmpeg failed (rc={rc}):\n{err}")
             if err.strip():
                 logger.debug(f"ffmpeg stderr: {err.strip()[:500]}")
-        except BrokenPipeError:
+            finished = True
+        except OSError:
             # ffmpeg died mid-stream (e.g. bad args). Reap it, then surface the
-            # real complaint from the drained stderr.
+            # real complaint from the drained stderr. OSError, not just
+            # BrokenPipeError: on Windows the same dead pipe raises EINVAL.
             proc.wait()
             raise RuntimeError(f"ffmpeg pipe broke:\n{_stderr_text()}")
+        finally:
+            if not finished:
+                # Anything that stops the stream early — a user interrupt
+                # (InterruptProcessingException is a BaseException, raised from
+                # the progress-bar hook), a CUDA error while packing, ffmpeg
+                # failing. Left alone, ffmpeg sat on an open stdin indefinitely
+                # and the half-written file (an mp4 with no moov atom) stayed in
+                # output/ looking like a render. Kill, reap, and remove it.
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+                stderr_thread.join(timeout=5)
+                for pipe in (proc.stdin, proc.stderr):
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+                _remove_partial_output(output_path)
     finally:
         if meta_file and os.path.isfile(meta_file):
             try:
@@ -1250,7 +1346,11 @@ class BatVideoCombine:
         if "%" in ext:
             seq_dir = os.path.join(full_dir, f"{base}_{counter:05d}")
             os.makedirs(seq_dir, exist_ok=True)
-            output_path = os.path.join(seq_dir, ext)
+            # Both writers read the WHOLE path as a printf pattern — ffmpeg's
+            # image2 muxer and the OIIO path's `output_path % n` — so a literal
+            # `%` in the directory (a prefix like "grade_100%") failed the
+            # encode. Doubling it is the escape both of them understand.
+            output_path = os.path.join(seq_dir.replace("%", "%%"), ext)
             # filename is the BARE printf pattern and subfolder is the
             # sequence directory: previously the directory appeared in both
             # and the `%` was doubled, so joining them addressed
@@ -1314,7 +1414,9 @@ class BatVideoCombine:
             "subfolder": preview_subfolder,
             "type": preview_type,
             "format": fmt.get("label", format),
-            "frame_rate": float(frame_rate),
+            # The rate actually written (23.98 -> 24000/1001), so the player's
+            # frame maths matches the file.
+            "frame_rate": _snap_frame_rate(frame_rate)[1],
             "frame_count": n_frames,
             "browser_playable": bool(fmt.get("browser_playable", True)),
             # The player needs to know it's addressing a numbered directory
@@ -1486,7 +1588,9 @@ def _resolve_request_target(request) -> Optional[dict]:
         return {
             "kind": "sequence",
             "dir": base,
-            "pattern": os.path.join(base, filename),
+            # ffmpeg's image2 demuxer reads the whole path as a pattern, so a
+            # literal `%` in the directory must be doubled (see combine()).
+            "pattern": os.path.join(base.replace("%", "%%"), filename),
             "indices": [i for i, _ in frames],
             "frames": [p for _, p in frames],
         }
