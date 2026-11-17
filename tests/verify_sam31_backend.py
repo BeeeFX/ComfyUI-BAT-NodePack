@@ -44,6 +44,12 @@ def iou(a, b):
     return (a & b).sum().item() / u if u else 1.0
 
 
+# GPU-only test. Check before importing the pack: comfy.model_management picks
+# a device at import time and raises on a machine without CUDA (e.g. CI).
+if not torch.cuda.is_available():
+    print("SKIP  no CUDA device")
+    sys.exit(0)
+
 # Load the pack's modules without its __init__ (which needs a running server).
 pkg = types.ModuleType("batpack")
 pkg.__path__ = [PACK]
