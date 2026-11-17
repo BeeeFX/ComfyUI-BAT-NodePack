@@ -72,6 +72,12 @@ module that fails to import now costs only its own nodes, not the whole pack.
 Video Loader, Advanced Blend, HDR Tonal Composite) with what is wired, so the
 output cache can no longer hand a newly connected output a stub from a run that
 skipped it.
+
+2026-11-04: ``Bat_Sam31Segmenter`` ("🦇 SAM 3.1 Segmenter") joins 🦇 SeC
+Segmenter rather than replacing it — same click-and-track job, built on ComfyUI
+core's native SAM 3.1 with a live mask on every click and text prompts. SeC
+stays because it still wins across hard edit cuts. ``Bat_Sam31TrackSink`` is an
+internal output node for the editor's ▶ Track button, hidden from search.
 """
 
 import importlib
@@ -127,9 +133,14 @@ BatExposureBracket, BatExposureMerge = _guarded(
 (BatRoto,) = _guarded("bat_roto", "BatRoto")
 (BatFilenamePrefix,) = _guarded("bat_filename_prefix", "BatFilenamePrefix")
 BatGrowMask, BatErodeMask = _guarded("bat_mask_morph", "BatGrowMask", "BatErodeMask")
+(BatMatteTemporalSmooth,) = _guarded("bat_matte_temporal_smooth", "BatMatteTemporalSmooth")
+(BatDespill,) = _guarded("bat_despill", "BatDespill")
+(BatMergeMattes,) = _guarded("bat_merge_mattes", "BatMergeMattes")
 (BatFramehold,) = _guarded("bat_framehold", "BatFramehold")
 (BatSecSegmenter,) = _guarded("bat_sec_segmenter", "BatSecSegmenter")
 (BatSecAdvancedParams,) = _guarded("bat_sec_advanced", "BatSecAdvancedParams")
+BatSam31Segmenter, BatSam31AdvancedParams, BatSam31TrackSink = _guarded(
+    "bat_sam31_segmenter", "BatSam31Segmenter", "BatSam31AdvancedParams", "BatSam31TrackSink")
 (BatBypassSwitch,) = _guarded("bat_bypass_switch", "BatBypassSwitch")
 BatShowAny, BatShowTensorShape = _guarded("bat_show", "BatShowAny", "BatShowTensorShape")
 BatConvertAny, BatAnyToString, BatNumberToString = _guarded(
@@ -210,9 +221,15 @@ NODE_CLASS_MAPPINGS = {
     "Bat_FilenamePrefix":       BatFilenamePrefix,
     "Bat_GrowMask":             BatGrowMask,
     "Bat_ErodeMask":            BatErodeMask,
+    "Bat_MatteTemporalSmooth":  BatMatteTemporalSmooth,
+    "Bat_Despill":              BatDespill,
+    "Bat_MergeMattes":          BatMergeMattes,
     "Bat_Framehold":            BatFramehold,
     "Bat_SecSegmenter":         BatSecSegmenter,
     "Bat_SecAdvancedParams":    BatSecAdvancedParams,
+    "Bat_Sam31Segmenter":       BatSam31Segmenter,
+    "Bat_Sam31AdvancedParams":  BatSam31AdvancedParams,
+    "Bat_Sam31TrackSink":       BatSam31TrackSink,
     "Bat_BypassSwitch":         BatBypassSwitch,
 
     # ─── Utility nodes (2026-09-17) ──────────────────────────────────
@@ -262,9 +279,15 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_FilenamePrefix":       "🦇 Filename Prefix",
     "Bat_GrowMask":             "🦇 Grow Mask",
     "Bat_ErodeMask":            "🦇 Erode Mask",
+    "Bat_MatteTemporalSmooth":  "🦇 Matte Temporal Smooth",
+    "Bat_Despill":              "🦇 Despill",
+    "Bat_MergeMattes":          "🦇 Merge Mattes",
     "Bat_Framehold":            "🦇 Framehold",
     "Bat_SecSegmenter":         "🦇 SeC Segmenter",
     "Bat_SecAdvancedParams":    "🦇 SeC Advanced Params",
+    "Bat_Sam31Segmenter":       "🦇 SAM 3.1 Segmenter",
+    "Bat_Sam31AdvancedParams":  "🦇 SAM 3.1 Advanced Params",
+    "Bat_Sam31TrackSink":       "🦇 SAM 3.1 Track (internal)",
     "Bat_BypassSwitch":         "🦇 Bypass Switch",
 
     "Bat_ShowAny":              "🦇 Show Any",
