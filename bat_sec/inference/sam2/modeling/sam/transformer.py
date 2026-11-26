@@ -40,12 +40,33 @@ def sdp_kernel_context(dropout_p):
     if ALLOW_ALL_KERNELS:
         return contextlib.nullcontext()
 
-    return torch.backends.cuda.sdp_kernel(
-        enable_flash=USE_FLASH_ATTN,
-        # if Flash attention kernel is off, then math kernel needs to be enabled
-        enable_math=(OLD_GPU and dropout_p > 0.0) or MATH_KERNEL_ON,
-        enable_mem_efficient=OLD_GPU,
-    )
+    enable_flash = USE_FLASH_ATTN
+    # if Flash attention kernel is off, then math kernel needs to be enabled
+    enable_math = (OLD_GPU and dropout_p > 0.0) or MATH_KERNEL_ON
+    enable_mem_efficient = OLD_GPU
+
+    # torch.backends.cuda.sdp_kernel is deprecated (FutureWarning since torch
+    # 2.3) in favour of torch.nn.attention.sdpa_kernel and a backend list.
+    # The old call left cuDNN attention enabled (its enable_cudnn defaulted to
+    # True), so list it too to keep the same kernel choice.
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:  # torch < 2.3
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=enable_flash,
+            enable_math=enable_math,
+            enable_mem_efficient=enable_mem_efficient,
+        )
+    backends = []
+    if enable_flash:
+        backends.append(SDPBackend.FLASH_ATTENTION)
+    if enable_mem_efficient:
+        backends.append(SDPBackend.EFFICIENT_ATTENTION)
+    if enable_math:
+        backends.append(SDPBackend.MATH)
+    if hasattr(SDPBackend, "CUDNN_ATTENTION"):
+        backends.append(SDPBackend.CUDNN_ATTENTION)
+    return sdpa_kernel(backends)
 
 
 class TwoWayTransformer(nn.Module):
