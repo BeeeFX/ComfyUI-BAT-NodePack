@@ -78,6 +78,13 @@ Segmenter rather than replacing it — same click-and-track job, built on ComfyU
 core's native SAM 3.1 with a live mask on every click and text prompts. SeC
 stays because it still wins across hard edit cuts. ``Bat_Sam31TrackSink`` is an
 internal output node for the editor's ▶ Track button, hidden from search.
+
+2026-11-26: ``Bat_Lines`` ("🦇 Lines") replaces comfyui_controlnet_aux's line
+extractors with one node and a ``filter`` dropdown — Canny, XDoG, standard
+lineart, TEED, HED, lineart realistic / anime / manga and M-LSD — so that pack
+(4 GB of weights, several of them non-commercial) can leave the studio installs.
+Only commercially usable weights are used, pinned by URL and sha256 in a new
+``models/lines`` folder; the networks are vendored in ``bat_lines_nets/``.
 """
 
 import importlib
@@ -128,6 +135,7 @@ BatExrLayer, BatCryptomatteMatte = _guarded(
 (BatAdvancedBlend,) = _guarded("bat_advanced_blend", "BatAdvancedBlend")
 (BatLayeredImages,) = _guarded("bat_layered_images", "BatLayeredImages")
 (BatRescale,) = _guarded("bat_rescale", "BatRescale")
+(BatLines,) = _guarded("bat_lines", "BatLines")
 BatExposureBracket, BatExposureMerge = _guarded(
     "bat_exposure_bracket", "BatExposureBracket", "BatExposureMerge")
 (BatRoto,) = _guarded("bat_roto", "BatRoto")
@@ -215,6 +223,7 @@ NODE_CLASS_MAPPINGS = {
     "Bat_AdvancedBlend":        BatAdvancedBlend,
     "Bat_LayeredImages":        BatLayeredImages,
     "Bat_Rescale":              BatRescale,
+    "Bat_Lines":                BatLines,
     "Bat_ExposureBracket":      BatExposureBracket,
     "Bat_ExposureMerge":        BatExposureMerge,
     "Bat_Roto":                 BatRoto,
@@ -273,6 +282,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Bat_AdvancedBlend":        "🦇 Advanced Blend",
     "Bat_LayeredImages":        "🦇 Layered Images",
     "Bat_Rescale":              "🦇 Rescale",
+    "Bat_Lines":                "🦇 Lines",
     "Bat_ExposureBracket":      "🦇 Exposure Bracket",
     "Bat_ExposureMerge":        "🦇 Exposure Merge",
     "Bat_Roto":                 "🦇 Roto",

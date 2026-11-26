@@ -44,6 +44,10 @@ For EXRs, **EXR Layer** selects passes and **Cryptomatte Matte** builds masks fr
 
 **Grade**, **Advanced Blend**, **Layered Images**, and **Rescale** cover common compositing tasks. The HDR nodes handle exposure-bracket reconstruction and tonal blending.
 
+### Line extraction
+
+**Lines** extracts lines and edges for ControlNet or comp: Canny, soft edges (XDoG, TEED, HED), line art for photos, anime and manga, and straight lines (M-LSD), picked from one dropdown with a live preview of the result. It replaces the line extractors of `comfyui_controlnet_aux`: old workflows using them open as Lines with the same settings and give the same lines (TEED, PiDiNet and AnyLine excepted; see [model setup](#optional-features)).
+
 ### Object segmentation
 
 **SAM 3.1 Segmenter** shows the mask live as you click the object, or finds it from a description ("person"), then tracks it through the clip in both directions. It runs on ComfyUI's built-in SAM 3.1; see [model setup](#optional-features). **SeC Segmenter** is slower but finds the object again across hard edit cuts; it needs [extra setup](#optional-features).
@@ -109,6 +113,7 @@ Names match the Add Node menu; the 🦇 prefix is omitted here.
 | **Advanced Blend** | Blend images; mix tone and detail separately. |
 | **Layered Images** | Composite up to eight masked layers. |
 | **Rescale** | Resize image and mask while comparing at a fixed viewing size. |
+| **Lines** | Extract lines and edges for ControlNet or comp, with a live preview. |
 | **Exposure Bracket** | Prepare exposures for LTX HDR reconstruction. |
 | **Exposure Merge** | Merge reconstructed passes into linear HDR. |
 | **HDR Tonal Composite** | Blend reconstructed shadows and highlights into a shot. |
@@ -186,6 +191,8 @@ Install these with the Python environment that runs ComfyUI:
 - **SeC:** `python -m pip install -r requirements.txt`. Restart after installation. The default model is about **7.35 GB** and downloads on first use. See [model setup](bat_sec/NOTICE.md#models).
 
 - **SAM 3.1:** needs a ComfyUI with built-in SAM 3.1 (core 0.20.1 and later have it). Put `sam3.1_multiplex_fp16.safetensors` from [Comfy-Org/sam3.1](https://huggingface.co/Comfy-Org/sam3.1) in `models/checkpoints`. Nothing to pip-install. The weights are under Meta's SAM Licence (commercial use allowed; military, weapons and ITAR uses prohibited).
+
+- **Lines:** Canny, XDoG and standard lineart need nothing. The model filters (TEED, HED, lineart realistic / anime / manga, M-LSD) fetch their weights on first use into `models/lines/` (0.25–218 MB each, about 460 MB in all), from pinned URLs checked against a sha256; turn off `auto_download` to place them by hand instead (the error names the URL and the path). Every weight is MIT or Apache-2.0: see [bat_lines_nets/NOTICE.md](bat_lines_nets/NOTICE.md). TEED uses its author's weights rather than the non-commercial copy `comfyui_controlnet_aux` downloads, so migrated TEED lines look different; PiDiNet (research-only licence) and AnyLine migrate to TEED.
 
 To prevent the SeC model download, connect **SeC Advanced Params** and turn off `auto_download` before running.
 
