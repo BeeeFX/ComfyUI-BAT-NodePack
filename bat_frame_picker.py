@@ -112,29 +112,86 @@ def count_frames(path):
 # ─── Frame decoding ────────────────────────────────────────────────────────────
 
 
+def _rgb3(arr):
+    """(H,W) or (H,W,C) → (H,W,3): grey is repeated, extra channels dropped."""
+    if arr.ndim == 2:
+        arr = arr[:, :, None]
+    if arr.shape[2] < 3:
+        arr = np.repeat(arr[:, :, :1], 3, axis=2)
+    return arr[:, :, :3]
+
+
+def _read_exr_oiio(path):
+    """EXR → float32 (H,W,3) via OpenImageIO, superwhites intact.
+
+    Takes the R/G/B channels by name when the file has them (OIIO lists them
+    first for an ordinary EXR, but a multi-layer render need not), otherwise
+    the first three channels, or a single channel (``Y``, ``Z``…) as grey.
+    Returns the data window, as cv2 did. OIIO is imported here and not at
+    module level: imported before sqlite3 it breaks sqlite3 for the whole
+    process."""
+    import OpenImageIO as oiio
+    inp = oiio.ImageInput.open(path)
+    if inp is None:
+        raise RuntimeError(oiio.geterror() or "OpenImageIO could not open it")
+    try:
+        names = [n.upper() for n in inp.spec().channelnames]
+        want = [names.index(c) for c in ("R", "G", "B") if c in names]
+        if len(want) == 3 and want == list(range(want[0], want[0] + 3)):
+            px = inp.read_image(0, 0, want[0], want[0] + 3, oiio.FLOAT)
+        else:
+            px = inp.read_image(oiio.FLOAT)
+            if px is not None and len(want) == 3:
+                px = px[:, :, want]
+        if px is None:
+            raise RuntimeError(inp.geterror() or "OpenImageIO read failed")
+    finally:
+        inp.close()
+    return np.ascontiguousarray(_rgb3(px), dtype=np.float32)
+
+
+def _read_exr_fallback(path):
+    """EXR without OpenImageIO: cv2 (needs an OpenEXR-enabled build — the
+    OpenCV 5 wheels have none, and return None), then imageio.
+
+    imageio's default plugin for .exr is pyav, which hands back uint8 frames
+    as (1,H,W,3): drop that batch axis and scale to 0..1 instead of passing
+    0..255 floats on as if they were linear light. That path has already lost
+    everything above 1.0 and every bit below 8, hence the warning."""
+    os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    try:
+        import cv2
+        arr = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
+        if arr is None:
+            raise RuntimeError("cv2 returned None")
+        arr = _rgb3(arr)[:, :, ::-1]  # BGR→RGB
+        return np.ascontiguousarray(arr).astype(np.float32)
+    except Exception as e:
+        import imageio.v3 as iio
+        arr = np.asarray(iio.imread(path))
+        if arr.ndim == 4:
+            arr = arr[0]
+        if np.issubdtype(arr.dtype, np.integer):
+            logger.warning("Bat_FramePicker: %s read without OpenImageIO (%s); "
+                           "it arrives as %s, clipped to 0..1.", path, e, arr.dtype)
+            arr = arr.astype(np.float32) / float(np.iinfo(arr.dtype).max)
+        return np.ascontiguousarray(_rgb3(arr)).astype(np.float32)
+
+
 def _load_image_file(path):
     """Load a still image (incl. EXR) → float32 RGB ndarray (H,W,3)."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".exr":
-        os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
         try:
-            import cv2
-            arr = cv2.imread(path, cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH | cv2.IMREAD_ANYCOLOR)
-            if arr is None:
-                raise RuntimeError("cv2 returned None")
-            if arr.ndim == 2:
-                arr = np.stack([arr] * 3, axis=-1)
-            arr = arr[:, :, :3][:, :, ::-1]  # BGR→RGB
-            return np.ascontiguousarray(arr).astype(np.float32)
+            return _read_exr_oiio(path)
+        except ImportError:
+            pass
         except Exception as e:
-            try:
-                import imageio.v3 as iio
-                arr = iio.imread(path)
-                if arr.ndim == 2:
-                    arr = np.stack([arr] * 3, axis=-1)
-                return np.ascontiguousarray(arr[:, :, :3]).astype(np.float32)
-            except Exception:
-                raise RuntimeError(f"Could not read EXR {path}: {e}")
+            logger.warning("Bat_FramePicker: OpenImageIO could not read %s: %s", path, e)
+        try:
+            return _read_exr_fallback(path)
+        except Exception as e:
+            raise RuntimeError(f"Could not read EXR {path}: {e}")
     # The loader's still reader, so a 16-bit PNG/TIFF keeps its depth (and a
     # 16-bit greyscale one isn't clipped to white).
     rgba, scale = read_still(path)

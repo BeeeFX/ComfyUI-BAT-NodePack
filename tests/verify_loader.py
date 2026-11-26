@@ -480,6 +480,86 @@ def test_frame_picker(root):
           bool(torch.equal(first, second)), False)
 
 
+def _write_exr(path, data, names):
+    spec = oiio.ImageSpec(data.shape[1], data.shape[0], len(names), "float")
+    spec.channelnames = names
+    out = oiio.ImageOutput.create(path)
+    out.open(path, spec)
+    out.write_image(np.ascontiguousarray(data, dtype=np.float32))
+    out.close()
+
+
+def test_frame_picker_exr(root):
+    """EXR went through cv2.imread, which is None on the OpenCV 5 wheels (no
+    OpenEXR), and then imageio, whose pyav plugin returns uint8 (1,H,W,3):
+    the frame arrived with a batch axis, clipped and 255x too bright."""
+    print("\n🦇 Frame Picker: EXR")
+    fp = sys.modules["batpack.bat_frame_picker"]
+    if HAVE_OIIO:
+        os.makedirs(f"{root}/pick_exr")
+        rgba = np.zeros((H, W, 4), dtype=np.float32)
+        rgba[:, :, 0] = 6.0                                  # a specular
+        rgba[:, :, 1] = np.linspace(0, 1, W)[None, :]
+        rgba[:, :, 2] = -0.25                                # and a negative
+        rgba[:, :, 3] = 0.5
+        _write_exr(f"{root}/pick_exr/hot.exr", rgba, ["R", "G", "B", "A"])
+        arr = fp._load_image_file(f"{root}/pick_exr/hot.exr")
+        check("EXR frame is (H,W,3) float32", (arr.shape, arr.dtype), ((H, W, 3), np.float32))
+        check("...superwhite and negative values survive",
+              (float(arr[0, 0, 0]), float(arr[0, 0, 2])), (6.0, -0.25))
+        check("...and the green ramp is intact",
+              bool(np.allclose(arr[0, :, 1], rgba[0, :, 1])), True)
+
+        layered = f"{root}/exr/render_1003.exr"             # R = seed / 100 = 0.02
+        arr = fp._load_image_file(layered)
+        check("multi-layer EXR: the beauty RGB, not a layer",
+              (arr.shape, round(float(arr[0, 0, 0]), 4), float(arr[0, 0, 2])),
+              ((H, W, 3), 0.02, 0.25))
+
+        depth = np.full((H, W, 1), 42.0, dtype=np.float32)
+        _write_exr(f"{root}/pick_exr/depth.exr", depth, ["depth.Z"])
+        arr = fp._load_image_file(f"{root}/pick_exr/depth.exr")
+        check("single-channel EXR comes back as grey RGB",
+              (arr.shape, float(arr.min()), float(arr.max())), ((H, W, 3), 42.0, 42.0))
+
+        body = fp._frame_jpeg(f"{root}/pick_exr/hot.exr", 0, 64)
+        check("thumbnail route serves an EXR", bool(body) and body[:2] == b"\xff\xd8", True)
+        picked = fp.BatFramePicker().load(f"{root}/exr/render_####.exr", 2)[0]
+        check("node output: one EXR frame, batch axis first",
+              (tuple(picked.shape), round(float(picked[0, 0, 0, 0]), 4)), ((1, H, W, 3), 0.02))
+    else:
+        print("  ..   no OpenImageIO: the OIIO-path checks skip")
+
+    # The fallback, made deterministic: cv2 without OpenEXR and imageio's pyav
+    # plugin, stubbed to behave exactly as they do on OpenCV 5.
+    frame = np.zeros((1, H, W, 3), dtype=np.uint8)
+    frame[0, :, :, 0] = 255
+    frame[0, :, :, 1] = 51
+    cv2_stub = types.ModuleType("cv2")
+    cv2_stub.IMREAD_UNCHANGED = cv2_stub.IMREAD_ANYDEPTH = cv2_stub.IMREAD_ANYCOLOR = 0
+    cv2_stub.imread = lambda *a, **k: None
+    iio_stub = types.ModuleType("imageio.v3")
+    iio_stub.imread = lambda *a, **k: frame
+    imageio_stub = types.ModuleType("imageio")
+    imageio_stub.v3 = iio_stub
+    stubs = {"cv2": cv2_stub, "imageio": imageio_stub, "imageio.v3": iio_stub,
+             "OpenImageIO": None}                            # None: import raises
+    saved = {k: sys.modules.get(k, KeyError) for k in stubs}
+    sys.modules.update(stubs)
+    try:
+        arr = fp._load_image_file(f"{root}/no_oiio.exr")
+    finally:
+        for k, v in saved.items():
+            if v is KeyError:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    check("no OIIO, no OpenEXR in cv2: imageio's batch axis is dropped",
+          (arr.shape, arr.dtype), ((H, W, 3), np.float32))
+    check("...and uint8 is scaled to 0..1, not passed on as 0..255",
+          (float(arr[0, 0, 0]), round(float(arr[0, 0, 1]), 4)), (1.0, 0.2))
+
+
 def test_scan(root, node):
     print("\nthe node-face scan")
     scan = bat_loader._scan_path
@@ -518,6 +598,7 @@ def main():
         test_deep_stills(root, node)
         test_hash_paths(root, node)
         test_frame_picker(root)
+        test_frame_picker_exr(root)
         test_scan(root, node)
         test_is_changed(root, node)     # last: it mutates the material
     finally:

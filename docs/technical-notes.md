@@ -776,6 +776,24 @@ shells out to `ffmpeg` for encoding; if `imageio_ffmpeg.get_ffmpeg_exe()`
 isn't usable on your box, the node falls back to whichever `ffmpeg` is
 on `$PATH`.
 
+Both ffmpeg 7 (imageio-ffmpeg 0.6) and ffmpeg 9 (imageio-ffmpeg 0.8, which
+ComfyUI 0.45-era environments ship) are supported. ffmpeg 9 removed two
+options the preview routes used to pass, so the pack no longer relies on
+either:
+
+- `-vsync 0` is now `-fps_mode passthrough` (frame grab, save frame and
+  hover-scrub thumbnails).
+- The OpenEXR decoder's `-apply_trc` (the sRGB / Rec.709 views of an EXR
+  sequence preview) is now a `lutrgb` filter carrying the same curve. Both
+  ffmpeg versions give bit-identical output, within 0.0003 of the exact
+  curve. `tests/verify_video_combine_trc.py` checks the curve and the three
+  routes end to end against whichever ffmpeg it finds.
+
+🦇 Frame Picker reads EXR through OpenImageIO, like 🦇 Loader. The OpenCV 5
+wheels are built without OpenEXR, so `cv2.imread` returns nothing for an
+`.exr` there. Without OpenImageIO the picker falls back to OpenCV, then
+imageio, and logs that the frame has been clipped to 8 bits.
+
 ---
 
 ## Workflow compatibility

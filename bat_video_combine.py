@@ -1602,12 +1602,49 @@ def _resolve_request_target(request) -> Optional[dict]:
 
 
 # EXR is scene-referred, so a preview needs to know which transfer curve to
-# apply on the way to an 8-bit player. Values are the OpenEXR decoder's
-# `apply_trc` names; the keys are what the front-end sends.
+# apply on the way to an 8-bit player. The keys are what the front-end sends;
+# the values are the curve as an ffmpeg `lut` expression over one 16-bit
+# channel (`val` in 0..maxval), applied by _trc_filter.
+#
+# This used to be the OpenEXR decoder's `-apply_trc` option. ffmpeg 9 removed
+# it (and `-gamma`) from the decoder, so on the 9.x binary that imageio-ffmpeg
+# 0.8 bundles every sRGB / Rec.709 sequence preview failed to open. A filter
+# works on 7.x and 9.x alike: both builds give bit-identical output, within
+# 0.0003 of the exact curve and of what `-apply_trc` produced on 7.0.2
+# (tests/verify_video_combine_trc.py). `zscale` was ruled out: its `bt709`
+# transfer is the display (BT.1886, gamma 2.4) inverse, not the camera curve
+# `-apply_trc bt709` applied, and it has no scene-referred switch.
 _SEQ_TRC = {
-    "srgb":   "iec61966_2_1",
-    "rec709": "bt709",
+    # IEC 61966-2-1 (sRGB) encoding.
+    "srgb":   "if(lte(val/maxval,0.0031308),12.92*val,"
+              "maxval*(1.055*pow(val/maxval,1/2.4)-0.055))",
+    # ITU-R BT.709 OETF, with the same constants ffmpeg's own avpriv
+    # bt709 transfer function uses.
+    "rec709": "if(lt(val/maxval,0.018053968510807),4.5*val,"
+              "maxval*(1.099296826809442*pow(val/maxval,0.45)-0.099296826809442))",
 }
+
+
+def _trc_filter(trc: str, path: str) -> str:
+    """`-vf` prefix that applies an sRGB / Rec.709 curve to an EXR, or "".
+
+    Only for `.exr` inputs, as `-apply_trc` was: every other format the
+    previews read is already display-referred. The float frame is converted
+    to 16-bit RGB first (clamping to 0..1, which the 8-bit preview did
+    anyway) because `lutrgb` works on integer formats; 16 bits keep the dark
+    end smooth through the steep part of the curve. Alpha, when present,
+    passes through untouched (`a` defaults to `clipval`)."""
+    expr = _SEQ_TRC.get((trc or "").lower())
+    if not expr or not (path or "").lower().endswith(".exr"):
+        return ""
+    return (f"format=pix_fmts=rgb48le|rgba64le,"
+            f"lutrgb=r='{expr}':g='{expr}':b='{expr}'")
+
+
+def _with_trc(vf: str, trc: str, path: str) -> str:
+    """Prepend _trc_filter's curve, if any, to a `-vf` chain."""
+    pre = _trc_filter(trc, path)
+    return f"{pre},{vf}" if pre else vf
 
 
 def _query_fps(request, default: float = 24.0) -> float:
@@ -1623,28 +1660,23 @@ def _query_fps(request, default: float = 24.0) -> float:
     return fps if 0.01 <= fps <= 1000 else default
 
 
-def _target_input_args(target: dict, fps: float = 24.0, trc: str = "") -> list:
+def _target_input_args(target: dict, fps: float = 24.0) -> list:
     """ffmpeg input args for a target — one file, or a numbered sequence.
 
     A sequence needs `-framerate` (see _query_fps) and `-start_number` (the
     first frame on disk is `00001`, not `00000`, because image2's printf
     pattern is 1-based — see _write_sequence_oiio).
 
-    `-apply_trc` is an OpenEXR *decoder* option, so it is only ever passed for
-    an `.exr` pattern; handing it to the PNG decoder is a hard ffmpeg error.
-    No TRC is the default on purpose: Video Combine writes the IMAGE tensor
-    into EXR verbatim (no linearisation), and ffmpeg's EXR decoder default is
-    identity — so a 1:1 read reproduces exactly what the h264 export of the
-    same frames looks like. The sRGB / Rec.709 options exist for genuinely
-    scene-linear renders, which read near-black straight."""
+    The transfer curve for an EXR sequence is a filter, not an input option —
+    see _trc_filter. No TRC is the default on purpose: Video Combine writes
+    the IMAGE tensor into EXR verbatim (no linearisation), and ffmpeg's EXR
+    decoder default is identity — so a 1:1 read reproduces exactly what the
+    h264 export of the same frames looks like. The sRGB / Rec.709 options
+    exist for genuinely scene-linear renders, which read near-black straight."""
     if target["kind"] != "sequence":
         return ["-i", target["path"]]
-    args = ["-framerate", f"{fps:.6f}", "-start_number", str(target["indices"][0])]
-    mapped = _SEQ_TRC.get((trc or "").lower())
-    if mapped and target["pattern"].lower().endswith(".exr"):
-        args += ["-apply_trc", mapped]
-    args += ["-i", target["pattern"]]
-    return args
+    return ["-framerate", f"{fps:.6f}", "-start_number", str(target["indices"][0]),
+            "-i", target["pattern"]]
 
 
 def _target_cache_stamp(target: dict) -> Optional[str]:
@@ -1816,14 +1848,15 @@ def _transcode_preview(target: dict, fps: float, trc: str,
     try:
         subprocess.run([
             _ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "warning",
-            *_target_input_args(target, fps=fps, trc=trc),
+            *_target_input_args(target, fps=fps),
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-pix_fmt", "yuv420p",
             # All-I so the player's frame-stepping and hover-scrub seek
             # instantly, matching what the browser-playable formats get
             # from their `-g 1` encode args.
             "-g", "1",
-            "-vf", "scale=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-vf", _with_trc("scale=ceil(iw/2)*2:ceil(ih/2)*2", trc,
+                             target["pattern"] if target["kind"] == "sequence" else ""),
             "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             "-f", "mp4", part,
@@ -1923,13 +1956,11 @@ async def bat_video_frame(request):
         trc = (request.rel_url.query.get("trc") or "").lower()
         one = {"kind": "file", "path": target["frames"][min(frame, len(target["frames"]) - 1)]}
         input_args = _target_input_args(one)
-        if _SEQ_TRC.get(trc) and one["path"].lower().endswith(".exr"):
-            input_args = ["-apply_trc", _SEQ_TRC[trc]] + input_args
-        select = "scale=ceil(iw/2)*2:ceil(ih/2)*2"
+        select = _with_trc("scale=ceil(iw/2)*2:ceil(ih/2)*2", trc, one["path"])
     else:
         input_args = _target_input_args(target)
-        # `select=eq(n,N)` jumps to the Nth decoded frame. Add `-vsync 0` so
-        # ffmpeg doesn't pad or drop around the target frame.
+        # `select=eq(n,N)` jumps to the Nth decoded frame. `-fps_mode
+        # passthrough` stops ffmpeg padding or dropping around it.
         select = f"select=eq(n\\,{frame}),scale=ceil(iw/2)*2:ceil(ih/2)*2"
 
     try:
@@ -1937,7 +1968,9 @@ async def bat_video_frame(request):
             _ffmpeg_bin(), "-hide_banner", "-loglevel", "error",
             *input_args,
             "-vf", select,
-            "-vsync", "0", "-frames:v", "1",
+            # `-fps_mode passthrough`, not `-vsync 0`: ffmpeg 9 removed
+            # `-vsync`, and `-fps_mode` has existed since 5.1.
+            "-fps_mode", "passthrough", "-frames:v", "1",
             "-f", "image2pipe", "-vcodec", "png", "-",
         ], capture_output=True, check=True, timeout=30)
     except subprocess.CalledProcessError as exc:
@@ -2005,7 +2038,9 @@ async def bat_video_save_frame(request):
             _ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error",
             *input_args,
             "-vf", select,
-            "-vsync", "0", "-frames:v", "1",
+            # `-fps_mode passthrough`, not `-vsync 0`: ffmpeg 9 removed
+            # `-vsync`, and `-fps_mode` has existed since 5.1.
+            "-fps_mode", "passthrough", "-frames:v", "1",
             out_path,
         ], capture_output=True, check=True, timeout=30)
     except subprocess.CalledProcessError as exc:

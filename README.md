@@ -182,7 +182,7 @@ For Desktop, use its active `custom_nodes` folder. Downloading the repository ZI
 
 Install these with the Python environment that runs ComfyUI:
 
-- **EXR:** `python -m pip install OpenImageIO`. Other Loader formats work without it.
+- **EXR:** `python -m pip install OpenImageIO`, for EXR in Loader and Frame Picker. Other formats work without it.
 - **SeC:** `python -m pip install -r requirements.txt`. Restart after installation. The default model is about **7.35 GB** and downloads on first use. See [model setup](bat_sec/NOTICE.md#models).
 
 - **SAM 3.1:** needs a ComfyUI with built-in SAM 3.1 (core 0.20.1 and later have it). Put `sam3.1_multiplex_fp16.safetensors` from [Comfy-Org/sam3.1](https://huggingface.co/Comfy-Org/sam3.1) in `models/checkpoints`. Nothing to pip-install. The weights are under Meta's SAM Licence (commercial use allowed; military, weapons and ITAR uses prohibited).
