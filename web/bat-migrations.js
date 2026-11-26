@@ -281,6 +281,127 @@ function indexSwitchInputs(slot, name) {
     return slot;
 }
 
+// ─── 🦇 Lines ← comfyui_controlnet_aux (2026-11-26) ───────────────────────────
+//
+// Bat_Lines widget order (append-only; tests/verify_lines.py pins it):
+//   0 filter, 1 resolution, 2 output_size, 3 invert, 4 canny_low, 5 canny_high,
+//   6 xdog_style, 7 xdog_sigma, 8 xdog_k, 9 xdog_sharpen, 10 xdog_threshold,
+//   11 xdog_softness, 12 xdog_scribble_threshold, 13 standard_sigma,
+//   14 standard_threshold, 15 teed_safe_steps, 16 hed_safe, 17 lineart_coarse,
+//   18 mlsd_score, 19 mlsd_distance, 20 mlsd_line_width, 21 auto_download,
+//   22 preview_frame
+//
+// Every migrated node gets output_size "processing": controlnet_aux returned
+// its lines at the working resolution, and whatever is downstream was built
+// around that size. Same weights and the same processing make Canny, XDoG
+// scribble, standard lineart, lineart realistic / anime / manga, M-LSD and HED
+// identical to before (tests/verify_lines*.py). TEED, PiDiNet and AnyLine
+// change look, and say so in the console.
+
+/** The full Bat_Lines widgets_values: defaults, then `over`. */
+function linesValues(over) {
+    const v = {
+        filter: "canny", resolution: 512, output_size: "processing", invert: false,
+        canny_low: 100, canny_high: 200, xdog_style: "soft", xdog_sigma: 0.8,
+        xdog_k: 1.6, xdog_sharpen: 20.0, xdog_threshold: 0.3, xdog_softness: 3.0,
+        xdog_scribble_threshold: 32, standard_sigma: 6.0, standard_threshold: 8.0,
+        teed_safe_steps: 2, hed_safe: true, lineart_coarse: false, mlsd_score: 0.1,
+        mlsd_distance: 0.1, mlsd_line_width: 1, auto_download: true, preview_frame: 0,
+    };
+    Object.assign(v, over || {});
+    return [v.filter, v.resolution, v.output_size, v.invert, v.canny_low, v.canny_high,
+            v.xdog_style, v.xdog_sigma, v.xdog_k, v.xdog_sharpen, v.xdog_threshold,
+            v.xdog_softness, v.xdog_scribble_threshold, v.standard_sigma,
+            v.standard_threshold, v.teed_safe_steps, v.hed_safe, v.lineart_coarse,
+            v.mlsd_score, v.mlsd_distance, v.mlsd_line_width, v.auto_download,
+            v.preview_frame];
+}
+
+/** controlnet_aux treats a resolution under 64 (or a non-number) as 512. */
+function caResolution(v) {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 64 ? Math.round(n) : 512;
+}
+
+function caNumber(v, dflt) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : dflt;
+}
+
+function linesLookChanged(from, why) {
+    console.warn(`[BAT.Migrations] ${from} → 🦇 Lines: ${why} Check the result before trusting it.`);
+}
+
+/** Old controlnet_aux values -> Bat_Lines values, by old class name. */
+function mapToLines(from, old) {
+    old = Array.isArray(old) ? old : [];
+    switch (from) {
+    case "CannyEdgePreprocessor":
+        return linesValues({ filter: "canny", canny_low: caNumber(old[0], 100),
+                             canny_high: caNumber(old[1], 200), resolution: caResolution(old[2]) });
+    case "Scribble_XDoG_Preprocessor":
+        return linesValues({ filter: "xdog", xdog_style: "scribble",
+                             xdog_scribble_threshold: caNumber(old[0], 32), resolution: caResolution(old[1]) });
+    case "LineartStandardPreprocessor":
+        return linesValues({ filter: "lineart standard", standard_sigma: caNumber(old[0], 6.0),
+                             standard_threshold: caNumber(old[1], 8), resolution: caResolution(old[2]) });
+    case "LineArtPreprocessor":
+        return linesValues({ filter: "lineart realistic", lineart_coarse: old[0] === "enable",
+                             resolution: caResolution(old[1]) });
+    case "AnimeLineArtPreprocessor":
+        return linesValues({ filter: "lineart anime", resolution: caResolution(old[0]) });
+    case "Manga2Anime_LineArt_Preprocessor":
+        return linesValues({ filter: "lineart manga", resolution: caResolution(old[0]) });
+    case "M-LSDPreprocessor":
+        return linesValues({ filter: "mlsd", mlsd_score: caNumber(old[0], 0.1),
+                             mlsd_distance: caNumber(old[1], 0.1), resolution: caResolution(old[2]) });
+    case "HEDPreprocessor":
+        return linesValues({ filter: "hed", hed_safe: old[0] !== "disable", resolution: caResolution(old[1]) });
+    case "TEEDPreprocessor":
+        linesLookChanged(from, "TEED now uses its author's MIT weights (controlnet_aux's copy is non-commercial), so the lines differ.");
+        return linesValues({ filter: "teed", teed_safe_steps: caNumber(old[0], 2), resolution: caResolution(old[1]) });
+    case "PiDiNetPreprocessor":
+        linesLookChanged(from, "PiDiNet's licence is research-only, so this is now TEED soft edges.");
+        return linesValues({ filter: "teed", teed_safe_steps: old[0] === "disable" ? 0 : 2,
+                             resolution: caResolution(old[1]) });
+    case "AnyLineArtPreprocessor_aux":
+        linesLookChanged(from, "AnyLine's MTEED weights carry use restrictions, so this is now TEED soft edges.");
+        return linesValues({ filter: "teed", resolution: caResolution(old[1]) });
+    default:
+        return null;
+    }
+}
+
+/** AIO_Preprocessor: [preprocessor class name, resolution]. */
+function mapFromAIO(old) {
+    old = Array.isArray(old) ? old : [];
+    const res = caResolution(old[1]);
+    const mapped = mapToLines(String(old[0]), []);
+    if (!mapped) {
+        linesLookChanged("AIO_Preprocessor", `its preprocessor '${old[0]}' has no 🦇 Lines equivalent; set to Canny.`);
+        return linesValues({ filter: "canny", resolution: res });
+    }
+    mapped[1] = res;   // AIO carries only the resolution; the rest stay at defaults
+    return mapped;
+}
+
+/** Inputs by name: `resolution` may have been converted to a socket. */
+function linesInputs(slot, name, oldNode, newNode) {
+    const target = (newNode?.inputs || []).findIndex((i) => i && i.name === name);
+    if (target >= 0) return target;
+    console.warn(`[BAT.Migrations] ${oldNode?.type} had a link on '${name}' with no matching ` +
+                 `input on 🦇 Lines; that link is not carried over.`);
+    return -1;
+}
+
+const LINES_FROM = [
+    "CannyEdgePreprocessor", "Scribble_XDoG_Preprocessor", "LineartStandardPreprocessor",
+    "LineArtPreprocessor", "AnimeLineArtPreprocessor", "Manga2Anime_LineArt_Preprocessor",
+    "M-LSDPreprocessor", "HEDPreprocessor", "TEEDPreprocessor", "PiDiNetPreprocessor",
+    "AnyLineArtPreprocessor_aux",
+];
+
+
 const PACK = "BAT NodePack";
 const MIGRATIONS = [
     { from: "Volt_VideoGridSplit",       to: "Bat_VideoGridSplit",       pack: PACK },
@@ -319,6 +440,14 @@ const MIGRATIONS = [
     // ── ComfyUI_QwenVL (alexcong) → ComfyUI-QwenVL (1038lab) ────────────
     { from: "Qwen2.5VL", to: QWEN_TARGET, pack: "ComfyUI-QwenVL (1038lab)",
       mapWidgetValues: mapFromQwen25VL, mapInputs: qwenInputs },
+
+    // comfyui_controlnet_aux line extractors -> 🦇 Lines (2026-11-26).
+    ...LINES_FROM.map((from) => ({
+        from, to: "Bat_Lines", pack: PACK,
+        mapWidgetValues: (old) => mapToLines(from, old), mapInputs: linesInputs,
+    })),
+    { from: "AIO_Preprocessor", to: "Bat_Lines", pack: PACK,
+      mapWidgetValues: mapFromAIO, mapInputs: linesInputs },
 ];
 
 /**

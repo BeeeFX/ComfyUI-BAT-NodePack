@@ -526,6 +526,18 @@ def render_preview(entry, p, frame_index):
     return lines, {"exact": exact, "w": int(lines.shape[1]), "h": int(lines.shape[0])}
 
 
+def source_preview(entry, frame_index, max_dim=1600):
+    """The cached source frame as 8-bit RGB (long edge capped), for the
+    viewer's wipe. Returns (u8, exact) like _frame_for."""
+    frame, exact = _frame_for(entry, frame_index)
+    u8 = to_u8(frame)
+    h, w = u8.shape[:2]
+    if max(h, w) > max_dim:
+        r = max_dim / max(h, w)
+        u8 = cv2.resize(u8, (max(1, int(w * r)), max(1, int(h * r))), interpolation=cv2.INTER_AREA)
+    return u8, exact
+
+
 try:
     import server
     from aiohttp import web
@@ -546,7 +558,9 @@ try:
     @server.PromptServer.instance.routes.post("/bat/lines/render")
     async def _bat_lines_render(request):
         """Re-run the filter on the cached frame. POST {token, frame, ...params}
-        -> PNG of the lines, or 409 when nothing is cached for the token."""
+        -> PNG of the lines, or 409 when nothing is cached for the token.
+        With {"want": "source"} it returns that frame of the source as a JPEG
+        instead, for the viewer's wipe."""
         try:
             body = await request.json()
         except Exception:
@@ -561,6 +575,13 @@ try:
         except (TypeError, ValueError):
             frame_index = int(entry["meta"].get("frame", 0))
         loop = asyncio.get_running_loop()
+        if body.get("want") == "source":
+            u8, exact = await loop.run_in_executor(None, source_preview, entry, frame_index)
+            buf = io.BytesIO()
+            Image.fromarray(u8).save(buf, format="JPEG", quality=90)
+            return web.Response(body=buf.getvalue(), content_type="image/jpeg",
+                                headers={"Cache-Control": "no-store",
+                                         "X-Bat-Lines": json.dumps({"exact": exact})})
         try:
             lines, info = await loop.run_in_executor(None, render_preview, entry, p, frame_index)
         except Exception as exc:
